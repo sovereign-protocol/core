@@ -1,0 +1,852 @@
+#!/usr/bin/env python3
+"""
+Sovereign Perspective Protocol  Transport Layer
+
+Each Sovereign Individual (SI) owns a Perspective (PRSP): a Merkle tree
+rooted at themselves. Other SIs get read-only access to subtrees via UUID
+as capability key. There is no way to modify another SI's PRSP from outside.
+
+Operations on a PRSP:
+  create_child   add a child node; parent hash cascades up
+  modify         update data/weights; updated_at set; hash cascades up
+  substitute     replace all children; created_at reset; hash cascades up
+  delete         remove node and all descendants; parent hash cascades up
+
+Sync protocol (delta-first):
+  mutate  ping peers {topic_uuid, topic_state_hash, changed_uuid}
+  peer:   if state hash mismatch  GET /p2p/subtree/<changed_uuid>
+"""
+
+import hashlib
+import json
+import logging
+import threading
+import uuid as uuid_mod
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+
+import requests
+
+log = logging.getLogger(__name__)
+
+
+# - -  Utilities - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+def now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec='milliseconds')
+
+
+def stable_hash(payload: dict) -> str:
+    encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()[:20]
+
+
+def content_hash(data: dict, weights: dict, child_content_hashes: list[str]) -> str:
+    return stable_hash({
+        "data": data,
+        "weights": weights,
+        "children": child_content_hashes,
+    })
+
+
+def state_hash(node_content_hash: str, proposals: list[dict],
+               child_state_hashes: list[str]) -> str:
+    ordered_proposals = sorted(
+        proposals,
+        key=lambda p: json.dumps(p, sort_keys=True, separators=(",", ":")),
+    )
+    return stable_hash({
+        "content_hash": node_content_hash,
+        "proposals": ordered_proposals,
+        "children": child_state_hashes,
+    })
+
+
+# - -  PRSPNode - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+class PRSPNode:
+    """
+    A node in a Sovereign Perspective tree.
+
+    Metadata (transport-layer owned):
+      uuid, created_at, updated_at, content_hash, state_hash,
+      weights, proposals, parent_uuid
+
+    Content (application-layer owned):
+      data   arbitrary dict; 'type' key conventionally carries node semantics
+    """
+
+    def __init__(self, data: dict,
+                 weights: dict[str, float] | None = None,
+                 parent_uuid: str | None = None):
+        self.uuid:        str               = str(uuid_mod.uuid4())
+        self.created_at:  str               = now_iso()
+        self.updated_at:  str               = now_iso()
+        self.weights:     dict[str, float]  = weights or {}
+        self.proposals:   list[dict]        = []
+        self.data:        dict              = data
+        self.parent_uuid: str | None        = parent_uuid
+        self.children:    list[PRSPNode]    = []
+        self.content_hash: str              = ""
+        self.state_hash:   str              = ""
+        self._refresh_hashes()
+
+    # - -  Hashing - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def _recompute_content_hash(self) -> str:
+        return content_hash(self.data, self.weights,
+                            sorted(c.content_hash for c in self.children))
+
+    def _recompute_state_hash(self) -> str:
+        return state_hash(self.content_hash, self.proposals,
+                          sorted(c.state_hash for c in self.children))
+
+    def _refresh_hashes(self) -> None:
+        self.content_hash = self._recompute_content_hash()
+        self.state_hash = self._recompute_state_hash()
+
+    # - -  Serialisation - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def to_dict(self) -> dict:
+        return {
+            "uuid":        self.uuid,
+            "created_at":  self.created_at,
+            "updated_at":  self.updated_at,
+            "content_hash": self.content_hash,
+            "state_hash":   self.state_hash,
+            "weights":     self.weights,
+            "proposals":   self.proposals,
+            "data":        self.data,
+            "parent_uuid": self.parent_uuid,
+            "children":    [c.to_dict() for c in self.children],
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict) -> "PRSPNode":
+        node             = cls.__new__(cls)
+        node.uuid        = d["uuid"]
+        node.created_at  = d["created_at"]
+        node.updated_at  = d["updated_at"]
+        node.content_hash = d["content_hash"]
+        node.state_hash   = d["state_hash"]
+        node.weights     = d.get("weights", {})
+        node.proposals   = d.get("proposals", [])
+        node.data        = d["data"]
+        node.parent_uuid = d.get("parent_uuid")
+        node.children    = [cls.from_dict(c) for c in d.get("children", [])]
+        computed_content_hash = node._recompute_content_hash()
+        if node.content_hash != computed_content_hash:
+            raise ValueError(
+                f"invalid content_hash for node {node.uuid}: "
+                f"expected {computed_content_hash}, got {node.content_hash}"
+            )
+        computed_state_hash = node._recompute_state_hash()
+        if node.state_hash != computed_state_hash:
+            raise ValueError(
+                f"invalid state_hash for node {node.uuid}: "
+                f"expected {computed_state_hash}, got {node.state_hash}"
+            )
+        return node
+
+
+# - -  TransportLayer - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+class TransportLayer:
+
+    def __init__(self, port: int):
+        self.address = f"http://127.0.0.1:{port}"
+        self.lock    = threading.RLock()
+        self.pool    = ThreadPoolExecutor(max_workers=8, thread_name_prefix="sov")
+
+        # My PRSP  root is the SI node itself
+        self.prsp   = PRSPNode(data={"label": self.address})
+        self._index: dict[str, PRSPNode] = {}
+        self._index_subtree(self.prsp)
+
+        # Network
+        self.members:          set[str]                      = {self.address}
+        self.peer_perspectives: dict[str, PRSPNode | None]   = {}
+        self.peer_topics:       dict[str, str]                = {}
+
+    # - -  Index management - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def _index_subtree(self, node: PRSPNode) -> None:
+        self._index[node.uuid] = node
+        for child in node.children:
+            self._index_subtree(child)
+
+    def _deindex_subtree(self, node: PRSPNode) -> None:
+        for child in node.children:
+            self._deindex_subtree(child)
+        self._index.pop(node.uuid, None)
+
+    def _cascade_hash(self, node_uuid: str) -> None:
+        """Recompute hashes bottom-up from node_uuid to root."""
+        current_uuid = node_uuid
+        while current_uuid:
+            node = self._index.get(current_uuid)
+            if not node:
+                break
+            node._refresh_hashes()
+            current_uuid = node.parent_uuid
+
+    # - -  PRSP Operations - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def create_child(self, parent_uuid: str, data: dict,
+                     weights: dict[str, float] | None = None) -> "PRSPNode | None":
+        with self.lock:
+            parent = self._index.get(parent_uuid)
+            if not parent:
+                return None
+            child = PRSPNode(data=data, weights=weights, parent_uuid=parent_uuid)
+            parent.children.append(child)
+            self._index_subtree(child)
+            self._cascade_hash(parent_uuid)
+            changed = parent_uuid
+
+        self._trigger_sync(changed)
+        return child
+
+    def modify(self, node_uuid: str, data: dict,
+               weights: dict[str, float] | None = None) -> bool:
+        """Replace data and/or weights. Children/parents untouched. Sets updated_at."""
+        with self.lock:
+            node = self._index.get(node_uuid)
+            if not node:
+                return False
+            node.data = dict(data or {})
+            if weights is not None:
+                node.weights = dict(weights or {})
+            node.updated_at = now_iso()
+            self._cascade_hash(node_uuid)
+            changed = node_uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    def substitute(self, node_uuid: str,
+                   new_children: list[dict]) -> bool:
+        """Replace all children with new_children specs. Sets created_at. Parents untouched."""
+        with self.lock:
+            node = self._index.get(node_uuid)
+            if not node:
+                return False
+            for child in node.children:
+                self._deindex_subtree(child)
+            node.children = []
+            node.created_at = now_iso()
+            for spec in new_children:
+                child = PRSPNode(
+                    data=spec.get("data", {}),
+                    weights=spec.get("weights"),
+                    parent_uuid=node_uuid,
+                )
+                node.children.append(child)
+                self._index_subtree(child)
+            self._cascade_hash(node_uuid)
+            changed = node_uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    def delete(self, node_uuid: str) -> bool:
+        """Delete node and all descendants. Cannot delete root."""
+        with self.lock:
+            node = self._index.get(node_uuid)
+            if not node or node.parent_uuid is None:
+                return False
+            parent = self._index.get(node.parent_uuid)
+            if not parent:
+                return False
+            self._deindex_subtree(node)
+            parent.children = [c for c in parent.children if c.uuid != node_uuid]
+            self._cascade_hash(parent.uuid)
+            changed = parent.uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    # - -  Subtree access - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def propose(self, node_uuid: str, proposal_type: str,
+                payload: dict | None = None,
+                target_uuid: str | None = None,
+                base_hash: str | None = None) -> dict | None:
+        with self.lock:
+            node = self._index.get(node_uuid)
+            if not node:
+                return None
+            target_uuid = target_uuid or node_uuid
+            target = self._index.get(target_uuid)
+            proposal = {
+                "uuid": str(uuid_mod.uuid4()),
+                "type": proposal_type,
+                "target_uuid": target_uuid,
+                "payload": payload or {},
+                "base_hash": base_hash or (target.content_hash if target else None),
+                "author": self.address,
+                "created_at": now_iso(),
+                "status": "open",
+            }
+            node.proposals.append(proposal)
+            node.updated_at = now_iso()
+            self._cascade_hash(node_uuid)
+            changed = node_uuid
+
+        self._trigger_sync(changed)
+        return proposal
+
+    def remove_proposal(self, proposal_uuid: str) -> bool:
+        with self.lock:
+            found = self._find_proposal(self.prsp, proposal_uuid)
+            if not found:
+                return False
+            node, _ = found
+            node.proposals = [
+                p for p in node.proposals if p.get("uuid") != proposal_uuid
+            ]
+            node.updated_at = now_iso()
+            self._cascade_hash(node.uuid)
+            changed = node.uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    def accept_proposal(self, proposal_uuid: str,
+                        source_addr: str | None = None) -> bool:
+        with self.lock:
+            proposal = self._get_visible_proposal(proposal_uuid, source_addr)
+            if not proposal:
+                return False
+            action = self._proposal_action(proposal)
+            target_uuid = action.get("target_uuid")
+            anchor_uuid = self._acceptance_anchor_uuid(target_uuid, action.get("type"))
+            ok, changed_uuid = self._apply_proposal_action(action)
+            if not ok:
+                return False
+            acceptance = {
+                "uuid": str(uuid_mod.uuid4()),
+                "type": "acceptance",
+                "target_uuid": target_uuid,
+                "payload": {
+                    "proposal": action,
+                    "accepted_proposal_uuid": proposal.get("uuid"),
+                    "source_addr": source_addr or self.address,
+                },
+                "base_hash": proposal.get("base_hash"),
+                "author": self.address,
+                "created_at": now_iso(),
+                "status": "accepted",
+            }
+            anchor = self._index.get(anchor_uuid) if anchor_uuid else None
+            if anchor:
+                anchor.proposals.append(acceptance)
+                anchor.updated_at = now_iso()
+                self._cascade_hash(anchor.uuid)
+                changed_uuid = anchor.uuid
+
+        self._trigger_sync(changed_uuid)
+        return True
+
+    def list_proposals(self) -> list[dict]:
+        with self.lock:
+            out = []
+            self._collect_proposals(out, self.address, self.prsp, local=True)
+            for addr, tree in self.peer_perspectives.items():
+                if tree:
+                    self._collect_proposals(out, addr, tree, local=False)
+            return out
+
+    def _collect_proposals(self, out: list[dict], addr: str,
+                           node: PRSPNode, local: bool) -> None:
+        for proposal in node.proposals:
+            out.append({
+                "addr": addr,
+                "local": local,
+                "node_uuid": node.uuid,
+                "node_label": node.data.get("name")
+                              or node.data.get("title")
+                              or node.data.get("label")
+                              or "Node",
+                "proposal": proposal,
+            })
+        for child in node.children:
+            self._collect_proposals(out, addr, child, local)
+
+    def _find_proposal(self, root: PRSPNode,
+                       proposal_uuid: str) -> tuple[PRSPNode, dict] | None:
+        for proposal in root.proposals:
+            if proposal.get("uuid") == proposal_uuid:
+                return root, proposal
+        for child in root.children:
+            found = self._find_proposal(child, proposal_uuid)
+            if found:
+                return found
+        return None
+
+    def _get_visible_proposal(self, proposal_uuid: str,
+                              source_addr: str | None) -> dict | None:
+        if source_addr in (None, "", self.address):
+            found = self._find_proposal(self.prsp, proposal_uuid)
+            return found[1] if found else None
+        tree = self.peer_perspectives.get(source_addr)
+        if not tree:
+            return None
+        found = self._find_proposal(tree, proposal_uuid)
+        return found[1] if found else None
+
+    @staticmethod
+    def _proposal_action(proposal: dict) -> dict:
+        if proposal.get("type") != "acceptance":
+            return proposal
+        payload = proposal.get("payload", {})
+        return payload.get("proposal", proposal)
+
+    def _acceptance_anchor_uuid(self, target_uuid: str | None,
+                                proposal_type: str | None) -> str | None:
+        target = self._index.get(target_uuid) if target_uuid else None
+        if not target:
+            return self.prsp.uuid
+        if proposal_type == "delete":
+            return target.parent_uuid or target.uuid
+        return target.uuid
+
+    def _apply_proposal_action(self, proposal: dict) -> tuple[bool, str]:
+        proposal_type = proposal.get("type")
+        target_uuid = proposal.get("target_uuid")
+        payload = proposal.get("payload", {})
+
+        if proposal_type == "modify":
+            node = self._index.get(target_uuid)
+            if not node:
+                return False, self.prsp.uuid
+            if "data" in payload:
+                node.data = dict(payload.get("data") or {})
+            if "weights" in payload:
+                node.weights = dict(payload.get("weights") or {})
+            node.updated_at = now_iso()
+            self._cascade_hash(target_uuid)
+            return True, target_uuid
+
+        if proposal_type == "create_child":
+            parent = self._index.get(target_uuid)
+            if not parent:
+                return False, self.prsp.uuid
+            child = PRSPNode(
+                data=payload.get("data", {}),
+                weights=payload.get("weights"),
+                parent_uuid=target_uuid,
+            )
+            parent.children.append(child)
+            self._index_subtree(child)
+            self._cascade_hash(target_uuid)
+            return True, target_uuid
+
+        if proposal_type == "substitute":
+            node = self._index.get(target_uuid)
+            if not node:
+                return False, self.prsp.uuid
+            for child in node.children:
+                self._deindex_subtree(child)
+            node.children = []
+            node.created_at = now_iso()
+            for spec in payload.get("children", []):
+                child = PRSPNode(
+                    data=spec.get("data", {}),
+                    weights=spec.get("weights"),
+                    parent_uuid=target_uuid,
+                )
+                node.children.append(child)
+                self._index_subtree(child)
+            self._cascade_hash(target_uuid)
+            return True, target_uuid
+
+        if proposal_type == "move":
+            node = self._index.get(target_uuid)
+            new_parent_uuid = payload.get("new_parent_uuid")
+            new_parent = self._index.get(new_parent_uuid)
+            if not node or node.parent_uuid is None or not new_parent:
+                return False, self.prsp.uuid
+            if node.uuid == new_parent.uuid or self._is_descendant(node, new_parent.uuid):
+                return False, self.prsp.uuid
+            old_parent = self._index.get(node.parent_uuid)
+            if not old_parent:
+                return False, self.prsp.uuid
+            old_parent.children = [c for c in old_parent.children if c.uuid != node.uuid]
+            node.parent_uuid = new_parent.uuid
+            new_parent.children.append(node)
+            node.updated_at = now_iso()
+            self._cascade_hash(old_parent.uuid)
+            self._cascade_hash(new_parent.uuid)
+            return True, new_parent.uuid
+
+        if proposal_type == "delete":
+            node = self._index.get(target_uuid)
+            if not node or node.parent_uuid is None:
+                return False, self.prsp.uuid
+            parent = self._index.get(node.parent_uuid)
+            if not parent:
+                return False, self.prsp.uuid
+            self._deindex_subtree(node)
+            parent.children = [c for c in parent.children if c.uuid != target_uuid]
+            self._cascade_hash(parent.uuid)
+            return True, parent.uuid
+
+        return False, self.prsp.uuid
+
+    @staticmethod
+    def _is_descendant(root: PRSPNode, uuid: str) -> bool:
+        return any(
+            child.uuid == uuid or TransportLayer._is_descendant(child, uuid)
+            for child in root.children
+        )
+
+    def get_subtree(self, node_uuid: str) -> dict | None:
+        with self.lock:
+            node = self._index.get(node_uuid)
+            if not node:
+                return None
+            return {"subtree": node.to_dict(), "parent_uuid": node.parent_uuid}
+
+    def fetch_peer_subtree(self, peer_addr: str, node_uuid: str) -> PRSPNode:
+        r = requests.get(f"{peer_addr}/p2p/subtree/{node_uuid}", timeout=5)
+        r.raise_for_status()
+        return PRSPNode.from_dict(r.json()["subtree"])
+
+    def get_cached_peer_subtree(self, peer_addr: str, node_uuid: str) -> PRSPNode | None:
+        with self.lock:
+            tree = self.peer_perspectives.get(peer_addr)
+            if not tree:
+                return None
+            node = self._find_in_tree(tree, node_uuid)
+            if not node:
+                return None
+            return PRSPNode.from_dict(node.to_dict())
+
+    # - -  Sync  outbound - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def _trigger_sync(self, changed_uuid: str) -> None:
+        with self.lock:
+            peers = set(self.members) - {self.address}
+            pings = []
+            for peer in peers:
+                topic_uuid = self.peer_topics.get(peer)
+                if not topic_uuid:
+                    continue
+                topic = self._index.get(topic_uuid)
+                if not topic:
+                    continue
+                pings.append((peer, topic_uuid, topic.state_hash, changed_uuid))
+
+        for peer, topic_uuid, topic_state_hash, changed in pings:
+            self.pool.submit(self._ping, peer, topic_uuid, topic_state_hash, changed)
+
+    def _ping(self, peer_addr: str, topic_uuid: str, topic_state_hash: str,
+              changed_uuid: str) -> None:
+        try:
+            requests.post(
+                f"{peer_addr}/p2p/ping",
+                json={"from_addr": self.address,
+                      "topic_uuid": topic_uuid,
+                      "topic_state_hash": topic_state_hash,
+                      "changed_uuid": changed_uuid},
+                timeout=3,
+            ).raise_for_status()
+        except Exception as e:
+            log.debug("ping  %s failed: %s", peer_addr, e)
+
+    # - -  Sync  inbound pull - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def _pull_subtree(self, peer_addr: str, node_uuid: str) -> None:
+        try:
+            r = requests.get(f"{peer_addr}/p2p/subtree/{node_uuid}", timeout=5)
+            if r.status_code == 404:
+                return
+            payload      = r.json()
+            subtree      = PRSPNode.from_dict(payload["subtree"])
+            parent_uuid  = payload.get("parent_uuid")
+            with self.lock:
+                self._merge_subtree(peer_addr, subtree, parent_uuid)
+        except Exception as e:
+            log.debug("pull_subtree  %s failed: %s", peer_addr, e)
+
+    def _merge_subtree(self, peer_addr: str,
+                        subtree: PRSPNode, parent_uuid: str | None) -> None:
+        """Replace matching node in cached peer PRSP with incoming subtree."""
+        cached = self.peer_perspectives.get(peer_addr)
+        if cached is None:
+            self.peer_perspectives[peer_addr] = subtree
+            return
+
+        target = self._find_in_tree(cached, subtree.uuid)
+        if target is None:
+            parent = self._find_in_tree(cached, parent_uuid) if parent_uuid else None
+            if parent:
+                parent.children = [
+                    child for child in parent.children
+                    if child.uuid != subtree.uuid
+                ]
+                subtree.parent_uuid = parent.uuid
+                parent.children.append(subtree)
+                self._refresh_tree_hashes(cached)
+                return
+            self.peer_perspectives[peer_addr] = subtree
+            return
+
+        # In-place replacement  keeps object identity in the parent's children list
+        target.created_at  = subtree.created_at
+        target.updated_at  = subtree.updated_at
+        target.content_hash = subtree.content_hash
+        target.state_hash   = subtree.state_hash
+        target.weights     = subtree.weights
+        target.proposals   = subtree.proposals
+        target.data        = subtree.data
+        target.children    = subtree.children
+        self._refresh_tree_hashes(cached)
+
+    @staticmethod
+    def _find_in_tree(root: PRSPNode, uuid: str) -> "PRSPNode | None":
+        if root.uuid == uuid:
+            return root
+        for child in root.children:
+            found = TransportLayer._find_in_tree(child, uuid)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def _refresh_tree_hashes(node: PRSPNode) -> None:
+        for child in node.children:
+            TransportLayer._refresh_tree_hashes(child)
+        node._refresh_hashes()
+
+    # - -  P2P handlers (called by server routes) - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def p2p_ping(self, payload: dict) -> tuple[dict, int]:
+        from_addr    = payload.get("from_addr")
+        topic_uuid = payload.get("topic_uuid")
+        topic_state_hash = payload.get("topic_state_hash")
+        changed_uuid = payload.get("changed_uuid")
+        if not from_addr:
+            return {"status": "error", "reason": "missing from_addr"}, 400
+        if not topic_uuid:
+            return {"status": "error", "reason": "missing topic_uuid"}, 400
+
+        with self.lock:
+            active_topic_uuid = next(iter(self.peer_topics.values()), None)
+            if active_topic_uuid and active_topic_uuid != topic_uuid:
+                return {
+                    "status": "error",
+                    "reason": "already discussing a different topic",
+                }, 409
+            self.members.add(from_addr)            # accept unknown pingers
+            self.peer_topics[from_addr] = topic_uuid
+            cached      = self.peer_perspectives.get(from_addr)
+            cached_state_hash = cached.state_hash if cached else None
+
+        if cached_state_hash != topic_state_hash:
+            pull_uuid = changed_uuid if cached and changed_uuid else topic_uuid
+            self.pool.submit(self._pull_subtree, from_addr, pull_uuid)
+
+        return {"status": "ok"}, 200
+
+    def p2p_join(self, payload: dict) -> tuple[dict, int]:
+        from_addr = payload.get("from_addr")
+        topic_uuid = payload.get("topic_uuid")
+        known_members = set(payload.get("known_members") or [])
+        if not from_addr:
+            return {"status": "error", "reason": "missing from_addr"}, 400
+        if not topic_uuid:
+            return {"status": "error", "reason": "missing topic_uuid"}, 400
+
+        with self.lock:
+            active_topic_uuid = next(iter(self.peer_topics.values()), None)
+            if active_topic_uuid and active_topic_uuid != topic_uuid:
+                return {
+                    "status": "error",
+                    "reason": "already discussing a different topic",
+                }, 409
+            self.members.add(from_addr)
+            self.peer_topics[from_addr] = topic_uuid
+            self.peer_perspectives.pop(from_addr, None)
+            for member in known_members:
+                if member != self.address:
+                    self.members.add(member)
+                    self.peer_topics[member] = topic_uuid
+                    if member != from_addr:
+                        self.peer_perspectives.pop(member, None)
+            members_snapshot = sorted(self.members)
+
+        self.pool.submit(self._pull_subtree, from_addr, topic_uuid)
+        for member in known_members:
+            if member not in (self.address, from_addr):
+                self.pool.submit(self._pull_subtree, member, topic_uuid)
+        return {"status": "ok", "members": members_snapshot}, 200
+
+    def p2p_announce(self, payload: dict) -> tuple[dict, int]:
+        new_addr = payload.get("new_addr")
+        topic_uuid = payload.get("topic_uuid")
+        if not new_addr:
+            return {"status": "error", "reason": "missing new_addr"}, 400
+        if not topic_uuid:
+            return {"status": "error", "reason": "missing topic_uuid"}, 400
+        with self.lock:
+            active_topic_uuid = next(iter(self.peer_topics.values()), None)
+            if active_topic_uuid and active_topic_uuid != topic_uuid:
+                return {
+                    "status": "error",
+                    "reason": "already discussing a different topic",
+                }, 409
+            self.members.add(new_addr)
+            self.peer_topics[new_addr] = topic_uuid
+            self.peer_perspectives.pop(new_addr, None)
+        self.pool.submit(self._pull_subtree, new_addr, topic_uuid)
+        return {"status": "ok"}, 200
+
+    def p2p_leave(self, payload: dict) -> tuple[dict, int]:
+        from_addr = payload.get("from_addr")
+        with self.lock:
+            self.members.discard(from_addr)
+            self.peer_perspectives.pop(from_addr, None)
+            self.peer_topics.pop(from_addr, None)
+        return {"status": "ok"}, 200
+
+    # - -  Network actions (called by server on behalf of UI) - - - - - - - - - - - - - - - - - - - - 
+
+    def invite_to_discuss(self, peer_addr: str, topic_uuid: str) -> dict:
+        try:
+            if not topic_uuid:
+                return {"status": "error", "reason": "topic_uuid is required"}
+            r = requests.post(
+                f"{peer_addr}/api/join_discussion",
+                json={"address": self.address, "topic_uuid": topic_uuid},
+                timeout=5,
+            )
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+    def join_discussion(self, target_addr: str, topic_uuid: str) -> dict:
+        try:
+            if not topic_uuid:
+                return {"status": "error", "reason": "topic_uuid is required"}
+            with self.lock:
+                known_members = sorted(self.members)
+            payload = {
+                "from_addr": self.address,
+                "topic_uuid": topic_uuid,
+                "known_members": known_members,
+            }
+            r = requests.post(
+                f"{target_addr}/p2p/join",
+                json=payload,
+                timeout=5,
+            )
+            r.raise_for_status()
+            members = r.json().get("members", [])
+
+            with self.lock:
+                for m in members:
+                    self.members.add(m)
+
+            # Announce ourselves to everyone the target knows (except target and self)
+            for member in members:
+                if member in (self.address, target_addr):
+                    continue
+                try:
+                    announce_payload = {"new_addr": self.address}
+                    announce_payload["topic_uuid"] = topic_uuid
+                    requests.post(
+                        f"{member}/p2p/announce",
+                        json=announce_payload,
+                        timeout=3,
+                    )
+                except Exception:
+                    pass
+
+            # Announce everyone to everyone so a newly connected discussion becomes a mesh.
+            all_members = set(members) | {self.address, target_addr}
+            for member in all_members:
+                if member == self.address:
+                    continue
+                for other in all_members:
+                    if other in (member, self.address):
+                        continue
+                    try:
+                        requests.post(
+                            f"{member}/p2p/announce",
+                            json={"new_addr": other, "topic_uuid": topic_uuid},
+                            timeout=3,
+                        )
+                    except Exception:
+                        pass
+
+            # Pull trees from all known peers
+            for member in all_members:
+                if member != self.address:
+                    with self.lock:
+                        self.peer_topics[member] = topic_uuid
+                        self.peer_perspectives.pop(member, None)
+                    self.pool.submit(self._pull_subtree, member, topic_uuid)
+
+            return {"status": "ok", "members": members}
+        except Exception as e:
+            return {"status": "error", "reason": str(e)}
+
+    def do_leave(self) -> None:
+        with self.lock:
+            peers           = set(self.members) - {self.address}
+            peer_topics     = dict(self.peer_topics)
+            self.members    = {self.address}
+            self.peer_perspectives.clear()
+            self.peer_topics.clear()
+
+        for peer in peers:
+            topic_uuid = peer_topics.get(peer)
+            if not topic_uuid:
+                continue
+            for other in peers:
+                if other == peer:
+                    continue
+                try:
+                    requests.post(
+                        f"{peer}/p2p/announce",
+                        json={"new_addr": other, "topic_uuid": topic_uuid},
+                        timeout=2,
+                    )
+                except Exception:
+                    pass
+
+        for peer in peers:
+            try:
+                requests.post(f"{peer}/p2p/leave",
+                              json={"from_addr": self.address}, timeout=2)
+            except Exception:
+                pass
+
+    # - -  Info - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def get_network_info(self) -> dict:
+        with self.lock:
+            topic_uuid = next(iter(self.peer_topics.values()), None)
+            peers = {
+                addr: {"content_hash": tree.content_hash if tree else None,
+                       "state_hash": tree.state_hash if tree else None,
+                       "root_uuid": tree.uuid if tree else None,
+                       "topic_uuid": self.peer_topics.get(addr)}
+                for addr, tree in self.peer_perspectives.items()
+            }
+            return {
+                "address":   self.address,
+                "root_uuid": self.prsp.uuid,
+                "root_content_hash": self.prsp.content_hash,
+                "root_state_hash": self.prsp.state_hash,
+                "members":   sorted(self.members),
+                "peer_addresses": sorted(self.peer_perspectives.keys()),
+                "topic_uuid": topic_uuid,
+                "peers":     peers,
+            }
+
+
+
