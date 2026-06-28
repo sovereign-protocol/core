@@ -9,7 +9,6 @@ as capability key. There is no way to modify another SI's PRSP from outside.
 Operations on a PRSP:
   create_child   add a child node; parent hash cascades up
   modify         update data/weights; updated_at set; hash cascades up
-  substitute     replace all children; created_at reset; hash cascades up
   delete         remove node and all descendants; parent hash cascades up
   copy           copy a subtree under another parent with fresh UUIDs
   move           move a subtree under another parent
@@ -187,6 +186,37 @@ class TransportLayer:
             node._refresh_hashes()
             current_uuid = node.parent_uuid
 
+    def _ancestor_uuids(self, node_uuid: str | None) -> list[str]:
+        out = []
+        current_uuid = node_uuid
+        while current_uuid:
+            out.append(current_uuid)
+            node = self._index.get(current_uuid)
+            current_uuid = node.parent_uuid if node else None
+        return out
+
+    def _lowest_common_ancestor_uuid(self, first_uuid: str, second_uuid: str) -> str | None:
+        second_ancestors = set(self._ancestor_uuids(second_uuid))
+        for uuid in self._ancestor_uuids(first_uuid):
+            if uuid in second_ancestors:
+                return uuid
+        return None
+
+    def _topic_ancestor_for(self, node_uuid: str) -> str | None:
+        topic_uuids = set(self.peer_topics.values())
+        for uuid in self._ancestor_uuids(node_uuid):
+            if uuid in topic_uuids:
+                return uuid
+        return None
+
+    def _sync_root_for_structural_change(self, first_parent_uuid: str,
+                                         second_parent_uuid: str) -> str:
+        common_uuid = self._lowest_common_ancestor_uuid(first_parent_uuid, second_parent_uuid)
+        if not common_uuid:
+            return second_parent_uuid
+        topic_uuid = self._topic_ancestor_for(common_uuid)
+        return topic_uuid or common_uuid
+
     # - -  PRSP Operations - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
     def create_child(self, parent_uuid: str, data: dict,
@@ -215,31 +245,6 @@ class TransportLayer:
             if weights is not None:
                 node.weights = dict(weights or {})
             node.updated_at = now_iso()
-            self._cascade_hash(node_uuid)
-            changed = node_uuid
-
-        self._trigger_sync(changed)
-        return True
-
-    def substitute(self, node_uuid: str,
-                   new_children: list[dict]) -> bool:
-        """Replace all children with new_children specs. Sets created_at. Parents untouched."""
-        with self.lock:
-            node = self._index.get(node_uuid)
-            if not node or self._change_blocked_by_active_proposal([node_uuid]):
-                return False
-            for child in node.children:
-                self._deindex_subtree(child)
-            node.children = []
-            node.created_at = now_iso()
-            for spec in new_children:
-                child = PRSPNode(
-                    data=spec.get("data", {}),
-                    weights=spec.get("weights"),
-                    parent_uuid=node_uuid,
-                )
-                node.children.append(child)
-                self._index_subtree(child)
             self._cascade_hash(node_uuid)
             changed = node_uuid
 
@@ -298,6 +303,7 @@ class TransportLayer:
                 return False
             if old_parent.uuid == destination.uuid:
                 return True
+            changed = self._sync_root_for_structural_change(old_parent.uuid, destination.uuid)
             old_parent.children = [
                 child for child in old_parent.children if child.uuid != node.uuid
             ]
@@ -306,7 +312,6 @@ class TransportLayer:
             destination.children.append(node)
             self._cascade_hash(old_parent.uuid)
             self._cascade_hash(destination.uuid)
-            changed = destination.uuid
 
         self._trigger_sync(changed)
         return True
@@ -537,7 +542,6 @@ class TransportLayer:
             keys = {
                 "create_child": ["parent_uuid"],
                 "modify": ["node_uuid"],
-                "substitute": ["node_uuid"],
                 "delete": ["node_uuid"],
                 "copy": ["source_uuid", "destination_uuid"],
                 "move": ["source_uuid", "destination_uuid"],
@@ -594,8 +598,6 @@ class TransportLayer:
             node.updated_at = now_iso()
             self._cascade_hash(node.uuid)
             return True
-        if op_type == "substitute":
-            return self._substitute_locked(op.get("node_uuid"), op.get("children", []))
         if op_type == "delete":
             return self._delete_locked(op.get("node_uuid"))
         if op_type == "copy":
@@ -611,25 +613,6 @@ class TransportLayer:
         if op_type == "move":
             return self._move_locked(op.get("source_uuid"), op.get("destination_uuid"))
         return False
-
-    def _substitute_locked(self, node_uuid: str, new_children: list[dict]) -> bool:
-        node = self._index.get(node_uuid)
-        if not node:
-            return False
-        for child in node.children:
-            self._deindex_subtree(child)
-        node.children = []
-        node.created_at = now_iso()
-        for spec in new_children:
-            child = PRSPNode(
-                data=spec.get("data", {}),
-                weights=spec.get("weights"),
-                parent_uuid=node_uuid,
-            )
-            node.children.append(child)
-            self._index_subtree(child)
-        self._cascade_hash(node_uuid)
-        return True
 
     def _delete_locked(self, node_uuid: str) -> bool:
         node = self._index.get(node_uuid)
@@ -813,8 +796,11 @@ class TransportLayer:
             self.peer_perspectives[peer_addr] = subtree
             return
 
+        subtree_uuids = self._collect_subtree_uuids(subtree)
         target = self._find_in_tree(cached, subtree.uuid)
         if target is None:
+            for uuid in subtree_uuids:
+                self._remove_uuid_from_tree(cached, uuid)
             parent = self._find_in_tree(cached, parent_uuid) if parent_uuid else None
             if parent:
                 parent.children = [
@@ -829,6 +815,7 @@ class TransportLayer:
             return
 
         # In-place replacement  keeps object identity in the parent's children list
+        self._remove_duplicate_subtree_uuids(cached, subtree_uuids, keep_uuid=subtree.uuid)
         target.created_at  = subtree.created_at
         target.updated_at  = subtree.updated_at
         target.content_hash = subtree.content_hash
@@ -838,6 +825,27 @@ class TransportLayer:
         target.data        = subtree.data
         target.children    = subtree.children
         self._refresh_tree_hashes(cached)
+
+    def _collect_subtree_uuids(self, node: PRSPNode) -> set[str]:
+        out = {node.uuid}
+        for child in node.children:
+            out.update(self._collect_subtree_uuids(child))
+        return out
+
+    def _remove_uuid_from_tree(self, root: PRSPNode, uuid: str) -> bool:
+        original_len = len(root.children)
+        root.children = [child for child in root.children if child.uuid != uuid]
+        removed = len(root.children) != original_len
+        for child in root.children:
+            removed = self._remove_uuid_from_tree(child, uuid) or removed
+        return removed
+
+    def _remove_duplicate_subtree_uuids(self, root: PRSPNode,
+                                        subtree_uuids: set[str],
+                                        keep_uuid: str) -> None:
+        for uuid in subtree_uuids:
+            if uuid != keep_uuid:
+                self._remove_uuid_from_tree(root, uuid)
 
     @staticmethod
     def _find_in_tree(root: PRSPNode, uuid: str) -> "PRSPNode | None":
