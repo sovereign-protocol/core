@@ -11,6 +11,8 @@ Operations on a PRSP:
   modify         update data/weights; updated_at set; hash cascades up
   substitute     replace all children; created_at reset; hash cascades up
   delete         remove node and all descendants; parent hash cascades up
+  copy           copy a subtree under another parent with fresh UUIDs
+  move           move a subtree under another parent
 
 Sync protocol (delta-first):
   mutate  ping peers {topic_uuid, topic_state_hash, changed_uuid}
@@ -22,6 +24,7 @@ import json
 import logging
 import threading
 import uuid as uuid_mod
+import copy as copy_mod
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 
@@ -49,15 +52,9 @@ def content_hash(data: dict, weights: dict, child_content_hashes: list[str]) -> 
     })
 
 
-def state_hash(node_content_hash: str, proposals: list[dict],
-               child_state_hashes: list[str]) -> str:
-    ordered_proposals = sorted(
-        proposals,
-        key=lambda p: json.dumps(p, sort_keys=True, separators=(",", ":")),
-    )
+def state_hash(node_content_hash: str, child_state_hashes: list[str]) -> str:
     return stable_hash({
         "content_hash": node_content_hash,
-        "proposals": ordered_proposals,
         "children": child_state_hashes,
     })
 
@@ -98,7 +95,7 @@ class PRSPNode:
                             sorted(c.content_hash for c in self.children))
 
     def _recompute_state_hash(self) -> str:
-        return state_hash(self.content_hash, self.proposals,
+        return state_hash(self.content_hash,
                           sorted(c.state_hash for c in self.children))
 
     def _refresh_hashes(self) -> None:
@@ -196,7 +193,7 @@ class TransportLayer:
                      weights: dict[str, float] | None = None) -> "PRSPNode | None":
         with self.lock:
             parent = self._index.get(parent_uuid)
-            if not parent:
+            if not parent or self._change_blocked_by_active_proposal([parent_uuid]):
                 return None
             child = PRSPNode(data=data, weights=weights, parent_uuid=parent_uuid)
             parent.children.append(child)
@@ -212,7 +209,7 @@ class TransportLayer:
         """Replace data and/or weights. Children/parents untouched. Sets updated_at."""
         with self.lock:
             node = self._index.get(node_uuid)
-            if not node:
+            if not node or self._change_blocked_by_active_proposal([node_uuid]):
                 return False
             node.data = dict(data or {})
             if weights is not None:
@@ -229,7 +226,7 @@ class TransportLayer:
         """Replace all children with new_children specs. Sets created_at. Parents untouched."""
         with self.lock:
             node = self._index.get(node_uuid)
-            if not node:
+            if not node or self._change_blocked_by_active_proposal([node_uuid]):
                 return False
             for child in node.children:
                 self._deindex_subtree(child)
@@ -255,6 +252,8 @@ class TransportLayer:
             node = self._index.get(node_uuid)
             if not node or node.parent_uuid is None:
                 return False
+            if self._change_blocked_by_active_proposal([node_uuid]):
+                return False
             parent = self._index.get(node.parent_uuid)
             if not parent:
                 return False
@@ -266,99 +265,456 @@ class TransportLayer:
         self._trigger_sync(changed)
         return True
 
-    # - -  Subtree access - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
-
-    def propose(self, node_uuid: str, proposal_type: str,
-                payload: dict | None = None,
-                target_uuid: str | None = None,
-                base_hash: str | None = None) -> dict | None:
+    def copy(self, source_uuid: str, destination_uuid: str) -> PRSPNode | None:
+        """Copy source subtree under destination with fresh UUIDs."""
         with self.lock:
-            node = self._index.get(node_uuid)
-            if not node:
+            source = self._index.get(source_uuid)
+            destination = self._index.get(destination_uuid)
+            if (not source or not destination
+                    or self._change_blocked_by_active_proposal([destination_uuid])):
                 return None
-            target_uuid = target_uuid or node_uuid
-            target = self._index.get(target_uuid)
+            clone = self._clone_subtree(source, destination.uuid)
+            destination.children.append(clone)
+            self._index_subtree(clone)
+            self._cascade_hash(destination.uuid)
+            changed = destination.uuid
+
+        self._trigger_sync(changed)
+        return clone
+
+    def move(self, source_uuid: str, destination_uuid: str) -> bool:
+        """Move source subtree under destination. Cannot move root or create cycles."""
+        with self.lock:
+            node = self._index.get(source_uuid)
+            destination = self._index.get(destination_uuid)
+            if not node or not destination or node.parent_uuid is None:
+                return False
+            if self._change_blocked_by_active_proposal([source_uuid, destination_uuid]):
+                return False
+            if node.uuid == destination.uuid or self._is_descendant(node, destination.uuid):
+                return False
+            old_parent = self._index.get(node.parent_uuid)
+            if not old_parent:
+                return False
+            if old_parent.uuid == destination.uuid:
+                return True
+            old_parent.children = [
+                child for child in old_parent.children if child.uuid != node.uuid
+            ]
+            node.parent_uuid = destination.uuid
+            node.updated_at = now_iso()
+            destination.children.append(node)
+            self._cascade_hash(old_parent.uuid)
+            self._cascade_hash(destination.uuid)
+            changed = destination.uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    def _clone_subtree(self, node: PRSPNode, parent_uuid: str | None) -> PRSPNode:
+        clone = PRSPNode(
+            data=copy_mod.deepcopy(node.data),
+            weights=copy_mod.deepcopy(node.weights),
+            parent_uuid=parent_uuid,
+        )
+        for child in node.children:
+            clone.children.append(self._clone_subtree(child, clone.uuid))
+        clone._refresh_hashes()
+        return clone
+
+    def _change_blocked_by_active_proposal(self, affected_uuids: list[str]) -> bool:
+        active_top_uuids = self._active_proposal_top_uuids(self.prsp)
+        for affected_uuid in affected_uuids:
+            affected = self._index.get(affected_uuid)
+            if not affected:
+                continue
+            for top_uuid in active_top_uuids:
+                top = self._index.get(top_uuid)
+                if not top:
+                    continue
+                if (affected.uuid == top.uuid
+                        or self._is_descendant(top, affected.uuid)
+                        or self._is_descendant(affected, top.uuid)):
+                    return True
+        return False
+
+    def _active_proposal_top_uuids(self, node: PRSPNode) -> set[str]:
+        out = set()
+        for proposal in node.proposals:
+            if proposal.get("status") == "active":
+                out.add(node.uuid)
+        for child in node.children:
+            out.update(self._active_proposal_top_uuids(child))
+        return out
+
+    # - -  Proposals - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
+
+    def propose(self, top_uuid: str, operations: list[dict]) -> dict | None:
+        with self.lock:
+            top = self._index.get(top_uuid)
+            if not top or self._proposal_inside_active_proposal(top_uuid):
+                return None
+            if not self._operations_within_top(top, operations):
+                return None
             proposal = {
                 "uuid": str(uuid_mod.uuid4()),
-                "type": proposal_type,
-                "target_uuid": target_uuid,
-                "payload": payload or {},
-                "base_hash": base_hash or (target.content_hash if target else None),
                 "author": self.address,
+                "top_uuid": top_uuid,
+                "base_state_hash": top.state_hash,
+                "operations": copy_mod.deepcopy(operations or []),
+                "acceptances": {},
+                "objections": {},
+                "status": "active",
                 "created_at": now_iso(),
-                "status": "open",
+                "updated_at": now_iso(),
             }
-            node.proposals.append(proposal)
-            node.updated_at = now_iso()
-            self._cascade_hash(node_uuid)
-            changed = node_uuid
+            top.proposals.append(proposal)
+            top.updated_at = now_iso()
+            changed = top_uuid
 
         self._trigger_sync(changed)
         return proposal
 
-    def remove_proposal(self, proposal_uuid: str) -> bool:
+    def amend_proposal(self, proposal_uuid: str, operations: list[dict]) -> bool:
         with self.lock:
-            found = self._find_proposal(self.prsp, proposal_uuid)
+            found = self._find_local_proposal(proposal_uuid)
             if not found:
                 return False
-            node, _ = found
-            node.proposals = [
-                p for p in node.proposals if p.get("uuid") != proposal_uuid
-            ]
-            node.updated_at = now_iso()
-            self._cascade_hash(node.uuid)
-            changed = node.uuid
+            top, proposal = found
+            if proposal.get("author") != self.address or proposal.get("status") != "active":
+                return False
+            if self._proposal_inside_active_proposal(top.uuid):
+                return False
+            if top.state_hash != proposal.get("base_state_hash"):
+                return False
+            if not self._operations_within_top(top, operations):
+                return False
+            proposal["operations"] = copy_mod.deepcopy(operations or [])
+            proposal["acceptances"] = {}
+            proposal["objections"] = {}
+            proposal["updated_at"] = now_iso()
+            top.updated_at = now_iso()
+            changed = top.uuid
 
         self._trigger_sync(changed)
         return True
 
-    def accept_proposal(self, proposal_uuid: str,
-                        source_addr: str | None = None) -> bool:
+    def take_back_proposal(self, proposal_uuid: str) -> bool:
+        with self.lock:
+            found = self._find_local_proposal(proposal_uuid)
+            if not found:
+                return False
+            top, proposal = found
+            if proposal.get("author") != self.address or proposal.get("status") != "active":
+                return False
+            if self._proposal_inside_active_proposal(top.uuid):
+                return False
+            proposal["status"] = "taken_back"
+            proposal["updated_at"] = now_iso()
+            changed = top.uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    def respond_to_proposal(self, proposal_uuid: str, response: str,
+                            source_addr: str | None = None) -> bool:
+        if response not in ("accept", "object"):
+            return False
         with self.lock:
             proposal = self._get_visible_proposal(proposal_uuid, source_addr)
-            if not proposal:
+            if not proposal or proposal.get("status") != "active":
                 return False
-            action = self._proposal_action(proposal)
-            target_uuid = action.get("target_uuid")
-            anchor_uuid = self._acceptance_anchor_uuid(target_uuid, action.get("type"))
-            ok, changed_uuid = self._apply_proposal_action(action)
-            if not ok:
+            top_uuid = proposal.get("top_uuid")
+            top = self._index.get(top_uuid)
+            if not top:
                 return False
-            acceptance = {
-                "uuid": str(uuid_mod.uuid4()),
-                "type": "acceptance",
-                "target_uuid": target_uuid,
-                "payload": {
-                    "proposal": action,
-                    "accepted_proposal_uuid": proposal.get("uuid"),
-                    "source_addr": source_addr or self.address,
-                },
-                "base_hash": proposal.get("base_hash"),
-                "author": self.address,
-                "created_at": now_iso(),
-                "status": "accepted",
-            }
-            anchor = self._index.get(anchor_uuid) if anchor_uuid else None
-            if anchor:
-                anchor.proposals.append(acceptance)
-                anchor.updated_at = now_iso()
-                self._cascade_hash(anchor.uuid)
-                changed_uuid = anchor.uuid
+            if self._proposal_inside_active_proposal(top.uuid):
+                return False
+            local = self._find_proposal_on_node(top, proposal_uuid)
+            if not local:
+                local = copy_mod.deepcopy(proposal)
+                local["acceptances"] = {}
+                local["objections"] = {}
+                top.proposals.append(local)
+            if response == "accept":
+                if top.state_hash != local.get("base_state_hash"):
+                    return False
+                local.setdefault("objections", {}).pop(self.address, None)
+                local.setdefault("acceptances", {})[self.address] = now_iso()
+            else:
+                local.setdefault("acceptances", {}).pop(self.address, None)
+                local.setdefault("objections", {})[self.address] = now_iso()
+            local["updated_at"] = now_iso()
+            changed = top.uuid
 
-        self._trigger_sync(changed_uuid)
+        self._trigger_sync(changed)
         return True
+
+    def integrate_proposal(self, proposal_uuid: str) -> bool:
+        with self.lock:
+            found = self._find_local_proposal(proposal_uuid)
+            if not found:
+                return False
+            top, proposal = found
+            if proposal.get("author") != self.address or proposal.get("status") != "active":
+                return False
+            if self._proposal_inside_active_proposal(top.uuid):
+                return False
+            if top.state_hash != proposal.get("base_state_hash"):
+                return False
+            if self._known_objections(proposal_uuid):
+                return False
+            if not self._execute_operations_locked(top, proposal.get("operations") or []):
+                return False
+            proposal["status"] = "integrated"
+            proposal["integrated_at"] = now_iso()
+            proposal["updated_at"] = now_iso()
+            changed = top.uuid if top.uuid in self._index else self.prsp.uuid
+
+        self._trigger_sync(changed)
+        return True
+
+    def reconcile_integrations(self) -> bool:
+        changed_uuids = []
+        with self.lock:
+            for _, peer_tree in self.peer_perspectives.items():
+                if not peer_tree:
+                    continue
+                for proposal in self._collect_tree_proposals(peer_tree):
+                    status = proposal.get("status")
+                    if status not in ("integrated", "taken_back"):
+                        continue
+                    top = self._index.get(proposal.get("top_uuid"))
+                    if not top:
+                        continue
+                    local = self._find_proposal_on_node(top, proposal.get("uuid"))
+                    if not local:
+                        continue
+                    accepted = self.address in local.get("acceptances", {})
+                    if status == "integrated" and accepted:
+                        if top.state_hash != local.get("base_state_hash"):
+                            local["status"] = "integration_failed"
+                            local["updated_at"] = now_iso()
+                            changed_uuids.append(top.uuid)
+                            continue
+                        if not self._execute_operations_locked(top, local.get("operations") or []):
+                            local["status"] = "integration_failed"
+                            local["updated_at"] = now_iso()
+                            changed_uuids.append(top.uuid)
+                            continue
+                    top.proposals = [
+                        p for p in top.proposals if p.get("uuid") != local.get("uuid")
+                    ]
+                    top.updated_at = now_iso()
+                    changed_uuids.append(top.uuid if top.uuid in self._index else self.prsp.uuid)
+
+        for changed_uuid in changed_uuids:
+            self._trigger_sync(changed_uuid)
+        return bool(changed_uuids)
 
     def list_proposals(self) -> list[dict]:
         with self.lock:
             out = []
-            self._collect_proposals(out, self.address, self.prsp, local=True)
+            self._collect_proposal_items(out, self.address, self.prsp, local=True)
             for addr, tree in self.peer_perspectives.items():
                 if tree:
-                    self._collect_proposals(out, addr, tree, local=False)
+                    self._collect_proposal_items(out, addr, tree, local=False)
             return out
 
-    def _collect_proposals(self, out: list[dict], addr: str,
-                           node: PRSPNode, local: bool) -> None:
+    def _proposal_inside_active_proposal(self, top_uuid: str) -> bool:
+        top = self._index.get(top_uuid)
+        for active_uuid in self._active_proposal_top_uuids(self.prsp):
+            active_top = self._index.get(active_uuid)
+            if active_top and active_uuid != top_uuid and self._is_descendant(active_top, top_uuid):
+                return True
+            if top and active_uuid != top_uuid and self._is_descendant(top, active_uuid):
+                return False
+        return False
+
+    def _operations_within_top(self, top: PRSPNode, operations: list[dict]) -> bool:
+        for op in operations or []:
+            op_type = op.get("type")
+            keys = {
+                "create_child": ["parent_uuid"],
+                "modify": ["node_uuid"],
+                "substitute": ["node_uuid"],
+                "delete": ["node_uuid"],
+                "copy": ["source_uuid", "destination_uuid"],
+                "move": ["source_uuid", "destination_uuid"],
+            }.get(op_type)
+            if not keys:
+                return False
+            for key in keys:
+                node_uuid = op.get(key)
+                if not node_uuid:
+                    return False
+                if node_uuid == top.uuid:
+                    if op_type in ("delete", "move"):
+                        return False
+                    continue
+                if not self._is_descendant(top, node_uuid):
+                    return False
+        return True
+
+    def _execute_operations_locked(self, top: PRSPNode, operations: list[dict]) -> bool:
+        if not self._operations_within_top(top, operations):
+            return False
+        snapshot = self.prsp.to_dict()
+        for op in operations:
+            if not self._execute_operation_locked(op):
+                self.prsp = PRSPNode.from_dict(snapshot)
+                self._index = {}
+                self._index_subtree(self.prsp)
+                return False
+        return True
+
+    def _execute_operation_locked(self, op: dict) -> bool:
+        op_type = op.get("type")
+        if op_type == "create_child":
+            parent = self._index.get(op.get("parent_uuid"))
+            if not parent:
+                return False
+            child = PRSPNode(
+                data=op.get("data", {}),
+                weights=op.get("weights"),
+                parent_uuid=parent.uuid,
+            )
+            parent.children.append(child)
+            self._index_subtree(child)
+            self._cascade_hash(parent.uuid)
+            return True
+        if op_type == "modify":
+            node = self._index.get(op.get("node_uuid"))
+            if not node:
+                return False
+            if "data" in op:
+                node.data = dict(op.get("data") or {})
+            if "weights" in op:
+                node.weights = dict(op.get("weights") or {})
+            node.updated_at = now_iso()
+            self._cascade_hash(node.uuid)
+            return True
+        if op_type == "substitute":
+            return self._substitute_locked(op.get("node_uuid"), op.get("children", []))
+        if op_type == "delete":
+            return self._delete_locked(op.get("node_uuid"))
+        if op_type == "copy":
+            source = self._index.get(op.get("source_uuid"))
+            destination = self._index.get(op.get("destination_uuid"))
+            if not source or not destination:
+                return False
+            clone = self._clone_subtree(source, destination.uuid)
+            destination.children.append(clone)
+            self._index_subtree(clone)
+            self._cascade_hash(destination.uuid)
+            return True
+        if op_type == "move":
+            return self._move_locked(op.get("source_uuid"), op.get("destination_uuid"))
+        return False
+
+    def _substitute_locked(self, node_uuid: str, new_children: list[dict]) -> bool:
+        node = self._index.get(node_uuid)
+        if not node:
+            return False
+        for child in node.children:
+            self._deindex_subtree(child)
+        node.children = []
+        node.created_at = now_iso()
+        for spec in new_children:
+            child = PRSPNode(
+                data=spec.get("data", {}),
+                weights=spec.get("weights"),
+                parent_uuid=node_uuid,
+            )
+            node.children.append(child)
+            self._index_subtree(child)
+        self._cascade_hash(node_uuid)
+        return True
+
+    def _delete_locked(self, node_uuid: str) -> bool:
+        node = self._index.get(node_uuid)
+        if not node or node.parent_uuid is None:
+            return False
+        parent = self._index.get(node.parent_uuid)
+        if not parent:
+            return False
+        self._deindex_subtree(node)
+        parent.children = [child for child in parent.children if child.uuid != node.uuid]
+        self._cascade_hash(parent.uuid)
+        return True
+
+    def _move_locked(self, source_uuid: str, destination_uuid: str) -> bool:
+        node = self._index.get(source_uuid)
+        destination = self._index.get(destination_uuid)
+        if not node or not destination or node.parent_uuid is None:
+            return False
+        if node.uuid == destination.uuid or self._is_descendant(node, destination.uuid):
+            return False
+        old_parent = self._index.get(node.parent_uuid)
+        if not old_parent:
+            return False
+        old_parent.children = [child for child in old_parent.children if child.uuid != node.uuid]
+        node.parent_uuid = destination.uuid
+        node.updated_at = now_iso()
+        destination.children.append(node)
+        self._cascade_hash(old_parent.uuid)
+        self._cascade_hash(destination.uuid)
+        return True
+
+    def _known_objections(self, proposal_uuid: str) -> dict:
+        objections = {}
+        found = self._find_local_proposal(proposal_uuid)
+        if found:
+            objections.update(found[1].get("objections", {}))
+        for _, tree in self.peer_perspectives.items():
+            if not tree:
+                continue
+            proposal = self._find_proposal_in_tree(tree, proposal_uuid)
+            if proposal:
+                objections.update(proposal.get("objections", {}))
+        return objections
+
+    def _find_local_proposal(self, proposal_uuid: str) -> tuple[PRSPNode, dict] | None:
+        return self._find_proposal_tuple(self.prsp, proposal_uuid)
+
+    def _find_proposal_tuple(self, node: PRSPNode,
+                             proposal_uuid: str) -> tuple[PRSPNode, dict] | None:
+        for proposal in node.proposals:
+            if proposal.get("uuid") == proposal_uuid:
+                return node, proposal
+        for child in node.children:
+            found = self._find_proposal_tuple(child, proposal_uuid)
+            if found:
+                return found
+        return None
+
+    def _find_proposal_in_tree(self, node: PRSPNode, proposal_uuid: str) -> dict | None:
+        found = self._find_proposal_tuple(node, proposal_uuid)
+        return found[1] if found else None
+
+    @staticmethod
+    def _find_proposal_on_node(node: PRSPNode, proposal_uuid: str | None) -> dict | None:
+        for proposal in node.proposals:
+            if proposal.get("uuid") == proposal_uuid:
+                return proposal
+        return None
+
+    def _get_visible_proposal(self, proposal_uuid: str,
+                              source_addr: str | None) -> dict | None:
+        if source_addr in (None, "", self.address):
+            found = self._find_local_proposal(proposal_uuid)
+            return found[1] if found else None
+        tree = self.peer_perspectives.get(source_addr)
+        return self._find_proposal_in_tree(tree, proposal_uuid) if tree else None
+
+    def _collect_tree_proposals(self, node: PRSPNode) -> list[dict]:
+        out = list(node.proposals)
+        for child in node.children:
+            out.extend(self._collect_tree_proposals(child))
+        return out
+
+    def _collect_proposal_items(self, out: list[dict], addr: str,
+                                node: PRSPNode, local: bool) -> None:
         for proposal in node.proposals:
             out.append({
                 "addr": addr,
@@ -371,128 +727,7 @@ class TransportLayer:
                 "proposal": proposal,
             })
         for child in node.children:
-            self._collect_proposals(out, addr, child, local)
-
-    def _find_proposal(self, root: PRSPNode,
-                       proposal_uuid: str) -> tuple[PRSPNode, dict] | None:
-        for proposal in root.proposals:
-            if proposal.get("uuid") == proposal_uuid:
-                return root, proposal
-        for child in root.children:
-            found = self._find_proposal(child, proposal_uuid)
-            if found:
-                return found
-        return None
-
-    def _get_visible_proposal(self, proposal_uuid: str,
-                              source_addr: str | None) -> dict | None:
-        if source_addr in (None, "", self.address):
-            found = self._find_proposal(self.prsp, proposal_uuid)
-            return found[1] if found else None
-        tree = self.peer_perspectives.get(source_addr)
-        if not tree:
-            return None
-        found = self._find_proposal(tree, proposal_uuid)
-        return found[1] if found else None
-
-    @staticmethod
-    def _proposal_action(proposal: dict) -> dict:
-        if proposal.get("type") != "acceptance":
-            return proposal
-        payload = proposal.get("payload", {})
-        return payload.get("proposal", proposal)
-
-    def _acceptance_anchor_uuid(self, target_uuid: str | None,
-                                proposal_type: str | None) -> str | None:
-        target = self._index.get(target_uuid) if target_uuid else None
-        if not target:
-            return self.prsp.uuid
-        if proposal_type == "delete":
-            return target.parent_uuid or target.uuid
-        return target.uuid
-
-    def _apply_proposal_action(self, proposal: dict) -> tuple[bool, str]:
-        proposal_type = proposal.get("type")
-        target_uuid = proposal.get("target_uuid")
-        payload = proposal.get("payload", {})
-
-        if proposal_type == "modify":
-            node = self._index.get(target_uuid)
-            if not node:
-                return False, self.prsp.uuid
-            if "data" in payload:
-                node.data = dict(payload.get("data") or {})
-            if "weights" in payload:
-                node.weights = dict(payload.get("weights") or {})
-            node.updated_at = now_iso()
-            self._cascade_hash(target_uuid)
-            return True, target_uuid
-
-        if proposal_type == "create_child":
-            parent = self._index.get(target_uuid)
-            if not parent:
-                return False, self.prsp.uuid
-            child = PRSPNode(
-                data=payload.get("data", {}),
-                weights=payload.get("weights"),
-                parent_uuid=target_uuid,
-            )
-            parent.children.append(child)
-            self._index_subtree(child)
-            self._cascade_hash(target_uuid)
-            return True, target_uuid
-
-        if proposal_type == "substitute":
-            node = self._index.get(target_uuid)
-            if not node:
-                return False, self.prsp.uuid
-            for child in node.children:
-                self._deindex_subtree(child)
-            node.children = []
-            node.created_at = now_iso()
-            for spec in payload.get("children", []):
-                child = PRSPNode(
-                    data=spec.get("data", {}),
-                    weights=spec.get("weights"),
-                    parent_uuid=target_uuid,
-                )
-                node.children.append(child)
-                self._index_subtree(child)
-            self._cascade_hash(target_uuid)
-            return True, target_uuid
-
-        if proposal_type == "move":
-            node = self._index.get(target_uuid)
-            new_parent_uuid = payload.get("new_parent_uuid")
-            new_parent = self._index.get(new_parent_uuid)
-            if not node or node.parent_uuid is None or not new_parent:
-                return False, self.prsp.uuid
-            if node.uuid == new_parent.uuid or self._is_descendant(node, new_parent.uuid):
-                return False, self.prsp.uuid
-            old_parent = self._index.get(node.parent_uuid)
-            if not old_parent:
-                return False, self.prsp.uuid
-            old_parent.children = [c for c in old_parent.children if c.uuid != node.uuid]
-            node.parent_uuid = new_parent.uuid
-            new_parent.children.append(node)
-            node.updated_at = now_iso()
-            self._cascade_hash(old_parent.uuid)
-            self._cascade_hash(new_parent.uuid)
-            return True, new_parent.uuid
-
-        if proposal_type == "delete":
-            node = self._index.get(target_uuid)
-            if not node or node.parent_uuid is None:
-                return False, self.prsp.uuid
-            parent = self._index.get(node.parent_uuid)
-            if not parent:
-                return False, self.prsp.uuid
-            self._deindex_subtree(node)
-            parent.children = [c for c in parent.children if c.uuid != target_uuid]
-            self._cascade_hash(parent.uuid)
-            return True, parent.uuid
-
-        return False, self.prsp.uuid
+            self._collect_proposal_items(out, addr, child, local)
 
     @staticmethod
     def _is_descendant(root: PRSPNode, uuid: str) -> bool:
@@ -644,8 +879,13 @@ class TransportLayer:
             cached      = self.peer_perspectives.get(from_addr)
             cached_state_hash = cached.state_hash if cached else None
 
-        if cached_state_hash != topic_state_hash:
-            pull_uuid = changed_uuid if cached and changed_uuid else topic_uuid
+        if changed_uuid:
+            pull_uuid = changed_uuid
+        elif cached_state_hash != topic_state_hash:
+            pull_uuid = topic_uuid
+        else:
+            pull_uuid = None
+        if pull_uuid:
             self.pool.submit(self._pull_subtree, from_addr, pull_uuid)
 
         return {"status": "ok"}, 200
