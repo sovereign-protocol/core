@@ -21,6 +21,7 @@ Sync protocol (delta-first):
 import hashlib
 import json
 import logging
+import os
 import threading
 import uuid as uuid_mod
 import copy as copy_mod
@@ -30,6 +31,13 @@ from datetime import datetime, timezone
 import requests
 
 log = logging.getLogger(__name__)
+
+
+def log_error(message: str, error: Exception | None = None) -> None:
+    if error:
+        print(f"[transport] {message}: {error}", flush=True)
+    else:
+        print(f"[transport] {message}", flush=True)
 
 
 # - -  Utilities - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
@@ -163,6 +171,29 @@ class TransportLayer:
         self.members:          set[str]                      = {self.address}
         self.peer_perspectives: dict[str, PRSPNode | None]   = {}
         self.peer_topics:       dict[str, str]                = {}
+
+    def save_prsp(self, path: str) -> None:
+        directory = os.path.dirname(os.path.abspath(path))
+        if directory:
+            os.makedirs(directory, exist_ok=True)
+        tmp_path = f"{path}.tmp"
+        with self.lock:
+            payload = self.prsp.to_dict()
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, sort_keys=True, indent=2)
+            f.write("\n")
+        os.replace(tmp_path, path)
+
+    def load_prsp(self, path: str) -> bool:
+        if not os.path.exists(path):
+            return False
+        with open(path, encoding="utf-8") as f:
+            node = PRSPNode.from_dict(json.load(f))
+        with self.lock:
+            self.prsp = node
+            self._index = {}
+            self._index_subtree(self.prsp)
+        return True
 
     # - -  Index management - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
@@ -771,7 +802,7 @@ class TransportLayer:
                 timeout=3,
             ).raise_for_status()
         except Exception as e:
-            log.debug("ping  %s failed: %s", peer_addr, e)
+            log_error(f"ping to {peer_addr} failed", e)
 
     # - -  Sync  inbound pull - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
@@ -786,7 +817,7 @@ class TransportLayer:
             with self.lock:
                 self._merge_subtree(peer_addr, subtree, parent_uuid)
         except Exception as e:
-            log.debug("pull_subtree  %s failed: %s", peer_addr, e)
+            log_error(f"pull_subtree from {peer_addr} failed", e)
 
     def _merge_subtree(self, peer_addr: str,
                         subtree: PRSPNode, parent_uuid: str | None) -> None:
@@ -965,20 +996,23 @@ class TransportLayer:
         try:
             if not topic_uuid:
                 return {"status": "error", "reason": "topic_uuid is required"}
+            log_error(f"inviting {peer_addr} to topic {topic_uuid}")
             r = requests.post(
                 f"{peer_addr}/api/join_discussion",
                 json={"address": self.address, "topic_uuid": topic_uuid},
-                timeout=5,
+                timeout=15,
             )
             r.raise_for_status()
             return r.json()
         except Exception as e:
+            log_error(f"invite to {peer_addr} failed", e)
             return {"status": "error", "reason": str(e)}
 
     def join_discussion(self, target_addr: str, topic_uuid: str) -> dict:
         try:
             if not topic_uuid:
                 return {"status": "error", "reason": "topic_uuid is required"}
+            log_error(f"joining {target_addr} on topic {topic_uuid}")
             with self.lock:
                 known_members = sorted(self.members)
             payload = {
@@ -989,7 +1023,7 @@ class TransportLayer:
             r = requests.post(
                 f"{target_addr}/p2p/join",
                 json=payload,
-                timeout=5,
+                timeout=10,
             )
             r.raise_for_status()
             members = r.json().get("members", [])
@@ -1011,7 +1045,7 @@ class TransportLayer:
                         timeout=3,
                     )
                 except Exception:
-                    pass
+                    log_error(f"announce self to {member} failed")
 
             # Announce everyone to everyone so a newly connected discussion becomes a mesh.
             all_members = set(members) | {self.address, target_addr}
@@ -1028,7 +1062,7 @@ class TransportLayer:
                             timeout=3,
                         )
                     except Exception:
-                        pass
+                        log_error(f"announce {other} to {member} failed")
 
             # Pull trees from all known peers
             for member in all_members:
@@ -1040,6 +1074,7 @@ class TransportLayer:
 
             return {"status": "ok", "members": members}
         except Exception as e:
+            log_error(f"join discussion via {target_addr} failed", e)
             return {"status": "error", "reason": str(e)}
 
     def do_leave(self) -> None:
@@ -1064,14 +1099,14 @@ class TransportLayer:
                         timeout=2,
                     )
                 except Exception:
-                    pass
+                    log_error(f"leave mesh announce to {peer} failed")
 
         for peer in peers:
             try:
                 requests.post(f"{peer}/p2p/leave",
                               json={"from_addr": self.address}, timeout=2)
             except Exception:
-                pass
+                log_error(f"leave notification to {peer} failed")
 
     # - -  Info - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - 
 
