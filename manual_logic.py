@@ -12,6 +12,8 @@ Offered API:
 
 from __future__ import annotations
 
+import asyncio
+import copy
 from typing import Any
 
 from starlette.requests import Request
@@ -56,6 +58,40 @@ class ManualLogic:
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         return self.session.move(source_uuid, destination_uuid)
 
+    def accept_peer_node(self, source_addr: str, node_uuid: str,
+                         adopt_absence: bool = False) -> SessionResult:
+        if adopt_absence:
+            return self.session.delete(node_uuid)
+        peer = self.session.get_cached_peer_subtree(source_addr, node_uuid)
+        if not peer:
+            return SessionResult("error", reason="peer node not found")
+        local = self.session.protocol.index.get(node_uuid)
+        if local:
+            parent_uuid = local.parent_uuid
+        else:
+            parent_uuid = peer.parent_uuid
+        if not parent_uuid or parent_uuid not in self.session.protocol.index:
+            return SessionResult("error", reason="local parent not found")
+
+        adopted = copy.deepcopy(peer)
+        adopted.parent_uuid = parent_uuid
+        existing = self.session.protocol.index.get(adopted.uuid)
+        parent = self.session.protocol.index[parent_uuid]
+        if existing:
+            self.session.protocol.deindex_subtree(existing)
+            parent.children = [
+                child for child in parent.children
+                if child.uuid != adopted.uuid
+            ]
+        parent.children.append(adopted)
+        self.session.protocol.index_subtree(adopted)
+        self.session.protocol.cascade_hash(parent.uuid)
+        return SessionResult(
+            "ok",
+            value=adopted.uuid,
+            effects=self.session._sync_effects(adopted.uuid),
+        )
+
 
 def create_logic(session: Session, config: dict) -> ManualLogic:
     return ManualLogic(session, config)
@@ -69,7 +105,7 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
     async def api_start_discussion(request: Request):
         data = await request.json()
         result = logic.start_discussion(data.get("topic_uuid"))
-        return _json_result(runtime, result)
+        return await _json_result(runtime, result)
 
     async def api_invite(request: Request):
         try:
@@ -77,8 +113,9 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
             topic_uuid = data.get("topic_uuid")
             result = logic.start_discussion(topic_uuid)
             if result.status != "ok":
-                return _json_result(runtime, result)
-            invite = runtime.adapter.invite_to_discuss(
+                return await _json_result(runtime, result)
+            invite = await asyncio.to_thread(
+                runtime.adapter.invite_to_discuss,
                 data["address"].strip().rstrip("/"),
                 topic_uuid,
             )
@@ -93,37 +130,52 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
             )
 
     async def api_create_child(request: Request):
-        data = await request.json()
-        result = logic.create_child(
-            data["parent_uuid"],
-            _object(data.get("data")),
-            _weights(data.get("weights")),
-        )
-        return _json_result(runtime, result)
+        try:
+            data = await request.json()
+            result = logic.create_child(
+                data["parent_uuid"],
+                _object(data.get("data")),
+                _weights(data.get("weights")),
+            )
+            return await _json_result(runtime, result)
+        except Exception as exc:
+            return _error_response(exc)
 
     async def api_modify(request: Request):
-        data = await request.json()
-        result = logic.modify(
-            data["node_uuid"],
-            _object(data.get("data")),
-            _weights(data.get("weights")),
-        )
-        return _json_result(runtime, result)
+        try:
+            data = await request.json()
+            result = logic.modify(
+                data["node_uuid"],
+                _object(data.get("data")),
+                _weights(data.get("weights")),
+            )
+            return await _json_result(runtime, result)
+        except Exception as exc:
+            return _error_response(exc)
 
     async def api_delete(request: Request):
         data = await request.json()
         result = logic.delete(data["node_uuid"])
-        return _json_result(runtime, result)
+        return await _json_result(runtime, result)
 
     async def api_copy(request: Request):
         data = await request.json()
         result = logic.copy(data["source_uuid"], data["destination_uuid"])
-        return _json_result(runtime, result)
+        return await _json_result(runtime, result)
 
     async def api_move(request: Request):
         data = await request.json()
         result = logic.move(data["source_uuid"], data["destination_uuid"])
-        return _json_result(runtime, result)
+        return await _json_result(runtime, result)
+
+    async def api_accept_peer_node(request: Request):
+        data = await request.json()
+        result = logic.accept_peer_node(
+            data["source_addr"],
+            data["node_uuid"],
+            bool(data.get("adopt_absence")),
+        )
+        return await _json_result(runtime, result)
 
     return [
         Route("/api/manual/state", api_state),
@@ -135,16 +187,21 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
         Route("/api/manual/delete", api_delete, methods=["POST"]),
         Route("/api/manual/copy", api_copy, methods=["POST"]),
         Route("/api/manual/move", api_move, methods=["POST"]),
+        Route("/api/manual/accept_peer_node", api_accept_peer_node,
+              methods=["POST"]),
     ]
 
 
-def _json_result(runtime, result: SessionResult) -> JSONResponse:
+async def _json_result(runtime, result: SessionResult) -> JSONResponse:
     if result.status != "ok":
         return JSONResponse(
             {"status": "error", "reason": result.reason},
             status_code=409,
         )
-    deliveries = runtime.adapter.execute_effects(result.effects)
+    deliveries = await asyncio.to_thread(
+        runtime.adapter.execute_effects,
+        result.effects,
+    )
     runtime.notify_change()
     payload: dict[str, Any] = {"status": "ok"}
     if hasattr(result.value, "to_dict"):
@@ -177,4 +234,19 @@ def _weights(value: Any) -> dict[str, float]:
         return {}
     if not isinstance(value, dict):
         raise ValueError("expected weights object")
-    return {str(key): float(item) for key, item in value.items()}
+    weights = {}
+    for key, item in value.items():
+        if item is None:
+            raise ValueError(f"weight '{key}' must be a number")
+        try:
+            weights[str(key)] = float(item)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"weight '{key}' must be a number") from exc
+    return weights
+
+
+def _error_response(error: Exception) -> JSONResponse:
+    return JSONResponse(
+        {"status": "error", "reason": str(error)},
+        status_code=400,
+    )

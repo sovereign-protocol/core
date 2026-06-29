@@ -63,6 +63,11 @@ class Session:
     def start_discussion(self, topic_uuid: str) -> SessionResult:
         if topic_uuid not in self.protocol.index:
             return SessionResult("error", reason="topic not found")
+        if self.active_topic_uuid and self.active_topic_uuid != topic_uuid:
+            return SessionResult(
+                "error",
+                reason="already discussing a different topic",
+            )
         self.active_topic_uuid = topic_uuid
         return SessionResult("ok", value=topic_uuid)
 
@@ -123,7 +128,7 @@ class Session:
         self.add_peer(from_addr, topic_uuid)
         cached = self.peer_perspectives.get(from_addr)
         cached_state_hash = cached.state_hash if cached else None
-        pull_uuid = changed_uuid if changed_uuid else None
+        pull_uuid = topic_uuid if cached is None else changed_uuid
         if not pull_uuid and cached_state_hash != topic_state_hash:
             pull_uuid = topic_uuid
 
@@ -148,13 +153,10 @@ class Session:
             return SessionResult("error", reason="already discussing a different topic")
 
         self.add_peer(from_addr, topic_uuid)
-        self.peer_perspectives.pop(from_addr, None)
         for member in sorted(known_members):
             if member == self.address:
                 continue
             self.add_peer(member, topic_uuid)
-            if member != from_addr:
-                self.peer_perspectives.pop(member, None)
 
         effects = [
             SessionEffect("pull_subtree", from_addr,
@@ -183,7 +185,6 @@ class Session:
         if self.active_topic_uuid and self.active_topic_uuid != topic_uuid:
             return SessionResult("error", reason="already discussing a different topic")
         self.add_peer(new_addr, topic_uuid)
-        self.peer_perspectives.pop(new_addr, None)
         return SessionResult(
             "ok",
             effects=[SessionEffect(
@@ -233,6 +234,7 @@ class Session:
         target.updated_at = subtree.updated_at
         target.content_hash = subtree.content_hash
         target.state_hash = subtree.state_hash
+        target.previous_state_hash = subtree.previous_state_hash
         target.weights = subtree.weights
         target.proposals = subtree.proposals
         target.data = subtree.data
@@ -245,6 +247,16 @@ class Session:
             return None
         node = self._find_in_tree(tree, node_uuid)
         return PRSPNode.from_dict(node.to_dict()) if node else None
+
+    def analyze_peer_transitions(self, peer_addr: str,
+                                 node_uuid: str | None = None) -> list[dict]:
+        peer_root = self.peer_perspectives.get(peer_addr)
+        if not peer_root:
+            return []
+        compare_uuid = node_uuid or peer_root.uuid
+        peer_node = self._find_in_tree(peer_root, compare_uuid)
+        local_node = self.protocol.index.get(compare_uuid)
+        return self._analyze_transition_node(peer_addr, local_node, peer_node)
 
     # App-facing protocol wrappers
 
@@ -425,6 +437,75 @@ class Session:
             yield proposal
         for child in root.children:
             yield from Session._iter_tree_proposals(child)
+
+    def _analyze_transition_node(self, peer_addr: str,
+                                 local_node: PRSPNode | None,
+                                 peer_node: PRSPNode | None) -> list[dict]:
+        if not local_node and not peer_node:
+            return []
+        if not local_node:
+            return [self._transition_event(
+                "missing_local_node",
+                peer_addr,
+                None,
+                peer_node,
+            )]
+        if not peer_node:
+            return [self._transition_event(
+                "missing_peer_node",
+                peer_addr,
+                local_node,
+                None,
+            )]
+
+        child_events = []
+        local_children = {child.uuid: child for child in local_node.children}
+        peer_children = {child.uuid: child for child in peer_node.children}
+        for child_uuid in sorted(set(local_children) | set(peer_children)):
+            child_events.extend(self._analyze_transition_node(
+                peer_addr,
+                local_children.get(child_uuid),
+                peer_children.get(child_uuid),
+            ))
+
+        if local_node.state_hash == peer_node.state_hash:
+            event_type = (
+                "agreement"
+                if peer_node.previous_state_hash == local_node.state_hash
+                else "accepted_change"
+            )
+        elif peer_node.previous_state_hash == local_node.state_hash:
+            event_type = "intentional_change"
+        elif local_node.previous_state_hash == peer_node.state_hash:
+            event_type = "local_intentional_change"
+        elif child_events and not any(
+                event["type"] == "conflict" for event in child_events):
+            event_type = "parallel_independent_changes"
+        else:
+            event_type = "conflict"
+
+        return [
+            self._transition_event(event_type, peer_addr, local_node, peer_node)
+        ] + child_events
+
+    @staticmethod
+    def _transition_event(event_type: str, peer_addr: str,
+                          local_node: PRSPNode | None,
+                          peer_node: PRSPNode | None) -> dict:
+        node = local_node or peer_node
+        return {
+            "type": event_type,
+            "peer_addr": peer_addr,
+            "node_uuid": node.uuid if node else None,
+            "local_state_hash": local_node.state_hash if local_node else None,
+            "local_previous_state_hash": (
+                local_node.previous_state_hash if local_node else None
+            ),
+            "peer_state_hash": peer_node.state_hash if peer_node else None,
+            "peer_previous_state_hash": (
+                peer_node.previous_state_hash if peer_node else None
+            ),
+        }
 
     @staticmethod
     def _collect_subtree_uuids(node: PRSPNode) -> set[str]:

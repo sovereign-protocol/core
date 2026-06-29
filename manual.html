@@ -13,7 +13,6 @@
       <p id="statusText">Loading</p>
     </div>
     <div class="toolbar">
-      <button id="refreshBtn">Refresh</button>
       <button id="inviteBtn">Invite</button>
       <button id="leaveBtn">Leave</button>
     </div>
@@ -44,6 +43,11 @@
     </aside>
   </main>
 
+  <footer class="statusbar">
+    <strong>Status</strong>
+    <div id="log"></div>
+  </footer>
+
   <dialog id="modal">
     <form method="dialog" id="modalForm">
       <h2 id="modalTitle">Edit</h2>
@@ -58,32 +62,44 @@
   <script>
     let appState = null;
     let selectedUuid = null;
+    let busy = false;
 
     const el = (id) => document.getElementById(id);
+    const selfColor = "#9aa4b2";
 
     async function api(path, body) {
-      const response = await fetch(path, {
-        method: body === undefined ? "GET" : "POST",
-        headers: body === undefined ? {} : {"Content-Type": "application/json"},
-        body: body === undefined ? undefined : JSON.stringify(body),
-      });
-      const text = await response.text();
-      let payload = {};
+      setBusy(true);
       try {
-        payload = text ? JSON.parse(text) : {};
-      } catch {
-        payload = {reason: text || "Invalid server response"};
+        const response = await fetch(path, {
+          method: body === undefined ? "GET" : "POST",
+          headers: body === undefined ? {} : {"Content-Type": "application/json"},
+          body: body === undefined ? undefined : JSON.stringify(body),
+        });
+        const text = await response.text();
+        let payload = {};
+        try {
+          payload = text ? JSON.parse(text) : {};
+        } catch {
+          payload = {reason: text || "Invalid server response"};
+        }
+        if (!response.ok || payload.status === "error") {
+          throw new Error(payload.reason || "Request failed");
+        }
+        return payload;
+      } finally {
+        setBusy(false);
       }
-      if (!response.ok || payload.status === "error") {
-        throw new Error(payload.reason || "Request failed");
-      }
-      return payload;
     }
 
-    async function loadState() {
-      appState = await api("/api/manual/state");
-      if (!selectedUuid) selectedUuid = appState.root.uuid;
-      render();
+    async function loadState(silent = false) {
+      try {
+        appState = await api("/api/manual/state");
+        if (!selectedUuid) selectedUuid = appState.root.uuid;
+        render();
+        if (!silent) log("State loaded");
+      } catch (error) {
+        log(error.message, true);
+      }
     }
 
     function render() {
@@ -94,39 +110,101 @@
       el("selectionText").textContent = selectedUuid
         ? `Selected ${short(selectedUuid)}`
         : "No selection";
-      el("tree").replaceChildren(renderNode(appState.root, 0, true));
+      el("tree").replaceChildren(renderNode(appState.root, 0, "local", null));
       renderPeers();
     }
 
-    function renderNode(node, depth, selectable) {
+    function renderNode(node, depth, mode, sourceAddr) {
       const wrap = document.createElement("div");
       wrap.className = "node-wrap";
-      const row = document.createElement("button");
+      const row = document.createElement("div");
       row.className = "node-row";
-      if (node.uuid === selectedUuid) row.classList.add("selected");
-      if (node.uuid === appState.network.topic_uuid) {
+      row.style.setProperty("--depth", depth);
+      if (mode === "local" && node.uuid === selectedUuid) row.classList.add("selected");
+      if (mode === "local" && node.uuid === appState.network.topic_uuid) {
         row.classList.add("current-topic");
       }
-      row.style.paddingLeft = `${12 + depth * 22}px`;
-      row.type = "button";
-      row.onclick = () => {
-        if (selectable) {
+
+      const select = document.createElement("button");
+      select.className = "node-main";
+      select.type = "button";
+      select.onclick = () => {
+        if (mode === "local") {
           selectedUuid = node.uuid;
           render();
         }
       };
+
       const title = document.createElement("span");
       title.className = "node-title";
       title.textContent = labelFor(node);
       const meta = document.createElement("span");
       meta.className = "node-meta";
       meta.textContent = `${short(node.uuid)} | ${short(node.state_hash)}`;
-      row.append(title, meta);
+      select.append(buildStripe(node), title, meta);
+
+      const actions = document.createElement("div");
+      actions.className = "node-actions";
+      actions.append(iconButton("UUID", () => copyUuid(node.uuid)));
+      if (mode === "local" && isUnderTopic(node.uuid) && hasPeerDifference(node)) {
+        actions.append(iconButton("Accept", () => openAcceptModal(node.uuid)));
+      }
+
+      row.append(select, actions);
       wrap.append(row);
       for (const child of node.children || []) {
-        wrap.append(renderNode(child, depth + 1, selectable));
+        wrap.append(renderNode(child, depth + 1, mode, sourceAddr));
       }
       return wrap;
+    }
+
+    function buildStripe(localNode) {
+      const stripe = document.createElement("span");
+      stripe.className = "stripe";
+      const members = discussionMembers();
+      for (const member of members) {
+        const segment = document.createElement("span");
+        segment.className = "stripe-segment";
+        const color = member === appState.network.address ? selfColor : colorFor(member);
+        segment.style.borderColor = color;
+        const peerNode = member === appState.network.address
+          ? localNode
+          : findPeerNode(member, localNode.uuid);
+        if (!peerNode) {
+          segment.classList.add("missing");
+          segment.style.background = "transparent";
+        } else if (peerNode.state_hash === localNode.state_hash) {
+          segment.style.background = selfColor;
+        } else {
+          segment.style.background = color;
+        }
+        stripe.append(segment);
+      }
+      return stripe;
+    }
+
+    function discussionMembers() {
+      const members = appState.network.members || [appState.network.address];
+      return [...members].sort((a, b) => {
+        if (a === appState.network.address) return -1;
+        if (b === appState.network.address) return 1;
+        return a.localeCompare(b);
+      });
+    }
+
+    function hasPeerDifference(node) {
+      return discussionMembers().some((member) => {
+        if (member === appState.network.address) return false;
+        const peerNode = findPeerNode(member, node.uuid);
+        return !peerNode || peerNode.state_hash !== node.state_hash;
+      });
+    }
+
+    function isUnderTopic(nodeUuid) {
+      const topicUuid = appState.network.topic_uuid;
+      if (!topicUuid) return false;
+      const topic = findNode(appState.root, topicUuid);
+      return Boolean(findNode(topic, nodeUuid));
     }
 
     function renderPeers() {
@@ -134,21 +212,196 @@
       peers.replaceChildren();
       const entries = Object.entries(appState.peers || {});
       if (!entries.length) {
-        const empty = document.createElement("p");
-        empty.className = "empty";
-        empty.textContent = "No peer cache yet.";
-        peers.append(empty);
+        peers.append(text("No peer cache yet."));
         return;
       }
       for (const [addr, root] of entries) {
         const block = document.createElement("section");
         block.className = "peer";
-        const head = document.createElement("h3");
-        head.textContent = addr;
+        const head = document.createElement("div");
+        head.className = "peer-head";
+        const title = document.createElement("h3");
+        title.textContent = addr;
+        const chip = document.createElement("span");
+        chip.className = "peer-chip";
+        chip.style.background = colorFor(addr);
+        head.append(title, chip);
         block.append(head);
-        block.append(root ? renderNode(root, 0, false) : text("No data"));
+        block.append(root ? renderNode(root, 0, "peer", addr) : text("No data"));
         peers.append(block);
       }
+    }
+
+    function openNodeModal(title, initialData, initialWeights, onSubmit) {
+      openModal(title, [], async () => {
+        await onSubmit(readPairs("dataRows"), readPairs("weightRows", true));
+      });
+      const area = el("modalFields");
+      area.replaceChildren(
+        pairEditor("Values", "dataRows", initialData || {}, false),
+        pairEditor("Weights", "weightRows", initialWeights || {}, true),
+      );
+    }
+
+    function pairEditor(title, id, values, numeric) {
+      const section = document.createElement("section");
+      section.className = "kv-section";
+      const head = document.createElement("div");
+      head.className = "kv-head";
+      const label = document.createElement("h3");
+      label.textContent = title;
+      const add = document.createElement("button");
+      add.type = "button";
+      add.textContent = "+";
+      add.onclick = () => addPairRow(rows, "", "", numeric);
+      head.append(label, add);
+      const rows = document.createElement("div");
+      rows.id = id;
+      rows.className = "kv-rows";
+      for (const [key, value] of Object.entries(values)) {
+        addPairRow(rows, key, value, numeric);
+      }
+      if (!Object.keys(values).length) addPairRow(rows, "", "", numeric);
+      section.append(head, rows);
+      return section;
+    }
+
+    function addPairRow(rows, key, value, numeric) {
+      const row = document.createElement("div");
+      row.className = "kv-row";
+      const keyInput = document.createElement("input");
+      keyInput.placeholder = "key";
+      keyInput.value = key;
+      keyInput.dataset.role = "key";
+      const valueInput = document.createElement("input");
+      valueInput.placeholder = numeric ? "number" : "value";
+      valueInput.value = value;
+      valueInput.dataset.role = "value";
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.textContent = "x";
+      remove.onclick = () => row.remove();
+      row.append(keyInput, valueInput, remove);
+      rows.append(row);
+    }
+
+    function readPairs(id, numeric = false) {
+      const result = {};
+      for (const row of el(id).querySelectorAll(".kv-row")) {
+        const key = row.querySelector("[data-role='key']").value.trim();
+        const value = row.querySelector("[data-role='value']").value.trim();
+        if (!key) continue;
+        if (numeric) {
+          const number = Number(value);
+          if (value === "" || Number.isNaN(number)) {
+            throw new Error(`Weight "${key}" must be a number`);
+          }
+          result[key] = number;
+        } else {
+          result[key] = parseScalar(value);
+        }
+      }
+      return result;
+    }
+
+    function parseScalar(value) {
+      if (value === "true") return true;
+      if (value === "false") return false;
+      if (value !== "" && !Number.isNaN(Number(value))) return Number(value);
+      return value;
+    }
+
+    function openAcceptModal(nodeUuid) {
+      const options = discussionMembers()
+        .filter((member) => member !== appState.network.address)
+        .map((member) => ({
+          addr: member,
+          missing: !findPeerNode(member, nodeUuid),
+        }));
+      if (!options.length) {
+        log("No peer version available", true);
+        return;
+      }
+      openModal("Accept Peer Version", [], async () => {
+        const selected = document.querySelector("input[name='peerChoice']:checked");
+        if (!selected) throw new Error("Choose a peer");
+        await acceptPeerNode(selected.value, nodeUuid, selected.dataset.missing === "1");
+      });
+      const area = el("modalFields");
+      area.replaceChildren();
+      for (const option of options) {
+        const label = document.createElement("label");
+        label.className = "radio-row";
+        const input = document.createElement("input");
+        input.type = "radio";
+        input.name = "peerChoice";
+        input.value = option.addr;
+        input.dataset.missing = option.missing ? "1" : "0";
+        if (!area.children.length) input.checked = true;
+        label.append(
+          input,
+          document.createTextNode(
+            option.missing ? `${option.addr} (no node)` : option.addr,
+          ),
+        );
+        area.append(label);
+      }
+    }
+
+    async function acceptPeerNode(sourceAddr, nodeUuid, adoptAbsence = false) {
+      await api("/api/manual/accept_peer_node", {
+        source_addr: sourceAddr,
+        node_uuid: nodeUuid,
+        adopt_absence: adoptAbsence,
+      });
+      log(`Accepted ${short(nodeUuid)} from ${sourceAddr}`);
+      await loadState(true);
+    }
+
+    function openModal(title, fields, onSubmit) {
+      el("modalTitle").textContent = title;
+      const area = el("modalFields");
+      area.replaceChildren();
+      for (const field of fields) {
+        const label = document.createElement("label");
+        label.textContent = field.label;
+        const input = field.multiline
+          ? document.createElement("textarea")
+          : document.createElement("input");
+        input.name = field.name;
+        input.value = field.value || "";
+        label.append(input);
+        area.append(label);
+      }
+      const dialog = el("modal");
+      el("modalCancel").onclick = () => dialog.close();
+      el("modalForm").onsubmit = async (event) => {
+        event.preventDefault();
+        try {
+          const form = new FormData(event.currentTarget);
+          await onSubmit(form);
+          dialog.close();
+          await loadState(true);
+        } catch (error) {
+          log(error.message, true);
+        }
+      };
+      dialog.showModal();
+    }
+
+    function iconButton(label, action) {
+      const button = document.createElement("button");
+      button.type = "button";
+      button.textContent = label;
+      button.onclick = (event) => {
+        event.stopPropagation();
+        action();
+      };
+      return button;
+    }
+
+    function currentNode() {
+      return findNode(appState.root, selectedUuid);
     }
 
     function labelFor(node) {
@@ -165,6 +418,10 @@
       return null;
     }
 
+    function findPeerNode(addr, uuid) {
+      return findNode((appState.peers || {})[addr], uuid);
+    }
+
     function text(value) {
       const p = document.createElement("p");
       p.className = "empty";
@@ -176,82 +433,84 @@
       return value ? String(value).slice(0, 8) : "";
     }
 
+    function colorFor(value) {
+      let hash = 0;
+      for (const char of value) hash = ((hash << 5) - hash + char.charCodeAt(0)) | 0;
+      const hue = Math.abs(hash) % 360;
+      return `hsl(${hue} 62% 48%)`;
+    }
+
     function ensureSelected() {
       if (!selectedUuid) throw new Error("Select a node first");
       return selectedUuid;
     }
 
-    function openModal(title, fields, onSubmit) {
-      el("modalTitle").textContent = title;
-      const area = el("modalFields");
-      area.replaceChildren();
-      for (const field of fields) {
-        const label = document.createElement("label");
-        label.textContent = field.label;
-        const input = field.multiline
-          ? document.createElement("textarea")
-          : document.createElement("input");
-        input.name = field.name;
-        input.value = field.value || "";
-        if (field.placeholder) input.placeholder = field.placeholder;
-        label.append(input);
-        area.append(label);
+    async function copyUuid(uuid) {
+      if (navigator.clipboard) {
+        await navigator.clipboard.writeText(uuid);
+      } else {
+        const input = document.createElement("textarea");
+        input.value = uuid;
+        document.body.append(input);
+        input.select();
+        document.execCommand("copy");
+        input.remove();
       }
-      const dialog = el("modal");
-      el("modalCancel").onclick = () => dialog.close();
-      el("modalForm").onsubmit = async (event) => {
-        event.preventDefault();
-        const form = new FormData(event.currentTarget);
-        try {
-          await onSubmit(form);
-          dialog.close();
-          await loadState();
-        } catch (error) {
-          alert(error.message);
-        }
-      };
-      dialog.showModal();
+      log(`Copied ${short(uuid)}`);
     }
 
-    function currentData() {
-      const node = findNode(appState.root, selectedUuid);
-      return node ? JSON.stringify(node.data || {}, null, 2) : "{}";
+    function setBusy(value) {
+      busy = value;
+      document.body.classList.toggle("busy", busy);
     }
 
-    function currentWeights() {
-      const node = findNode(appState.root, selectedUuid);
-      return node ? JSON.stringify(node.weights || {}, null, 2) : "{}";
+    function log(message, error = false) {
+      const line = document.createElement("div");
+      line.className = error ? "log-line error" : "log-line";
+      line.textContent = `${new Date().toLocaleTimeString()}  ${message}`;
+      el("log").prepend(line);
+      el("statusText").textContent = message;
+      while (el("log").children.length > 6) el("log").lastChild.remove();
     }
 
-    el("refreshBtn").onclick = loadState;
-    el("addBtn").onclick = () => openModal("Add Child", [
-      {name: "data", label: "Data", multiline: true, value: "{\n  \"name\": \"New node\"\n}"},
-      {name: "weights", label: "Weights", multiline: true, value: "{}"},
-    ], async (form) => {
-      await api("/api/manual/create_child", {
-        parent_uuid: ensureSelected(),
-        data: JSON.parse(form.get("data")),
-        weights: JSON.parse(form.get("weights") || "{}"),
+    el("addBtn").onclick = () => openNodeModal(
+      "Add Child",
+      {name: "New node"},
+      {},
+      async (data, weights) => {
+        await api("/api/manual/create_child", {
+          parent_uuid: ensureSelected(),
+          data,
+          weights,
+        });
+        log("Child added");
+      },
+    );
+
+    el("editBtn").onclick = () => {
+      const node = currentNode();
+      if (!node) return log("Select a node first", true);
+      openNodeModal("Modify Node", node.data, node.weights, async (data, weights) => {
+        await api("/api/manual/modify", {
+          node_uuid: ensureSelected(),
+          data,
+          weights,
+        });
+        log("Node modified");
       });
-    });
-
-    el("editBtn").onclick = () => openModal("Modify Node", [
-      {name: "data", label: "Data", multiline: true, value: currentData()},
-      {name: "weights", label: "Weights", multiline: true, value: currentWeights()},
-    ], async (form) => {
-      await api("/api/manual/modify", {
-        node_uuid: ensureSelected(),
-        data: JSON.parse(form.get("data")),
-        weights: JSON.parse(form.get("weights") || "{}"),
-      });
-    });
+    };
 
     el("deleteBtn").onclick = async () => {
-      const uuid = ensureSelected();
-      if (!confirm("Delete selected node and its children?")) return;
-      await api("/api/manual/delete", {node_uuid: uuid});
-      selectedUuid = appState.root.uuid;
-      await loadState();
+      try {
+        const uuid = ensureSelected();
+        if (!confirm("Delete selected node and its children?")) return;
+        await api("/api/manual/delete", {node_uuid: uuid});
+        selectedUuid = appState.root.uuid;
+        log("Node deleted");
+        await loadState(true);
+      } catch (error) {
+        log(error.message, true);
+      }
     };
 
     el("copyBtn").onclick = () => openModal("Copy Subtree", [
@@ -261,6 +520,7 @@
         source_uuid: ensureSelected(),
         destination_uuid: form.get("destination").trim(),
       });
+      log("Subtree copied");
     });
 
     el("moveBtn").onclick = () => openModal("Move Subtree", [
@@ -270,11 +530,17 @@
         source_uuid: ensureSelected(),
         destination_uuid: form.get("destination").trim(),
       });
+      log("Subtree moved");
     });
 
     el("topicBtn").onclick = async () => {
-      await api("/api/manual/start_discussion", {topic_uuid: ensureSelected()});
-      await loadState();
+      try {
+        await api("/api/manual/start_discussion", {topic_uuid: ensureSelected()});
+        log("Topic set");
+        await loadState(true);
+      } catch (error) {
+        log(error.message, true);
+      }
     };
 
     el("inviteBtn").onclick = () => openModal("Invite", [
@@ -285,19 +551,23 @@
         address: form.get("address").trim(),
         topic_uuid: form.get("topic").trim(),
       });
+      log("Invite sent");
     });
 
     el("leaveBtn").onclick = async () => {
-      await api("/api/leave", {});
-      await loadState();
+      try {
+        await api("/api/leave", {});
+        log("Left discussion");
+        await loadState(true);
+      } catch (error) {
+        log(error.message, true);
+      }
     };
 
-    const events = new EventSource("/api/events");
-    events.addEventListener("changed", loadState);
-    events.addEventListener("ready", loadState);
-    loadState().catch((error) => {
-      el("statusText").textContent = error.message;
-    });
+    setInterval(() => {
+      loadState(true);
+    }, 1500);
+    loadState();
   </script>
 </body>
 </html>

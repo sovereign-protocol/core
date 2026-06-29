@@ -77,9 +77,12 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        changed = PRSPNode({"name": "changed"})
-        http.get_responses["http://b/p2p/subtree/changed"] = {
-            "subtree": changed.to_dict(),
+        topic = PRSPNode({"name": "topic"})
+        changed = PRSPNode({"name": "changed"}, parent_uuid=topic.uuid)
+        topic.children.append(changed)
+        topic.refresh_hashes_deep()
+        http.get_responses["http://b/p2p/subtree/topic"] = {
+            "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
 
@@ -114,6 +117,10 @@ class TransportTests(unittest.TestCase):
         result = adapter.join_discussion("http://b", topic.uuid)
 
         self.assertEqual(result["status"], "ok")
+        self.assertIsNotNone(session.get_cached_peer_subtree(
+            "http://b",
+            topic.uuid,
+        ))
         self.assertEqual(session.active_topic_uuid, topic.uuid)
         self.assertIn("http://b", session.members)
         self.assertIn("http://c", session.members)

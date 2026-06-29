@@ -30,6 +30,42 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PRSPNode.from_dict(payload)
 
+    def test_previous_state_hash_is_serialized_but_not_part_of_state_hash(self):
+        node = PRSPNode({"name": "node"})
+        payload = node.to_dict()
+        payload["previous_state_hash"] = "different-history"
+
+        loaded = PRSPNode.from_dict(payload)
+
+        self.assertEqual(loaded.previous_state_hash, "different-history")
+        self.assertEqual(loaded.state_hash, node.state_hash)
+
+    def test_modify_tracks_previous_state_hash(self):
+        state = ProtocolState("si-a")
+        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
+        old_child_hash = child.state_hash
+        old_root_hash = state.root.state_hash
+
+        state.modify(child.uuid, {"name": "changed"}, {})
+
+        self.assertEqual(child.previous_state_hash, old_child_hash)
+        self.assertEqual(state.root.previous_state_hash, old_root_hash)
+        self.assertNotEqual(child.state_hash, old_child_hash)
+        self.assertNotEqual(state.root.state_hash, old_root_hash)
+
+    def test_new_clone_resets_previous_state_hash_to_current(self):
+        state = ProtocolState("si-a")
+        parent = state.create_child(state.root.uuid, {"name": "parent"}, {}).value
+        state.create_child(parent.uuid, {"name": "child"}, {})
+
+        clone = state.copy(parent.uuid, state.root.uuid).value
+
+        self.assertEqual(clone.previous_state_hash, clone.state_hash)
+        self.assertEqual(
+            clone.children[0].previous_state_hash,
+            clone.children[0].state_hash,
+        )
+
     def test_atomic_create_modify_delete(self):
         state = ProtocolState("si-a")
         child = state.create_child(state.root.uuid, {"name": "child"}, {}).value

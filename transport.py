@@ -193,6 +193,11 @@ class HttpTransportAdapter:
             accepted = self.session.accept_topic_invitation(tree)
             if accepted.status != "ok":
                 return {"status": "error", "reason": accepted.reason}
+            self.session.apply_peer_subtree(
+                peer_addr,
+                PRSPNode.from_dict(tree_payload["subtree"]),
+                tree_payload.get("parent_uuid"),
+            )
 
             response = self.http.post_json(
                 self._url(peer_addr, "/p2p/join"),

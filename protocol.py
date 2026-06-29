@@ -186,7 +186,9 @@ class PRSPNode:
         self.children: list[PRSPNode] = []
         self.content_hash = ""
         self.state_hash = ""
-        self.refresh_hashes()
+        self.previous_state_hash = None
+        self.refresh_hashes(track_previous=False)
+        self.previous_state_hash = self.state_hash
 
     def recompute_content_hash(self) -> str:
         return content_hash(
@@ -201,14 +203,26 @@ class PRSPNode:
             sorted(child.state_hash for child in self.children),
         )
 
-    def refresh_hashes(self) -> None:
-        self.content_hash = self.recompute_content_hash()
-        self.state_hash = self.recompute_state_hash()
+    def refresh_hashes(self, track_previous: bool = True) -> None:
+        new_content_hash = self.recompute_content_hash()
+        new_state_hash = state_hash(
+            new_content_hash,
+            sorted(child.state_hash for child in self.children),
+        )
+        if track_previous and self.state_hash and new_state_hash != self.state_hash:
+            self.previous_state_hash = self.state_hash
+        self.content_hash = new_content_hash
+        self.state_hash = new_state_hash
 
     def refresh_hashes_deep(self) -> None:
         for child in self.children:
             child.refresh_hashes_deep()
         self.refresh_hashes()
+
+    def reset_previous_state_hash_deep(self) -> None:
+        self.previous_state_hash = self.state_hash
+        for child in self.children:
+            child.reset_previous_state_hash_deep()
 
     def to_dict(self) -> dict:
         return {
@@ -217,6 +231,7 @@ class PRSPNode:
             "updated_at": self.updated_at,
             "content_hash": self.content_hash,
             "state_hash": self.state_hash,
+            "previous_state_hash": self.previous_state_hash,
             "weights": copy.deepcopy(self.weights),
             "proposals": [proposal.to_dict() for proposal in self.proposals],
             "data": copy.deepcopy(self.data),
@@ -232,6 +247,10 @@ class PRSPNode:
         node.updated_at = payload["updated_at"]
         node.content_hash = payload["content_hash"]
         node.state_hash = payload["state_hash"]
+        node.previous_state_hash = payload.get(
+            "previous_state_hash",
+            node.state_hash,
+        )
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.proposals = [
             Proposal.from_dict(proposal)
@@ -520,6 +539,7 @@ class ProtocolState:
         for child in node.children:
             clone.children.append(self.clone_subtree(child, clone.uuid))
         clone.refresh_hashes_deep()
+        clone.reset_previous_state_hash_deep()
         return clone
 
     def delete_locked(self, node_uuid: str) -> bool:
