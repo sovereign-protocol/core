@@ -1,0 +1,128 @@
+import unittest
+
+from protocol import AtomicOperation, PRSPNode, ProtocolState
+
+
+class ProtocolTests(unittest.TestCase):
+    def test_hashes_ignore_child_order(self):
+        first = PRSPNode({"name": "root"})
+        a = PRSPNode({"name": "a"}, parent_uuid=first.uuid)
+        b = PRSPNode({"name": "b"}, parent_uuid=first.uuid)
+        first.children = [a, b]
+        first.refresh_hashes_deep()
+
+        second = PRSPNode({"name": "root"})
+        a2 = PRSPNode.from_dict(a.to_dict())
+        b2 = PRSPNode.from_dict(b.to_dict())
+        a2.parent_uuid = second.uuid
+        b2.parent_uuid = second.uuid
+        second.children = [b2, a2]
+        second.refresh_hashes_deep()
+
+        self.assertEqual(first.content_hash, second.content_hash)
+        self.assertEqual(first.state_hash, second.state_hash)
+
+    def test_from_dict_rejects_mismatched_hash(self):
+        node = PRSPNode({"name": "node"})
+        payload = node.to_dict()
+        payload["data"]["name"] = "tampered"
+
+        with self.assertRaises(ValueError):
+            PRSPNode.from_dict(payload)
+
+    def test_atomic_create_modify_delete(self):
+        state = ProtocolState("si-a")
+        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
+
+        self.assertIn(child.uuid, state.index)
+        self.assertTrue(state.modify(child.uuid, {"name": "renamed"}, {}).ok)
+        self.assertEqual(state.index[child.uuid].data["name"], "renamed")
+        self.assertTrue(state.delete(child.uuid).ok)
+        self.assertNotIn(child.uuid, state.index)
+
+    def test_copy_uses_fresh_uuids(self):
+        state = ProtocolState("si-a")
+        parent = state.create_child(state.root.uuid, {"name": "parent"}, {}).value
+        child = state.create_child(parent.uuid, {"name": "child"}, {}).value
+
+        clone = state.copy(parent.uuid, state.root.uuid).value
+
+        self.assertNotEqual(clone.uuid, parent.uuid)
+        self.assertEqual(clone.data, parent.data)
+        self.assertEqual(clone.children[0].data, child.data)
+        self.assertNotEqual(clone.children[0].uuid, child.uuid)
+
+    def test_move_prevents_cycles_and_duplicate_locations(self):
+        state = ProtocolState("si-a")
+        left = state.create_child(state.root.uuid, {"name": "left"}, {}).value
+        right = state.create_child(state.root.uuid, {"name": "right"}, {}).value
+        moving = state.create_child(left.uuid, {"name": "moving"}, {}).value
+
+        self.assertFalse(state.move(left.uuid, moving.uuid).ok)
+        self.assertTrue(state.move(moving.uuid, right.uuid).ok)
+        self.assertNotIn(moving.uuid, [child.uuid for child in left.children])
+        self.assertIn(moving.uuid, [child.uuid for child in right.children])
+        self.assertIs(state.index[moving.uuid], moving)
+
+    def test_proposal_freezes_subtree_and_integrates(self):
+        state = ProtocolState("si-a")
+        topic = state.create_child(state.root.uuid, {"name": "topic"}, {}).value
+        proposal = state.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "proposed"}, {})
+        ]).value
+
+        self.assertIsNone(state.create_child(topic.uuid, {"name": "blocked"}, {}).value)
+        self.assertTrue(state.integrate_proposal(proposal.uuid).ok)
+        self.assertIn("proposed", [child.data["name"] for child in topic.children])
+
+    def test_accepted_proposal_locks_until_finalized(self):
+        proposer = ProtocolState("si-a")
+        accepter = ProtocolState("si-b")
+        topic = proposer.create_child(proposer.root.uuid, {"name": "topic"}, {}).value
+        accepter.attach_topic(PRSPNode.from_dict(topic.to_dict()))
+        proposal = proposer.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "accepted"}, {})
+        ]).value
+
+        self.assertTrue(accepter.accept_proposal(proposal).ok)
+        self.assertIsNone(accepter.create_child(topic.uuid, {"name": "blocked"}, {}).value)
+
+        self.assertTrue(proposer.integrate_proposal(proposal.uuid).ok)
+        final = proposer.find_proposal(proposal.uuid)
+        self.assertTrue(accepter.reconcile_final_proposal(final).ok)
+        self.assertIsNotNone(accepter.create_child(topic.uuid, {"name": "allowed"}, {}).value)
+
+    def test_objection_blocks_integration(self):
+        proposer = ProtocolState("si-a")
+        objector = ProtocolState("si-b")
+        topic = proposer.create_child(proposer.root.uuid, {"name": "topic"}, {}).value
+        objector.attach_topic(PRSPNode.from_dict(topic.to_dict()))
+        proposal = proposer.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "blocked"}, {})
+        ]).value
+        self.assertTrue(objector.object_to_proposal(proposal).ok)
+        proposer.observe_proposal(objector.find_proposal(proposal.uuid))
+
+        self.assertFalse(proposer.integrate_proposal(proposal.uuid).ok)
+
+    def test_final_marker_gc_after_acknowledgement(self):
+        proposer = ProtocolState("si-a")
+        accepter = ProtocolState("si-b")
+        topic = proposer.create_child(proposer.root.uuid, {"name": "topic"}, {}).value
+        accepter.attach_topic(PRSPNode.from_dict(topic.to_dict()))
+        proposal = proposer.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "accepted"}, {})
+        ]).value
+        accepter.accept_proposal(proposal)
+        proposer.observe_proposal(accepter.find_proposal(proposal.uuid))
+
+        self.assertTrue(proposer.integrate_proposal(proposal.uuid).ok)
+        self.assertIsNotNone(proposer.find_proposal(proposal.uuid))
+        accepter.reconcile_final_proposal(proposer.find_proposal(proposal.uuid))
+        proposer.acknowledge_final_proposal_cleanup(proposal.uuid, accepter.author)
+
+        self.assertIsNone(proposer.find_proposal(proposal.uuid))
+
+
+if __name__ == "__main__":
+    unittest.main()

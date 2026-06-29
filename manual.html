@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Manual Perspective</title>
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>Manual Perspective</h1>
+      <p id="statusText">Loading</p>
+    </div>
+    <div class="toolbar">
+      <button id="refreshBtn">Refresh</button>
+      <button id="inviteBtn">Invite</button>
+      <button id="leaveBtn">Leave</button>
+    </div>
+  </header>
+
+  <main class="layout">
+    <section class="panel main-panel">
+      <div class="panel-head">
+        <div>
+          <h2>My Perspective</h2>
+          <p id="selectionText">No selection</p>
+        </div>
+        <div class="toolbar compact">
+          <button id="addBtn">Add Child</button>
+          <button id="editBtn">Modify</button>
+          <button id="deleteBtn">Delete</button>
+          <button id="copyBtn">Copy</button>
+          <button id="moveBtn">Move</button>
+          <button id="topicBtn">Set Topic</button>
+        </div>
+      </div>
+      <div id="tree" class="tree"></div>
+    </section>
+
+    <aside class="panel side-panel">
+      <h2>Known Perspectives</h2>
+      <div id="peers" class="peers"></div>
+    </aside>
+  </main>
+
+  <dialog id="modal">
+    <form method="dialog" id="modalForm">
+      <h2 id="modalTitle">Edit</h2>
+      <div id="modalFields"></div>
+      <menu>
+        <button id="modalCancel" type="button">Cancel</button>
+        <button id="modalSubmit" type="submit">Apply</button>
+      </menu>
+    </form>
+  </dialog>
+
+  <script>
+    let appState = null;
+    let selectedUuid = null;
+
+    const el = (id) => document.getElementById(id);
+
+    async function api(path, body) {
+      const response = await fetch(path, {
+        method: body === undefined ? "GET" : "POST",
+        headers: body === undefined ? {} : {"Content-Type": "application/json"},
+        body: body === undefined ? undefined : JSON.stringify(body),
+      });
+      const text = await response.text();
+      let payload = {};
+      try {
+        payload = text ? JSON.parse(text) : {};
+      } catch {
+        payload = {reason: text || "Invalid server response"};
+      }
+      if (!response.ok || payload.status === "error") {
+        throw new Error(payload.reason || "Request failed");
+      }
+      return payload;
+    }
+
+    async function loadState() {
+      appState = await api("/api/manual/state");
+      if (!selectedUuid) selectedUuid = appState.root.uuid;
+      render();
+    }
+
+    function render() {
+      const network = appState.network;
+      el("statusText").textContent =
+        `${network.address} | peers ${network.members.length - 1}` +
+        (network.topic_uuid ? ` | topic ${short(network.topic_uuid)}` : "");
+      el("selectionText").textContent = selectedUuid
+        ? `Selected ${short(selectedUuid)}`
+        : "No selection";
+      el("tree").replaceChildren(renderNode(appState.root, 0, true));
+      renderPeers();
+    }
+
+    function renderNode(node, depth, selectable) {
+      const wrap = document.createElement("div");
+      wrap.className = "node-wrap";
+      const row = document.createElement("button");
+      row.className = "node-row";
+      if (node.uuid === selectedUuid) row.classList.add("selected");
+      if (node.uuid === appState.network.topic_uuid) {
+        row.classList.add("current-topic");
+      }
+      row.style.paddingLeft = `${12 + depth * 22}px`;
+      row.type = "button";
+      row.onclick = () => {
+        if (selectable) {
+          selectedUuid = node.uuid;
+          render();
+        }
+      };
+      const title = document.createElement("span");
+      title.className = "node-title";
+      title.textContent = labelFor(node);
+      const meta = document.createElement("span");
+      meta.className = "node-meta";
+      meta.textContent = `${short(node.uuid)} | ${short(node.state_hash)}`;
+      row.append(title, meta);
+      wrap.append(row);
+      for (const child of node.children || []) {
+        wrap.append(renderNode(child, depth + 1, selectable));
+      }
+      return wrap;
+    }
+
+    function renderPeers() {
+      const peers = el("peers");
+      peers.replaceChildren();
+      const entries = Object.entries(appState.peers || {});
+      if (!entries.length) {
+        const empty = document.createElement("p");
+        empty.className = "empty";
+        empty.textContent = "No peer cache yet.";
+        peers.append(empty);
+        return;
+      }
+      for (const [addr, root] of entries) {
+        const block = document.createElement("section");
+        block.className = "peer";
+        const head = document.createElement("h3");
+        head.textContent = addr;
+        block.append(head);
+        block.append(root ? renderNode(root, 0, false) : text("No data"));
+        peers.append(block);
+      }
+    }
+
+    function labelFor(node) {
+      const data = node.data || {};
+      return data.name || data.label || data.title || node.uuid;
+    }
+
+    function findNode(node, uuid) {
+      if (!node || node.uuid === uuid) return node;
+      for (const child of node.children || []) {
+        const found = findNode(child, uuid);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function text(value) {
+      const p = document.createElement("p");
+      p.className = "empty";
+      p.textContent = value;
+      return p;
+    }
+
+    function short(value) {
+      return value ? String(value).slice(0, 8) : "";
+    }
+
+    function ensureSelected() {
+      if (!selectedUuid) throw new Error("Select a node first");
+      return selectedUuid;
+    }
+
+    function openModal(title, fields, onSubmit) {
+      el("modalTitle").textContent = title;
+      const area = el("modalFields");
+      area.replaceChildren();
+      for (const field of fields) {
+        const label = document.createElement("label");
+        label.textContent = field.label;
+        const input = field.multiline
+          ? document.createElement("textarea")
+          : document.createElement("input");
+        input.name = field.name;
+        input.value = field.value || "";
+        if (field.placeholder) input.placeholder = field.placeholder;
+        label.append(input);
+        area.append(label);
+      }
+      const dialog = el("modal");
+      el("modalCancel").onclick = () => dialog.close();
+      el("modalForm").onsubmit = async (event) => {
+        event.preventDefault();
+        const form = new FormData(event.currentTarget);
+        try {
+          await onSubmit(form);
+          dialog.close();
+          await loadState();
+        } catch (error) {
+          alert(error.message);
+        }
+      };
+      dialog.showModal();
+    }
+
+    function currentData() {
+      const node = findNode(appState.root, selectedUuid);
+      return node ? JSON.stringify(node.data || {}, null, 2) : "{}";
+    }
+
+    function currentWeights() {
+      const node = findNode(appState.root, selectedUuid);
+      return node ? JSON.stringify(node.weights || {}, null, 2) : "{}";
+    }
+
+    el("refreshBtn").onclick = loadState;
+    el("addBtn").onclick = () => openModal("Add Child", [
+      {name: "data", label: "Data", multiline: true, value: "{\n  \"name\": \"New node\"\n}"},
+      {name: "weights", label: "Weights", multiline: true, value: "{}"},
+    ], async (form) => {
+      await api("/api/manual/create_child", {
+        parent_uuid: ensureSelected(),
+        data: JSON.parse(form.get("data")),
+        weights: JSON.parse(form.get("weights") || "{}"),
+      });
+    });
+
+    el("editBtn").onclick = () => openModal("Modify Node", [
+      {name: "data", label: "Data", multiline: true, value: currentData()},
+      {name: "weights", label: "Weights", multiline: true, value: currentWeights()},
+    ], async (form) => {
+      await api("/api/manual/modify", {
+        node_uuid: ensureSelected(),
+        data: JSON.parse(form.get("data")),
+        weights: JSON.parse(form.get("weights") || "{}"),
+      });
+    });
+
+    el("deleteBtn").onclick = async () => {
+      const uuid = ensureSelected();
+      if (!confirm("Delete selected node and its children?")) return;
+      await api("/api/manual/delete", {node_uuid: uuid});
+      selectedUuid = appState.root.uuid;
+      await loadState();
+    };
+
+    el("copyBtn").onclick = () => openModal("Copy Subtree", [
+      {name: "destination", label: "Destination UUID", value: selectedUuid || ""},
+    ], async (form) => {
+      await api("/api/manual/copy", {
+        source_uuid: ensureSelected(),
+        destination_uuid: form.get("destination").trim(),
+      });
+    });
+
+    el("moveBtn").onclick = () => openModal("Move Subtree", [
+      {name: "destination", label: "Destination UUID", value: ""},
+    ], async (form) => {
+      await api("/api/manual/move", {
+        source_uuid: ensureSelected(),
+        destination_uuid: form.get("destination").trim(),
+      });
+    });
+
+    el("topicBtn").onclick = async () => {
+      await api("/api/manual/start_discussion", {topic_uuid: ensureSelected()});
+      await loadState();
+    };
+
+    el("inviteBtn").onclick = () => openModal("Invite", [
+      {name: "address", label: "Peer address", value: "http://127.0.0.1:8002"},
+      {name: "topic", label: "Topic UUID", value: selectedUuid || ""},
+    ], async (form) => {
+      await api("/api/manual/invite", {
+        address: form.get("address").trim(),
+        topic_uuid: form.get("topic").trim(),
+      });
+    });
+
+    el("leaveBtn").onclick = async () => {
+      await api("/api/leave", {});
+      await loadState();
+    };
+
+    const events = new EventSource("/api/events");
+    events.addEventListener("changed", loadState);
+    events.addEventListener("ready", loadState);
+    loadState().catch((error) => {
+      el("statusText").textContent = error.message;
+    });
+  </script>
+</body>
+</html>
