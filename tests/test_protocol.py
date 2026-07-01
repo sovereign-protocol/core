@@ -50,8 +50,22 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(child.previous_state_hash, old_child_hash)
         self.assertEqual(state.root.previous_state_hash, old_root_hash)
+        self.assertIn(old_child_hash, child.state_ancestor_hashes)
+        self.assertIn(old_root_hash, state.root.state_ancestor_hashes)
         self.assertNotEqual(child.state_hash, old_child_hash)
         self.assertNotEqual(state.root.state_hash, old_root_hash)
+
+    def test_modify_keeps_bounded_state_ancestor_hashes(self):
+        state = ProtocolState("si-a")
+        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
+        seen = []
+
+        for index in range(20):
+            seen.append(child.state_hash)
+            state.modify(child.uuid, {"name": f"changed-{index}"}, {})
+
+        self.assertEqual(len(child.state_ancestor_hashes), 16)
+        self.assertEqual(child.state_ancestor_hashes, seen[-1:-17:-1])
 
     def test_new_clone_resets_previous_state_hash_to_current(self):
         state = ProtocolState("si-a")
@@ -61,10 +75,12 @@ class ProtocolTests(unittest.TestCase):
         clone = state.copy(parent.uuid, state.root.uuid).value
 
         self.assertEqual(clone.previous_state_hash, clone.state_hash)
+        self.assertEqual(clone.state_ancestor_hashes, [])
         self.assertEqual(
             clone.children[0].previous_state_hash,
             clone.children[0].state_hash,
         )
+        self.assertEqual(clone.children[0].state_ancestor_hashes, [])
 
     def test_atomic_create_modify_delete(self):
         state = ProtocolState("si-a")

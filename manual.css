@@ -206,6 +206,17 @@ button:hover {
   border-color: rgba(22, 115, 71, 0.46);
 }
 
+.node-row.ghost {
+  border-style: dashed;
+  background: #fbfcfe;
+  color: var(--muted);
+}
+
+.node-row.ghost .node-main {
+  cursor: default;
+  opacity: 1;
+}
+
 .node-main {
   display: grid;
   grid-template-columns: 70px minmax(120px, 1fr) auto;

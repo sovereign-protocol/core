@@ -34,6 +34,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+MAX_STATE_ANCESTORS = 16
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -187,6 +190,7 @@ class PRSPNode:
         self.content_hash = ""
         self.state_hash = ""
         self.previous_state_hash = None
+        self.state_ancestor_hashes: list[str] = []
         self.refresh_hashes(track_previous=False)
         self.previous_state_hash = self.state_hash
 
@@ -211,6 +215,10 @@ class PRSPNode:
         )
         if track_previous and self.state_hash and new_state_hash != self.state_hash:
             self.previous_state_hash = self.state_hash
+            ancestors = [self.state_hash] + self.state_ancestor_hashes
+            self.state_ancestor_hashes = list(dict.fromkeys(ancestors))[
+                :MAX_STATE_ANCESTORS
+            ]
         self.content_hash = new_content_hash
         self.state_hash = new_state_hash
 
@@ -221,6 +229,7 @@ class PRSPNode:
 
     def reset_previous_state_hash_deep(self) -> None:
         self.previous_state_hash = self.state_hash
+        self.state_ancestor_hashes = []
         for child in self.children:
             child.reset_previous_state_hash_deep()
 
@@ -232,6 +241,7 @@ class PRSPNode:
             "content_hash": self.content_hash,
             "state_hash": self.state_hash,
             "previous_state_hash": self.previous_state_hash,
+            "state_ancestor_hashes": list(self.state_ancestor_hashes),
             "weights": copy.deepcopy(self.weights),
             "proposals": [proposal.to_dict() for proposal in self.proposals],
             "data": copy.deepcopy(self.data),
@@ -240,7 +250,7 @@ class PRSPNode:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict) -> "PRSPNode":
+    def from_dict(cls, payload: dict, repair_hashes: bool = False) -> "PRSPNode":
         node = cls.__new__(cls)
         node.uuid = payload["uuid"]
         node.created_at = payload["created_at"]
@@ -251,6 +261,17 @@ class PRSPNode:
             "previous_state_hash",
             node.state_hash,
         )
+        node.state_ancestor_hashes = list(payload.get(
+            "state_ancestor_hashes",
+            [],
+        ))
+        if not node.state_ancestor_hashes and node.previous_state_hash != node.state_hash:
+            node.state_ancestor_hashes = [node.previous_state_hash]
+        node.state_ancestor_hashes = list(dict.fromkeys(
+            hash_value
+            for hash_value in node.state_ancestor_hashes
+            if hash_value != node.state_hash
+        ))[:MAX_STATE_ANCESTORS]
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.proposals = [
             Proposal.from_dict(proposal)
@@ -259,12 +280,26 @@ class PRSPNode:
         node.data = copy.deepcopy(payload["data"])
         node.parent_uuid = payload.get("parent_uuid")
         node.children = [
-            cls.from_dict(child) for child in payload.get("children", [])
+            cls.from_dict(child, repair_hashes=repair_hashes)
+            for child in payload.get("children", [])
         ]
-        if node.content_hash != node.recompute_content_hash():
-            raise ValueError(f"invalid content_hash for node {node.uuid}")
-        if node.state_hash != node.recompute_state_hash():
-            raise ValueError(f"invalid state_hash for node {node.uuid}")
+        computed_content_hash = node.recompute_content_hash()
+        if node.content_hash != computed_content_hash:
+            if repair_hashes:
+                node.content_hash = computed_content_hash
+            else:
+                raise ValueError(f"invalid content_hash for node {node.uuid}")
+        computed_state_hash = node.recompute_state_hash()
+        if node.state_hash != computed_state_hash:
+            if repair_hashes:
+                node.state_hash = computed_state_hash
+                node.state_ancestor_hashes = [
+                    hash_value
+                    for hash_value in node.state_ancestor_hashes
+                    if hash_value != node.state_hash
+                ][:MAX_STATE_ANCESTORS]
+            else:
+                raise ValueError(f"invalid state_hash for node {node.uuid}")
         return node
 
 

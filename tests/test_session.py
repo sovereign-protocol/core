@@ -176,7 +176,7 @@ class SessionTests(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertEqual(cached.data["name"], "child")
 
-    def test_analyze_peer_transition_detects_intentional_change(self):
+    def test_analyze_peer_transition_detects_peer_made_changes(self):
         local = Session("si-a")
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
@@ -190,10 +190,11 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-b", topic.uuid)
 
-        self.assertEqual(events[0]["type"], "intentional_change")
+        self.assertEqual(events[0]["type"], "peer_made_changes")
+        self.assertEqual(events[0]["causal_distance"], 1)
         self.assertEqual(events[0]["node_uuid"], topic.uuid)
 
-    def test_analyze_peer_transition_detects_accepted_change(self):
+    def test_analyze_peer_transition_detects_in_agreement(self):
         local = Session("si-a")
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
@@ -209,9 +210,9 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-b", topic.uuid)
 
-        self.assertEqual(events[0]["type"], "accepted_change")
+        self.assertEqual(events[0]["type"], "in_agreement")
 
-    def test_analyze_peer_transition_detects_conflict(self):
+    def test_analyze_peer_transition_detects_divergence(self):
         local = Session("si-a")
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
@@ -226,7 +227,71 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-b", topic.uuid)
 
-        self.assertEqual(events[0]["type"], "conflict")
+        self.assertEqual(events[0]["type"], "divergence")
+
+    def test_analyze_peer_transition_detects_local_missing_node(self):
+        local = Session("si-a")
+        peer = Session("si-b")
+        topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
+        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        child = peer.create_child(topic.uuid, {"name": "peer child"}, {}).value
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        events = local.analyze_peer_transitions("si-b", child.uuid)
+
+        self.assertEqual(events[0]["type"], "local_missing_node")
+
+    def test_analyze_peer_transition_detects_peer_missing_node(self):
+        local = Session("si-a")
+        peer = Session("si-b")
+        topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
+        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        child = local.create_child(topic.uuid, {"name": "local child"}, {}).value
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        events = local.analyze_peer_transitions("si-b", child.uuid)
+
+        self.assertEqual(events[0]["type"], "peer_missing_node")
+
+    def test_analyze_peer_transition_detects_transitive_peer_changes(self):
+        local = Session("si-a")
+        middle = Session("si-b")
+        peer = Session("si-c")
+        topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
+        middle.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+
+        middle.modify(topic.uuid, {"name": "middle"}, {})
+        imported = PRSPNode.from_dict(middle.protocol.index[topic.uuid].to_dict())
+        parent = peer.protocol.root
+        old = peer.protocol.index[topic.uuid]
+        imported.parent_uuid = parent.uuid
+        peer.protocol.deindex_subtree(old)
+        parent.children = [
+            imported if child.uuid == old.uuid else child
+            for child in parent.children
+        ]
+        peer.protocol.index_subtree(imported)
+        peer.protocol.cascade_hash(parent.uuid)
+        peer.modify(topic.uuid, {"name": "peer-after-middle"}, {})
+        local.apply_peer_subtree(
+            "si-c",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        events = local.analyze_peer_transitions("si-c", topic.uuid)
+
+        self.assertEqual(events[0]["type"], "peer_made_changes")
+        self.assertEqual(events[0]["causal_distance"], 2)
 
     def test_leave_returns_transport_effects_and_clears_session(self):
         session = Session("si-a")

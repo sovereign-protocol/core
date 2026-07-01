@@ -138,7 +138,7 @@ class HttpTransportAdapter:
     def _pull_subtree_effect(self, effect: SessionEffect) -> TransportDelivery:
         node_uuid = effect.payload["node_uuid"]
         payload = self.fetch_subtree(effect.target, node_uuid)
-        subtree = PRSPNode.from_dict(payload["subtree"])
+        subtree = self._decode_wire_subtree(payload["subtree"], effect.target)
         self.session.apply_peer_subtree(
             effect.target,
             subtree,
@@ -189,13 +189,13 @@ class HttpTransportAdapter:
         try:
             peer_addr = peer_addr.rstrip("/")
             tree_payload = self.fetch_subtree(peer_addr, topic_uuid)
-            tree = PRSPNode.from_dict(tree_payload["subtree"])
+            tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
             accepted = self.session.accept_topic_invitation(tree)
             if accepted.status != "ok":
                 return {"status": "error", "reason": accepted.reason}
             self.session.apply_peer_subtree(
                 peer_addr,
-                PRSPNode.from_dict(tree_payload["subtree"]),
+                self._decode_wire_subtree(tree_payload["subtree"], peer_addr),
                 tree_payload.get("parent_uuid"),
             )
 
@@ -222,6 +222,14 @@ class HttpTransportAdapter:
         for member in response.get("members", []):
             self.session.add_peer(member, topic_uuid)
         self.session.add_peer(peer_addr, topic_uuid)
+        for member in sorted(self.session.members - {self.session.address}):
+            if member == peer_addr:
+                continue
+            self.execute_effect(SessionEffect(
+                "pull_subtree",
+                member,
+                {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
+            ))
         self.execute_effects(self.session._sync_effects(topic_uuid))
         return {
             "status": "ok",
@@ -272,6 +280,16 @@ class HttpTransportAdapter:
         return result, 200
 
     # Internals
+
+    def _decode_wire_subtree(self, payload: dict, peer_addr: str | None) -> PRSPNode:
+        try:
+            return PRSPNode.from_dict(payload)
+        except ValueError as exc:
+            self.logger(
+                "[transport] repairing invalid subtree from "
+                f"{peer_addr or 'peer'}: {exc}"
+            )
+            return PRSPNode.from_dict(payload, repair_hashes=True)
 
     def _handle_session_result(
             self, result: SessionResult) -> tuple[dict, int]:

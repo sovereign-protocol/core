@@ -120,6 +120,7 @@
       const row = document.createElement("div");
       row.className = "node-row";
       row.style.setProperty("--depth", depth);
+      if (mode === "ghost") row.classList.add("ghost");
       if (mode === "local" && node.uuid === selectedUuid) row.classList.add("selected");
       if (mode === "local" && node.uuid === appState.network.topic_uuid) {
         row.classList.add("current-topic");
@@ -128,6 +129,7 @@
       const select = document.createElement("button");
       select.className = "node-main";
       select.type = "button";
+      select.disabled = mode === "ghost";
       select.onclick = () => {
         if (mode === "local") {
           selectedUuid = node.uuid;
@@ -140,13 +142,17 @@
       title.textContent = labelFor(node);
       const meta = document.createElement("span");
       meta.className = "node-meta";
-      meta.textContent = `${short(node.uuid)} | ${short(node.state_hash)}`;
-      select.append(buildStripe(node), title, meta);
+      meta.textContent = mode === "ghost"
+        ? `${short(node.uuid)} | only in ${peerLabel(sourceAddr)}`
+        : `${short(node.uuid)} | ${short(node.state_hash)}`;
+      select.append(buildStripe(node.uuid, mode === "local" ? node : null), title, meta);
 
       const actions = document.createElement("div");
       actions.className = "node-actions";
       actions.append(iconButton("UUID", () => copyUuid(node.uuid)));
       if (mode === "local" && isUnderTopic(node.uuid) && hasPeerDifference(node)) {
+        actions.append(iconButton("Accept", () => openAcceptModal(node.uuid)));
+      } else if (mode === "ghost") {
         actions.append(iconButton("Accept", () => openAcceptModal(node.uuid)));
       }
 
@@ -155,10 +161,15 @@
       for (const child of node.children || []) {
         wrap.append(renderNode(child, depth + 1, mode, sourceAddr));
       }
+      if (mode === "local") {
+        for (const ghost of ghostChildren(node.uuid)) {
+          wrap.append(renderNode(ghost.node, depth + 1, "ghost", ghost.sourceAddr));
+        }
+      }
       return wrap;
     }
 
-    function buildStripe(localNode) {
+    function buildStripe(nodeUuid, localNode) {
       const stripe = document.createElement("span");
       stripe.className = "stripe";
       const members = discussionMembers();
@@ -169,11 +180,11 @@
         segment.style.borderColor = color;
         const peerNode = member === appState.network.address
           ? localNode
-          : findPeerNode(member, localNode.uuid);
+          : findPeerNode(member, nodeUuid);
         if (!peerNode) {
           segment.classList.add("missing");
           segment.style.background = "transparent";
-        } else if (peerNode.state_hash === localNode.state_hash) {
+        } else if (localNode && peerNode.state_hash === localNode.state_hash) {
           segment.style.background = selfColor;
         } else {
           segment.style.background = color;
@@ -190,6 +201,19 @@
         if (b === appState.network.address) return 1;
         return a.localeCompare(b);
       });
+    }
+
+    function ghostChildren(parentUuid) {
+      const ghosts = new Map();
+      for (const member of discussionMembers()) {
+        if (member === appState.network.address) continue;
+        const peerParent = findPeerNode(member, parentUuid);
+        for (const child of peerParent?.children || []) {
+          if (findNode(appState.root, child.uuid) || ghosts.has(child.uuid)) continue;
+          ghosts.set(child.uuid, {node: child, sourceAddr: member});
+        }
+      }
+      return [...ghosts.values()];
     }
 
     function hasPeerDifference(node) {
@@ -407,6 +431,12 @@
     function labelFor(node) {
       const data = node.data || {};
       return data.name || data.label || data.title || node.uuid;
+    }
+
+    function peerLabel(address) {
+      const text = String(address || "");
+      const match = text.match(/:(\d+)(?:\/)?$/);
+      return match ? match[1] : text.replace(/^https?:\/\//, "") || "peer";
     }
 
     function findNode(node, uuid) {

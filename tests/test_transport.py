@@ -73,6 +73,35 @@ class TransportTests(unittest.TestCase):
         self.assertIsNotNone(cached)
         self.assertEqual(cached.data["name"], "topic")
 
+    def test_pull_subtree_repairs_stale_hashes_from_peer(self):
+        session = Session("http://a")
+        http = FakeHttpClient()
+        logs = []
+        adapter = HttpTransportAdapter(session, http, logger=logs.append)
+        topic = PRSPNode({"name": "topic"})
+        child = PRSPNode({"name": "child"}, parent_uuid=topic.uuid)
+        topic.children.append(child)
+        topic.refresh_hashes_deep()
+        payload = topic.to_dict()
+        payload["content_hash"] = "stale"
+        payload["state_hash"] = "stale"
+        http.get_responses["http://b/p2p/subtree/topic"] = {
+            "subtree": payload,
+            "parent_uuid": None,
+        }
+
+        result = adapter.execute_effect(SessionEffect(
+            "pull_subtree",
+            "http://b",
+            {"node_uuid": "topic", "topic_uuid": "topic"},
+        ))
+
+        self.assertTrue(result.ok)
+        cached = session.get_cached_peer_subtree("http://b", topic.uuid)
+        self.assertIsNotNone(cached)
+        self.assertNotEqual(cached.state_hash, "stale")
+        self.assertIn("repairing invalid subtree", logs[0])
+
     def test_p2p_ping_executes_session_pull_effect(self):
         session = Session("http://a")
         http = FakeHttpClient()
@@ -113,6 +142,13 @@ class TransportTests(unittest.TestCase):
             "status": "ok",
             "members": ["http://b", "http://c"],
         }
+        peer_topic = PRSPNode.from_dict(topic.to_dict())
+        peer_topic.data["name"] = "peer-topic"
+        peer_topic.refresh_hashes()
+        http.get_responses[f"http://c/p2p/subtree/{topic.uuid}"] = {
+            "subtree": peer_topic.to_dict(),
+            "parent_uuid": None,
+        }
 
         result = adapter.join_discussion("http://b", topic.uuid)
 
@@ -121,6 +157,9 @@ class TransportTests(unittest.TestCase):
             "http://b",
             topic.uuid,
         ))
+        c_cached = session.get_cached_peer_subtree("http://c", topic.uuid)
+        self.assertIsNotNone(c_cached)
+        self.assertEqual(c_cached.data["name"], "peer-topic")
         self.assertEqual(session.active_topic_uuid, topic.uuid)
         self.assertIn("http://b", session.members)
         self.assertIn("http://c", session.members)

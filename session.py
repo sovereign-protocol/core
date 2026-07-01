@@ -235,6 +235,7 @@ class Session:
         target.content_hash = subtree.content_hash
         target.state_hash = subtree.state_hash
         target.previous_state_hash = subtree.previous_state_hash
+        target.state_ancestor_hashes = list(subtree.state_ancestor_hashes)
         target.weights = subtree.weights
         target.proposals = subtree.proposals
         target.data = subtree.data
@@ -445,14 +446,14 @@ class Session:
             return []
         if not local_node:
             return [self._transition_event(
-                "missing_local_node",
+                "local_missing_node",
                 peer_addr,
                 None,
                 peer_node,
             )]
         if not peer_node:
             return [self._transition_event(
-                "missing_peer_node",
+                "peer_missing_node",
                 peer_addr,
                 local_node,
                 None,
@@ -468,30 +469,74 @@ class Session:
                 peer_children.get(child_uuid),
             ))
 
-        if local_node.state_hash == peer_node.state_hash:
-            event_type = (
-                "agreement"
-                if peer_node.previous_state_hash == local_node.state_hash
-                else "accepted_change"
-            )
-        elif peer_node.previous_state_hash == local_node.state_hash:
-            event_type = "intentional_change"
-        elif local_node.previous_state_hash == peer_node.state_hash:
-            event_type = "local_intentional_change"
-        elif child_events and not any(
-                event["type"] == "conflict" for event in child_events):
-            event_type = "parallel_independent_changes"
-        else:
-            event_type = "conflict"
+        event_type, causal_distance = self._transition_type(
+            local_node,
+            peer_node,
+        )
+        if event_type == "cannot_compare" and child_events:
+            child_types = {event["type"] for event in child_events}
+            if "divergence" in child_types:
+                event_type = "divergence"
+            elif child_types <= {
+                    "in_agreement",
+                    "peer_made_changes",
+                    "local_made_changes",
+                    "local_missing_node",
+                    "peer_missing_node",
+            } and child_types != {"in_agreement"}:
+                event_type = "divergence"
 
         return [
-            self._transition_event(event_type, peer_addr, local_node, peer_node)
+            self._transition_event(
+                event_type,
+                peer_addr,
+                local_node,
+                peer_node,
+                causal_distance,
+            )
         ] + child_events
+
+    @staticmethod
+    def _transition_type(local_node: PRSPNode,
+                         peer_node: PRSPNode) -> tuple[str, int | None]:
+        local_ancestors = Session._state_ancestors(local_node)
+        peer_ancestors = Session._state_ancestors(peer_node)
+
+        if local_node.state_hash == peer_node.state_hash:
+            return "in_agreement", None
+        if local_node.state_hash in peer_ancestors:
+            return (
+                "peer_made_changes",
+                peer_ancestors.index(local_node.state_hash) + 1,
+            )
+        if peer_node.state_hash in local_ancestors:
+            return (
+                "local_made_changes",
+                local_ancestors.index(peer_node.state_hash) + 1,
+            )
+        local_lineage = {local_node.state_hash, *local_ancestors}
+        peer_lineage = {peer_node.state_hash, *peer_ancestors}
+        if local_lineage & peer_lineage:
+            return "divergence", None
+        return "cannot_compare", None
+
+    @staticmethod
+    def _state_ancestors(node: PRSPNode) -> list[str]:
+        ancestors = list(getattr(node, "state_ancestor_hashes", []) or [])
+        previous = getattr(node, "previous_state_hash", None)
+        if previous and previous != node.state_hash:
+            ancestors.append(previous)
+        return list(dict.fromkeys(
+            hash_value
+            for hash_value in ancestors
+            if hash_value != node.state_hash
+        ))
 
     @staticmethod
     def _transition_event(event_type: str, peer_addr: str,
                           local_node: PRSPNode | None,
-                          peer_node: PRSPNode | None) -> dict:
+                          peer_node: PRSPNode | None,
+                          causal_distance: int | None = None) -> dict:
         node = local_node or peer_node
         return {
             "type": event_type,
@@ -505,6 +550,7 @@ class Session:
             "peer_previous_state_hash": (
                 peer_node.previous_state_hash if peer_node else None
             ),
+            "causal_distance": causal_distance,
         }
 
     @staticmethod
