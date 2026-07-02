@@ -122,6 +122,8 @@ class HttpTransportAdapter:
             )
         except Exception as exc:
             self.logger(f"[transport] {effect.type} failed: {exc}")
+            if effect.type == "send_ping" and effect.target:
+                self.session.mark_peer_unreachable(effect.target, str(exc))
             return TransportDelivery(
                 False, effect.type, effect.target, str(exc)
             )
@@ -130,8 +132,9 @@ class HttpTransportAdapter:
         response = self.http.post_json(
             self._url(effect.target, "/p2p/ping"),
             effect.payload,
-            timeout=3,
+            timeout=10,
         )
+        self.session.mark_peer_reachable(effect.target)
         return TransportDelivery(True, effect.type, effect.target,
                                  response=response)
 
@@ -159,7 +162,8 @@ class HttpTransportAdapter:
                 self._url(effect.target, "/p2p/announce"),
                 {
                     "new_addr": new_addr,
-                    "topic_uuid": effect.payload["topic_uuid"],
+                    "topic_uuid": effect.payload.get("topic_uuid"),
+                    "topic_uuids": effect.payload.get("topic_uuids"),
                 },
                 timeout=3,
             ))
@@ -183,27 +187,33 @@ class HttpTransportAdapter:
             timeout=5,
         )
 
-    def join_discussion(self, peer_addr: str, topic_uuid: str) -> dict:
-        if not topic_uuid:
+    def join_discussion(self, peer_addr: str, topic_uuid: str | None = None,
+                        topic_uuids: list[str] | None = None) -> dict:
+        topic_uuids = self._topic_uuids(topic_uuid, topic_uuids)
+        if not topic_uuids:
             return {"status": "error", "reason": "topic_uuid is required"}
         try:
             peer_addr = peer_addr.rstrip("/")
-            tree_payload = self.fetch_subtree(peer_addr, topic_uuid)
-            tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
-            accepted = self.session.accept_topic_invitation(tree)
-            if accepted.status != "ok":
-                return {"status": "error", "reason": accepted.reason}
-            self.session.apply_peer_subtree(
-                peer_addr,
-                self._decode_wire_subtree(tree_payload["subtree"], peer_addr),
-                tree_payload.get("parent_uuid"),
-            )
+            adopted = []
+            for topic_uuid in topic_uuids:
+                tree_payload = self.fetch_subtree(peer_addr, topic_uuid)
+                tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
+                accepted = self.session.accept_topic_invitation(tree)
+                if accepted.status != "ok":
+                    return {"status": "error", "reason": accepted.reason}
+                adopted.append(accepted.value)
+                self.session.apply_peer_subtree(
+                    peer_addr,
+                    self._decode_wire_subtree(tree_payload["subtree"], peer_addr),
+                    tree_payload.get("parent_uuid"),
+                )
 
             response = self.http.post_json(
                 self._url(peer_addr, "/p2p/join"),
                 {
                     "from_addr": self.session.address,
-                    "topic_uuid": topic_uuid,
+                    "topic_uuid": topic_uuids[0],
+                    "topic_uuids": topic_uuids,
                     "known_members": sorted(self.session.members),
                 },
                 timeout=10,
@@ -220,30 +230,43 @@ class HttpTransportAdapter:
             return {"status": "error", "reason": str(exc)}
 
         for member in response.get("members", []):
-            self.session.add_peer(member, topic_uuid)
-        self.session.add_peer(peer_addr, topic_uuid)
+            if member == self.session.address:
+                continue
+            self.session.add_peer_topics(member, topic_uuids)
+        if peer_addr != self.session.address:
+            self.session.add_peer_topics(peer_addr, topic_uuids)
         for member in sorted(self.session.members - {self.session.address}):
             if member == peer_addr:
                 continue
-            self.execute_effect(SessionEffect(
-                "pull_subtree",
-                member,
-                {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-            ))
-        self.execute_effects(self.session._sync_effects(topic_uuid))
+            for topic_uuid in topic_uuids:
+                self.execute_effect(SessionEffect(
+                    "pull_subtree",
+                    member,
+                    {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
+                ))
+        for topic_uuid in topic_uuids:
+            self.execute_effects(self.session._sync_effects(topic_uuid))
         return {
             "status": "ok",
             "members": response.get("members", []),
-            "adopted_root_uuid": accepted.value,
+            "topic_uuids": topic_uuids,
+            "adopted_root_uuid": adopted[0] if adopted else None,
+            "adopted_root_uuids": adopted,
         }
 
-    def invite_to_discuss(self, peer_addr: str, topic_uuid: str) -> dict:
-        if not topic_uuid:
+    def invite_to_discuss(self, peer_addr: str, topic_uuid: str | None = None,
+                          topic_uuids: list[str] | None = None) -> dict:
+        topic_uuids = self._topic_uuids(topic_uuid, topic_uuids)
+        if not topic_uuids:
             return {"status": "error", "reason": "topic_uuid is required"}
         try:
             return self.http.post_json(
                 self._url(peer_addr, "/api/join_discussion"),
-                {"address": self.session.address, "topic_uuid": topic_uuid},
+                {
+                    "address": self.session.address,
+                    "topic_uuid": topic_uuids[0],
+                    "topic_uuids": topic_uuids,
+                },
                 timeout=15,
             )
         except TransportHttpError as exc:
@@ -258,6 +281,56 @@ class HttpTransportAdapter:
     def leave_discussion(self) -> list[TransportDelivery]:
         result = self.session.leave()
         return self.execute_effects(result.effects)
+
+    def check_peer_health(self, peer_addr: str, timeout: float = 2) -> TransportDelivery:
+        topic_uuids = sorted(self.session.peer_topic_sets.get(peer_addr) or [])
+        if not topic_uuids:
+            changed = self.session.mark_peer_unreachable(peer_addr, "no shared topics")
+            return TransportDelivery(
+                False,
+                "health_ping",
+                peer_addr,
+                "no shared topics",
+                response={"status_changed": changed},
+            )
+        responses = []
+        try:
+            for topic_uuid in topic_uuids:
+                topic = self.session.protocol.index.get(topic_uuid)
+                responses.append(self.http.post_json(
+                    self._url(peer_addr, "/p2p/ping"),
+                    {
+                        "from_addr": self.session.address,
+                        "topic_uuid": topic_uuid,
+                        "topic_state_hash": topic.state_hash if topic else None,
+                        "changed_uuid": None,
+                        "health_check": True,
+                    },
+                    timeout=timeout,
+                ))
+                subtree_payload = self.fetch_subtree(peer_addr, topic_uuid)
+                self.session.apply_peer_subtree(
+                    peer_addr,
+                    self._decode_wire_subtree(subtree_payload["subtree"], peer_addr),
+                    subtree_payload.get("parent_uuid"),
+                )
+            changed = self.session.mark_peer_reachable(peer_addr)
+            return TransportDelivery(
+                True,
+                "health_ping",
+                peer_addr,
+                response={"responses": responses, "status_changed": changed},
+            )
+        except Exception as exc:
+            changed = self.session.mark_peer_unreachable(peer_addr, str(exc))
+            self.logger(f"[transport] health_ping failed for {peer_addr}: {exc}")
+            return TransportDelivery(
+                False,
+                "health_ping",
+                peer_addr,
+                str(exc),
+                response={"status_changed": changed},
+            )
 
     # Incoming P2P endpoints
 
@@ -290,6 +363,14 @@ class HttpTransportAdapter:
                 f"{peer_addr or 'peer'}: {exc}"
             )
             return PRSPNode.from_dict(payload, repair_hashes=True)
+
+    @staticmethod
+    def _topic_uuids(topic_uuid: str | None,
+                     topic_uuids: list[str] | None) -> list[str]:
+        values = list(topic_uuids or [])
+        if topic_uuid:
+            values.append(topic_uuid)
+        return sorted(str(value) for value in set(values) if value)
 
     def _handle_session_result(
             self, result: SessionResult) -> tuple[dict, int]:

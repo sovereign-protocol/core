@@ -19,7 +19,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.active_topic_uuid, topic.uuid)
         self.assertEqual(session.members, {"si-a"})
 
-    def test_start_discussion_rejects_different_topic_while_active(self):
+    def test_start_discussion_allows_multiple_topics(self):
         session = Session("si-a")
         first = session.create_child(
             session.protocol.root.uuid,
@@ -35,9 +35,8 @@ class SessionTests(unittest.TestCase):
 
         result = session.start_discussion(second.uuid)
 
-        self.assertEqual(result.status, "error")
-        self.assertEqual(result.reason, "already discussing a different topic")
-        self.assertEqual(session.active_topic_uuid, first.uuid)
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(session.active_topic_uuids, {first.uuid, second.uuid})
 
     def test_local_change_returns_send_ping_effects(self):
         session = Session("si-a")
@@ -57,6 +56,21 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.effects[0].target, "si-b")
         self.assertEqual(result.effects[0].payload["topic_uuid"], topic.uuid)
 
+    def test_local_change_outside_topic_does_not_ping_topic_peers(self):
+        session = Session("si-a")
+        topic = session.create_child(
+            session.protocol.root.uuid,
+            {"name": "topic"},
+            {},
+        ).value
+        session.start_discussion(topic.uuid)
+        session.add_peer("si-b", topic.uuid)
+
+        result = session.modify(session.protocol.root.uuid, {"name": "local setting"}, {})
+
+        self.assertEqual(result.status, "ok")
+        self.assertEqual(result.effects, [])
+
     def test_handle_ping_without_peer_cache_pulls_topic(self):
         session = Session("si-a")
 
@@ -71,6 +85,22 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.effects[0].type, "pull_subtree")
         self.assertEqual(result.effects[0].target, "si-b")
         self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
+        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "online")
+
+    def test_peer_can_be_marked_on_hold_and_recovered(self):
+        session = Session("si-a")
+        session.add_peer("si-b", "topic-1")
+
+        changed = session.mark_peer_unreachable("si-b", "timeout")
+
+        self.assertTrue(changed)
+        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "on_hold")
+        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["last_error"], "timeout")
+
+        recovered = session.mark_peer_reachable("si-b")
+
+        self.assertTrue(recovered)
+        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "online")
 
     def test_handle_ping_with_peer_cache_pulls_changed_subtree(self):
         session = Session("si-a")
@@ -145,7 +175,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.effects[0].type, "pull_subtree")
         self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
 
-    def test_accept_topic_invitation_attaches_topic_under_root(self):
+    def test_accept_topic_invitation_attaches_topic_under_other_perspectives(self):
         inviter = Session("si-a")
         topic = inviter.create_child(
             inviter.protocol.root.uuid,
@@ -160,8 +190,11 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.value, topic.uuid)
         self.assertEqual(invited.active_topic_uuid, topic.uuid)
         self.assertIn(topic.uuid, invited.protocol.index)
-        self.assertEqual(invited.protocol.index[topic.uuid].parent_uuid,
-                         invited.protocol.root.uuid)
+        parent = invited.protocol.index[invited.protocol.index[topic.uuid].parent_uuid]
+        self.assertEqual(parent.data, {
+            "type": "folder",
+            "name": "other_perspectives",
+        })
 
     def test_apply_peer_subtree_updates_peer_cache_without_http(self):
         session = Session("si-a")

@@ -28,6 +28,7 @@ Transport contract:
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -55,49 +56,73 @@ class Session:
         self.protocol = ProtocolState(author=address)
         self.members: set[str] = {address}
         self.peer_topics: dict[str, str] = {}
+        self.peer_topic_sets: dict[str, set[str]] = {}
         self.peer_perspectives: dict[str, PRSPNode | None] = {}
-        self.active_topic_uuid: str | None = None
+        self.peer_status: dict[str, dict[str, Any]] = {}
+        self.active_topic_uuids: set[str] = set()
+
+    @property
+    def active_topic_uuid(self) -> str | None:
+        return sorted(self.active_topic_uuids)[0] if self.active_topic_uuids else None
+
+    @active_topic_uuid.setter
+    def active_topic_uuid(self, value: str | None) -> None:
+        self.active_topic_uuids = {value} if value else set()
 
     # Discussion/session state
 
     def start_discussion(self, topic_uuid: str) -> SessionResult:
         if topic_uuid not in self.protocol.index:
             return SessionResult("error", reason="topic not found")
-        if self.active_topic_uuid and self.active_topic_uuid != topic_uuid:
-            return SessionResult(
-                "error",
-                reason="already discussing a different topic",
-            )
-        self.active_topic_uuid = topic_uuid
+        self.active_topic_uuids.add(topic_uuid)
         return SessionResult("ok", value=topic_uuid)
 
     def add_peer(self, peer_addr: str, topic_uuid: str) -> None:
+        if peer_addr == self.address:
+            self.active_topic_uuids.add(topic_uuid)
+            return
         self.members.add(peer_addr)
-        self.peer_topics[peer_addr] = topic_uuid
-        if self.active_topic_uuid is None:
-            self.active_topic_uuid = topic_uuid
+        self.peer_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
+        self.peer_topics.setdefault(peer_addr, topic_uuid)
+        self.peer_status.setdefault(peer_addr, self._new_peer_status())
+        self.active_topic_uuids.add(topic_uuid)
 
-    def accept_topic_invitation(self, tree: PRSPNode) -> SessionResult:
-        result = self.protocol.attach_topic(tree)
+    def add_peer_topics(self, peer_addr: str, topic_uuids: list[str] | set[str]) -> None:
+        for topic_uuid in sorted(set(topic_uuids)):
+            self.add_peer(peer_addr, topic_uuid)
+
+    def accept_topic_invitation(self, tree: PRSPNode,
+                                parent_uuid: str | None = None) -> SessionResult:
+        result = self.protocol.attach_topic(
+            tree,
+            parent_uuid or self._other_perspectives_uuid(),
+        )
         if not result.ok:
             return SessionResult("error", reason=result.reason)
-        self.active_topic_uuid = result.value
+        self.active_topic_uuids.add(result.value)
         return SessionResult("ok", value=result.value)
 
     def leave(self) -> SessionResult:
         peers = sorted(self.members - {self.address})
-        peer_topics = dict(self.peer_topics)
+        peer_topics = {
+            peer: set(self.peer_topic_sets.get(peer) or [])
+            for peer in peers
+        }
         effects = []
         for peer in peers:
-            topic_uuid = peer_topics.get(peer)
-            if not topic_uuid:
+            topic_uuids = peer_topics.get(peer) or set()
+            if not topic_uuids:
                 continue
             others = [other for other in peers if other != peer]
             if others:
                 effects.append(SessionEffect(
                     "announce_peer",
                     peer,
-                    {"new_addrs": others, "topic_uuid": topic_uuid},
+                    {
+                        "new_addrs": others,
+                        "topic_uuids": sorted(topic_uuids),
+                        "topic_uuid": sorted(topic_uuids)[0],
+                    },
                 ))
         for peer in peers:
             effects.append(SessionEffect(
@@ -107,8 +132,10 @@ class Session:
             ))
         self.members = {self.address}
         self.peer_topics.clear()
+        self.peer_topic_sets.clear()
         self.peer_perspectives.clear()
-        self.active_topic_uuid = None
+        self.peer_status.clear()
+        self.active_topic_uuids.clear()
         return SessionResult("ok", effects=effects)
 
     # Incoming session messages
@@ -122,10 +149,9 @@ class Session:
             return SessionResult("error", reason="missing from_addr")
         if not topic_uuid:
             return SessionResult("error", reason="missing topic_uuid")
-        if self.active_topic_uuid and self.active_topic_uuid != topic_uuid:
-            return SessionResult("error", reason="already discussing a different topic")
 
         self.add_peer(from_addr, topic_uuid)
+        self.mark_peer_reachable(from_addr)
         cached = self.peer_perspectives.get(from_addr)
         cached_state_hash = cached.state_hash if cached else None
         pull_uuid = topic_uuid if cached is None else changed_uuid
@@ -143,63 +169,93 @@ class Session:
 
     def handle_join(self, message: dict) -> SessionResult:
         from_addr = message.get("from_addr")
-        topic_uuid = message.get("topic_uuid")
+        topic_uuids = self._message_topic_uuids(message)
         known_members = set(message.get("known_members") or [])
         if not from_addr:
             return SessionResult("error", reason="missing from_addr")
-        if not topic_uuid:
+        if not topic_uuids:
             return SessionResult("error", reason="missing topic_uuid")
-        if self.active_topic_uuid and self.active_topic_uuid != topic_uuid:
-            return SessionResult("error", reason="already discussing a different topic")
 
-        self.add_peer(from_addr, topic_uuid)
+        self.add_peer_topics(from_addr, topic_uuids)
         for member in sorted(known_members):
             if member == self.address:
                 continue
-            self.add_peer(member, topic_uuid)
+            self.add_peer_topics(member, topic_uuids)
 
-        effects = [
-            SessionEffect("pull_subtree", from_addr,
-                          {"node_uuid": topic_uuid, "topic_uuid": topic_uuid})
-        ]
-        for member in sorted(known_members):
-            if member not in (self.address, from_addr):
-                effects.append(SessionEffect(
+        effects = []
+        for topic_uuid in topic_uuids:
+            effects.append(SessionEffect(
+                "pull_subtree",
+                from_addr,
+                {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
+            ))
+            for member in sorted(known_members):
+                if member not in (self.address, from_addr):
+                    effects.append(SessionEffect(
                     "pull_subtree",
                     member,
                     {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-                ))
+                    ))
         return SessionResult(
             "ok",
-            value={"members": sorted(self.members)},
+            value={
+                "members": sorted(self.members),
+                "topic_uuids": topic_uuids,
+                "topic_uuid": topic_uuids[0],
+            },
             effects=effects,
         )
 
     def handle_announce(self, message: dict) -> SessionResult:
         new_addr = message.get("new_addr")
-        topic_uuid = message.get("topic_uuid")
+        topic_uuids = self._message_topic_uuids(message)
         if not new_addr:
             return SessionResult("error", reason="missing new_addr")
-        if not topic_uuid:
+        if not topic_uuids:
             return SessionResult("error", reason="missing topic_uuid")
-        if self.active_topic_uuid and self.active_topic_uuid != topic_uuid:
-            return SessionResult("error", reason="already discussing a different topic")
-        self.add_peer(new_addr, topic_uuid)
-        return SessionResult(
-            "ok",
-            effects=[SessionEffect(
+        self.add_peer_topics(new_addr, topic_uuids)
+        effects = [
+            SessionEffect(
                 "pull_subtree",
                 new_addr,
                 {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-            )],
+            )
+            for topic_uuid in topic_uuids
+        ]
+        return SessionResult(
+            "ok",
+            effects=effects,
         )
 
     def handle_leave(self, message: dict) -> SessionResult:
         from_addr = message.get("from_addr")
         self.members.discard(from_addr)
         self.peer_topics.pop(from_addr, None)
+        self.peer_topic_sets.pop(from_addr, None)
         self.peer_perspectives.pop(from_addr, None)
+        self.peer_status.pop(from_addr, None)
         return SessionResult("ok")
+
+    def mark_peer_reachable(self, peer_addr: str) -> bool:
+        status = self.peer_status.setdefault(peer_addr, self._new_peer_status())
+        changed = status.get("state") != "online" or status.get("failures", 0) != 0
+        status.update({
+            "state": "online",
+            "failures": 0,
+            "last_seen": time.time(),
+            "last_error": None,
+        })
+        return changed
+
+    def mark_peer_unreachable(self, peer_addr: str, reason: str | None = None) -> bool:
+        status = self.peer_status.setdefault(peer_addr, self._new_peer_status())
+        was_on_hold = status.get("state") == "on_hold"
+        status.update({
+            "state": "on_hold",
+            "failures": int(status.get("failures", 0)) + 1,
+            "last_error": reason or "unreachable",
+        })
+        return not was_on_hold
 
     # Peer cache
 
@@ -226,6 +282,24 @@ class Session:
                 parent.children.append(subtree)
                 self._refresh_tree_hashes(cached)
                 return
+            if cached.data.get("type") == "peer_cache_root":
+                subtree.parent_uuid = cached.uuid
+                cached.children = [
+                    child for child in cached.children
+                    if child.uuid != subtree.uuid
+                ]
+                cached.children.append(subtree)
+                self._refresh_tree_hashes(cached)
+                return
+            if cached.uuid != subtree.uuid:
+                aggregate = self._peer_cache_root(peer_addr)
+                existing = cached
+                existing.parent_uuid = aggregate.uuid
+                subtree.parent_uuid = aggregate.uuid
+                aggregate.children = [existing, subtree]
+                aggregate.refresh_hashes_deep()
+                self.peer_perspectives[peer_addr] = aggregate
+                return
             self.peer_perspectives[peer_addr] = subtree
             return
 
@@ -240,6 +314,20 @@ class Session:
         target.proposals = subtree.proposals
         target.data = subtree.data
         target.children = subtree.children
+        if parent_uuid and target.parent_uuid != parent_uuid:
+            old_parent = self._find_in_tree(cached, target.parent_uuid)
+            new_parent = self._find_in_tree(cached, parent_uuid)
+            if old_parent and new_parent:
+                old_parent.children = [
+                    child for child in old_parent.children
+                    if child.uuid != target.uuid
+                ]
+                target.parent_uuid = new_parent.uuid
+                new_parent.children = [
+                    child for child in new_parent.children
+                    if child.uuid != target.uuid
+                ]
+                new_parent.children.append(target)
         self._refresh_tree_hashes(cached)
 
     def get_cached_peer_subtree(self, peer_addr: str, node_uuid: str) -> PRSPNode | None:
@@ -289,7 +377,7 @@ class Session:
 
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self.protocol.move(source_uuid, destination_uuid)
-        return self._operation_result(result, self.active_topic_uuid or destination_uuid)
+        return self._operation_result(result, source_uuid)
 
     def propose(self, top_uuid: str,
                 operations: list[dict | AtomicOperation]) -> SessionResult:
@@ -361,14 +449,21 @@ class Session:
             "members": sorted(self.members),
             "peer_addresses": sorted(self.peer_perspectives.keys()),
             "topic_uuid": self.active_topic_uuid,
+            "topic_uuids": sorted(self.active_topic_uuids),
             "peers": {
                 addr: {
                     "content_hash": tree.content_hash if tree else None,
                     "state_hash": tree.state_hash if tree else None,
                     "root_uuid": tree.uuid if tree else None,
                     "topic_uuid": self.peer_topics.get(addr),
+                    "topic_uuids": sorted(self.peer_topic_sets.get(addr) or []),
+                    "status": self.peer_status.get(addr, self._new_peer_status()),
                 }
                 for addr, tree in self.peer_perspectives.items()
+            },
+            "peer_status": {
+                addr: self.peer_status.get(addr, self._new_peer_status())
+                for addr in sorted(self.members - {self.address})
             },
         }
 
@@ -381,27 +476,40 @@ class Session:
                              effects=self._sync_effects(changed_uuid))
 
     def _sync_effects(self, changed_uuid: str | None) -> list[SessionEffect]:
-        topic_uuid = self.active_topic_uuid
-        if not topic_uuid:
-            return []
-        topic = self.protocol.index.get(topic_uuid)
-        if not topic:
-            return []
         effects = []
-        for peer in sorted(self.members - {self.address}):
-            if self.peer_topics.get(peer) != topic_uuid:
+        for topic_uuid in self._topics_for_change(changed_uuid):
+            topic = self.protocol.index.get(topic_uuid)
+            if not topic:
                 continue
-            effects.append(SessionEffect(
-                "send_ping",
-                peer,
-                {
-                    "from_addr": self.address,
-                    "topic_uuid": topic_uuid,
-                    "topic_state_hash": topic.state_hash,
-                    "changed_uuid": changed_uuid or topic_uuid,
-                },
-            ))
+            for peer in sorted(self.members - {self.address}):
+                if topic_uuid not in self.peer_topic_sets.get(peer, set()):
+                    continue
+                effects.append(SessionEffect(
+                    "send_ping",
+                    peer,
+                    {
+                        "from_addr": self.address,
+                        "topic_uuid": topic_uuid,
+                        "topic_state_hash": topic.state_hash,
+                        "changed_uuid": changed_uuid or topic_uuid,
+                    },
+                ))
         return effects
+
+    def _topics_for_change(self, changed_uuid: str | None) -> list[str]:
+        if not self.active_topic_uuids:
+            return []
+        if not changed_uuid:
+            return sorted(self.active_topic_uuids)
+        return [
+            topic_uuid
+            for topic_uuid in sorted(self.active_topic_uuids)
+            if self._is_descendant_or_self(topic_uuid, changed_uuid)
+        ]
+
+    def _is_descendant_or_self(self, root_uuid: str, node_uuid: str) -> bool:
+        root = self.protocol.index.get(root_uuid)
+        return bool(root and self._find_in_tree(root, node_uuid))
 
     @staticmethod
     def _coerce_operations(
@@ -413,6 +521,43 @@ class Session:
             else:
                 out.append(AtomicOperation.from_dict(operation))
         return out
+
+    @staticmethod
+    def _message_topic_uuids(message: dict) -> list[str]:
+        topic_uuids = message.get("topic_uuids")
+        if topic_uuids:
+            return sorted(str(uuid) for uuid in set(topic_uuids))
+        topic_uuid = message.get("topic_uuid")
+        return [topic_uuid] if topic_uuid else []
+
+    @staticmethod
+    def _new_peer_status() -> dict[str, Any]:
+        return {
+            "state": "online",
+            "failures": 0,
+            "last_seen": None,
+            "last_error": None,
+        }
+
+    @staticmethod
+    def _peer_cache_root(peer_addr: str) -> PRSPNode:
+        root = PRSPNode({"type": "peer_cache_root", "label": peer_addr})
+        root.uuid = f"peer-cache:{peer_addr}"
+        root.refresh_hashes(track_previous=False)
+        root.previous_state_hash = root.state_hash
+        return root
+
+    def _other_perspectives_uuid(self) -> str:
+        for child in self.protocol.root.children:
+            if (child.data.get("type") == "folder"
+                    and child.data.get("name") == "other_perspectives"):
+                return child.uuid
+        created = self.protocol.create_child(
+            self.protocol.root.uuid,
+            {"type": "folder", "name": "other_perspectives"},
+            {},
+        )
+        return created.value.uuid
 
     def _find_visible_proposal(self, proposal_uuid: str,
                                source_addr: str | None) -> Proposal | None:

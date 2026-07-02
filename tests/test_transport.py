@@ -36,6 +36,7 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
+        session.add_peer("http://b/", "topic")
 
         result = adapter.execute_effect(SessionEffect(
             "send_ping",
@@ -51,6 +52,39 @@ class TransportTests(unittest.TestCase):
         self.assertTrue(result.ok)
         self.assertEqual(http.posts[0][0], "http://b/p2p/ping")
         self.assertEqual(http.posts[0][1]["changed_uuid"], "changed")
+        self.assertEqual(session.peer_status["http://b/"]["state"], "online")
+
+    def test_health_ping_marks_peer_on_hold_after_failure(self):
+        session = Session("http://a")
+        topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
+        session.start_discussion(topic.uuid)
+        session.add_peer("http://b", topic.uuid)
+        http = FailingHttpClient()
+        adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
+
+        result = adapter.check_peer_health("http://b", timeout=0.1)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(session.peer_status["http://b"]["state"], "on_hold")
+
+    def test_health_ping_recovers_peer(self):
+        session = Session("http://a")
+        topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
+        session.start_discussion(topic.uuid)
+        session.add_peer("http://b", topic.uuid)
+        session.mark_peer_unreachable("http://b", "timeout")
+        http = FakeHttpClient()
+        http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
+            "subtree": topic.to_dict(),
+            "parent_uuid": None,
+        }
+        adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
+
+        result = adapter.check_peer_health("http://b", timeout=0.1)
+
+        self.assertTrue(result.ok)
+        self.assertEqual(session.peer_status["http://b"]["state"], "online")
+        self.assertIsNotNone(session.get_cached_peer_subtree("http://b", topic.uuid))
 
     def test_pull_subtree_effect_updates_session_peer_cache(self):
         session = Session("http://a")

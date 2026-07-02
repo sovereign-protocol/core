@@ -525,19 +525,22 @@ class ProtocolState:
 
     # Topic / tree helpers
 
-    def attach_topic(self, tree: PRSPNode) -> ProtocolResult:
+    def attach_topic(self, tree: PRSPNode, parent_uuid: str | None = None) -> ProtocolResult:
         existing = self.index.get(tree.uuid)
         if existing:
             return ProtocolResult(True, existing.uuid)
-        tree.parent_uuid = self.root.uuid
-        self.root.children = [
-            child for child in self.root.children if child.uuid != tree.uuid
+        parent = self.index.get(parent_uuid) if parent_uuid else self.root
+        if not parent:
+            return ProtocolResult(False, reason="parent not found")
+        tree.parent_uuid = parent.uuid
+        parent.children = [
+            child for child in parent.children if child.uuid != tree.uuid
         ]
-        self.root.children.append(tree)
+        parent.children.append(tree)
         self.index = {}
         self.index_subtree(self.root)
         self.cascade_hash(tree.uuid)
-        self.cascade_hash(self.root.uuid)
+        self.cascade_hash(parent.uuid)
         return ProtocolResult(True, tree.uuid)
 
     def find_proposal(self, proposal_uuid: str) -> Proposal | None:
