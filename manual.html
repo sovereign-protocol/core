@@ -176,8 +176,8 @@
         const topics = network.peers?.[addr]?.topic_uuids || [];
         const status = peerStatus(addr);
         const chip = document.createElement("span");
-        chip.className = `network-peer ${status.state === "on_hold" ? "on-hold" : ""}`;
-        chip.textContent = status.state === "on_hold"
+        chip.className = `network-peer ${status.state === "offline" ? "on-hold" : ""}`;
+        chip.textContent = status.state === "offline"
           ? `${peerLabel(addr)} on hold`
           : peerLabel(addr);
         chip.title = `${addr}\nTopics: ${
@@ -370,12 +370,12 @@
           head.className = "peer-head";
         const title = document.createElement("h3");
         const status = peerStatus(addr);
-        title.textContent = status.state === "on_hold" ? `${addr} (on hold)` : addr;
+        title.textContent = status.state === "offline" ? `${addr} (on hold)` : addr;
         title.title = status.last_error || "";
         const chip = document.createElement("span");
         chip.className = "peer-chip";
         chip.style.background = colorFor(addr);
-        if (status.state === "on_hold") chip.classList.add("on-hold");
+        if (status.state === "offline") chip.classList.add("on-hold");
         head.append(title, chip);
           block.append(head);
           block.append(root ? renderNode(root, 0, "peer", addr) : text("No data"));

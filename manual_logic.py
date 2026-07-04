@@ -13,7 +13,6 @@ Offered API:
 from __future__ import annotations
 
 import asyncio
-import copy
 from typing import Any
 
 from starlette.requests import Request
@@ -40,6 +39,15 @@ class ManualLogic:
 
     def start_discussion(self, topic_uuid: str) -> SessionResult:
         return self.session.start_discussion(topic_uuid)
+
+    def join_discussion(self, runtime, address: str,
+                        topic_uuid: str | None = None,
+                        topic_uuids: list[str] | None = None) -> dict:
+        return runtime.adapter.join_discussion(
+            address,
+            topic_uuid,
+            topic_uuids,
+        )
 
     def create_child(self, parent_uuid: str, data: dict,
                      weights: dict[str, float] | None = None) -> SessionResult:
@@ -73,24 +81,7 @@ class ManualLogic:
         if not parent_uuid or parent_uuid not in self.session.protocol.index:
             return SessionResult("error", reason="local parent not found")
 
-        adopted = copy.deepcopy(peer)
-        adopted.parent_uuid = parent_uuid
-        existing = self.session.protocol.index.get(adopted.uuid)
-        parent = self.session.protocol.index[parent_uuid]
-        if existing:
-            self.session.protocol.deindex_subtree(existing)
-            parent.children = [
-                child for child in parent.children
-                if child.uuid != adopted.uuid
-            ]
-        parent.children.append(adopted)
-        self.session.protocol.index_subtree(adopted)
-        self.session.protocol.cascade_hash(parent.uuid)
-        return SessionResult(
-            "ok",
-            value=adopted.uuid,
-            effects=self.session._sync_effects(adopted.uuid),
-        )
+        return self.session.adopt_subtree(peer, parent_uuid)
 
 
 def create_logic(session: Session, config: dict) -> ManualLogic:

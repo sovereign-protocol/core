@@ -34,9 +34,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-MAX_STATE_ANCESTORS = 16
-
-
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -189,10 +186,7 @@ class PRSPNode:
         self.children: list[PRSPNode] = []
         self.content_hash = ""
         self.state_hash = ""
-        self.previous_state_hash = None
-        self.state_ancestor_hashes: list[str] = []
-        self.refresh_hashes(track_previous=False)
-        self.previous_state_hash = self.state_hash
+        self.refresh_hashes()
 
     def recompute_content_hash(self) -> str:
         return content_hash(
@@ -207,18 +201,12 @@ class PRSPNode:
             sorted(child.state_hash for child in self.children),
         )
 
-    def refresh_hashes(self, track_previous: bool = True) -> None:
+    def refresh_hashes(self) -> None:
         new_content_hash = self.recompute_content_hash()
         new_state_hash = state_hash(
             new_content_hash,
             sorted(child.state_hash for child in self.children),
         )
-        if track_previous and self.state_hash and new_state_hash != self.state_hash:
-            self.previous_state_hash = self.state_hash
-            ancestors = [self.state_hash] + self.state_ancestor_hashes
-            self.state_ancestor_hashes = list(dict.fromkeys(ancestors))[
-                :MAX_STATE_ANCESTORS
-            ]
         self.content_hash = new_content_hash
         self.state_hash = new_state_hash
 
@@ -227,12 +215,6 @@ class PRSPNode:
             child.refresh_hashes_deep()
         self.refresh_hashes()
 
-    def reset_previous_state_hash_deep(self) -> None:
-        self.previous_state_hash = self.state_hash
-        self.state_ancestor_hashes = []
-        for child in self.children:
-            child.reset_previous_state_hash_deep()
-
     def to_dict(self) -> dict:
         return {
             "uuid": self.uuid,
@@ -240,8 +222,6 @@ class PRSPNode:
             "updated_at": self.updated_at,
             "content_hash": self.content_hash,
             "state_hash": self.state_hash,
-            "previous_state_hash": self.previous_state_hash,
-            "state_ancestor_hashes": list(self.state_ancestor_hashes),
             "weights": copy.deepcopy(self.weights),
             "proposals": [proposal.to_dict() for proposal in self.proposals],
             "data": copy.deepcopy(self.data),
@@ -257,21 +237,6 @@ class PRSPNode:
         node.updated_at = payload["updated_at"]
         node.content_hash = payload["content_hash"]
         node.state_hash = payload["state_hash"]
-        node.previous_state_hash = payload.get(
-            "previous_state_hash",
-            node.state_hash,
-        )
-        node.state_ancestor_hashes = list(payload.get(
-            "state_ancestor_hashes",
-            [],
-        ))
-        if not node.state_ancestor_hashes and node.previous_state_hash != node.state_hash:
-            node.state_ancestor_hashes = [node.previous_state_hash]
-        node.state_ancestor_hashes = list(dict.fromkeys(
-            hash_value
-            for hash_value in node.state_ancestor_hashes
-            if hash_value != node.state_hash
-        ))[:MAX_STATE_ANCESTORS]
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.proposals = [
             Proposal.from_dict(proposal)
@@ -293,11 +258,6 @@ class PRSPNode:
         if node.state_hash != computed_state_hash:
             if repair_hashes:
                 node.state_hash = computed_state_hash
-                node.state_ancestor_hashes = [
-                    hash_value
-                    for hash_value in node.state_ancestor_hashes
-                    if hash_value != node.state_hash
-                ][:MAX_STATE_ANCESTORS]
             else:
                 raise ValueError(f"invalid state_hash for node {node.uuid}")
         return node
@@ -362,6 +322,44 @@ class ProtocolState:
             return ProtocolResult(False, reason="blocked by active proposal")
         ok = self.move_locked(source_uuid, destination_uuid)
         return ProtocolResult(ok, ok, None if ok else "move failed")
+
+    def move_child(self, source_uuid: str, destination_uuid: str,
+                   index: int | None = None) -> ProtocolResult:
+        if self.change_blocked_by_active_proposal([source_uuid, destination_uuid]):
+            return ProtocolResult(False, reason="blocked by active proposal")
+        ok = self.move_child_locked(source_uuid, destination_uuid, index)
+        return ProtocolResult(ok, ok, None if ok else "move failed")
+
+    def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
+                      remove_descendant_duplicates: bool = False) -> ProtocolResult:
+        if parent_uuid not in self.index:
+            return ProtocolResult(False, reason="parent not found")
+        affected = [parent_uuid, tree.uuid]
+        if self.change_blocked_by_active_proposal(affected):
+            return ProtocolResult(False, reason="blocked by active proposal")
+        adopted = PRSPNode.from_dict(tree.to_dict())
+        ok = self.adopt_subtree_locked(
+            adopted,
+            parent_uuid,
+            remove_descendant_duplicates=remove_descendant_duplicates,
+        )
+        return ProtocolResult(ok, adopted if ok else None,
+                              None if ok else "adopt failed")
+
+    def replace_subtree(self, tree: PRSPNode) -> ProtocolResult:
+        local = self.index.get(tree.uuid)
+        if not local or not local.parent_uuid:
+            return ProtocolResult(False, reason="node not found")
+        return self.adopt_subtree(tree, local.parent_uuid)
+
+    def remove_subtree_uuids(self, root_uuid: str, uuids: set[str]) -> ProtocolResult:
+        root = self.index.get(root_uuid)
+        if not root:
+            return ProtocolResult(False, reason="root not found")
+        if self.change_blocked_by_active_proposal(list(uuids)):
+            return ProtocolResult(False, reason="blocked by active proposal")
+        changed = self.remove_subtree_uuids_locked(root, set(uuids))
+        return ProtocolResult(True, changed)
 
     # Proposals
 
@@ -577,7 +575,6 @@ class ProtocolState:
         for child in node.children:
             clone.children.append(self.clone_subtree(child, clone.uuid))
         clone.refresh_hashes_deep()
-        clone.reset_previous_state_hash_deep()
         return clone
 
     def delete_locked(self, node_uuid: str) -> bool:
@@ -595,6 +592,10 @@ class ProtocolState:
         return True
 
     def move_locked(self, source_uuid: str, destination_uuid: str) -> bool:
+        return self.move_child_locked(source_uuid, destination_uuid, None)
+
+    def move_child_locked(self, source_uuid: str, destination_uuid: str,
+                          index: int | None = None) -> bool:
         node = self.index.get(source_uuid)
         destination = self.index.get(destination_uuid)
         if not node or not destination or node.parent_uuid is None:
@@ -609,10 +610,65 @@ class ProtocolState:
         ]
         node.parent_uuid = destination.uuid
         node.updated_at = now_iso()
-        destination.children.append(node)
+        insert_at = len(destination.children) if index is None else max(0, min(index, len(destination.children)))
+        destination.children.insert(insert_at, node)
         self.cascade_hash(old_parent.uuid)
         self.cascade_hash(destination.uuid)
         return True
+
+    def adopt_subtree_locked(self, adopted: PRSPNode, parent_uuid: str,
+                             remove_descendant_duplicates: bool = False) -> bool:
+        parent = self.index.get(parent_uuid)
+        if not parent:
+            return False
+        touched_parent_uuids = {parent.uuid}
+        adopted.parent_uuid = parent.uuid
+        if remove_descendant_duplicates:
+            duplicates = self.collect_subtree_uuids(adopted) - {adopted.uuid}
+            self.remove_subtree_uuids_locked(self.root, duplicates)
+        existing = self.index.get(adopted.uuid)
+        if existing:
+            old_parent = self.index.get(existing.parent_uuid)
+            self.deindex_subtree(existing)
+            if old_parent:
+                old_parent.children = [
+                    child for child in old_parent.children
+                    if child.uuid != adopted.uuid
+                ]
+                touched_parent_uuids.add(old_parent.uuid)
+        parent = self.index.get(parent_uuid)
+        if not parent:
+            return False
+        parent.children = [
+            child for child in parent.children
+            if child.uuid != adopted.uuid
+        ]
+        parent.children.append(adopted)
+        self.index_subtree(adopted)
+        for touched_uuid in touched_parent_uuids:
+            self.cascade_hash(touched_uuid)
+        return True
+
+    def collect_subtree_uuids(self, node: PRSPNode) -> set[str]:
+        out = {node.uuid}
+        for child in node.children:
+            out.update(self.collect_subtree_uuids(child))
+        return out
+
+    def remove_subtree_uuids_locked(self, root: PRSPNode, uuids: set[str]) -> bool:
+        changed = False
+        kept = []
+        for child in root.children:
+            if child.uuid in uuids:
+                self.deindex_subtree(child)
+                changed = True
+                continue
+            changed = self.remove_subtree_uuids_locked(child, uuids) or changed
+            kept.append(child)
+        root.children = kept
+        if changed:
+            self.cascade_hash(root.uuid)
+        return changed
 
     def execute_operations_locked(self, top: PRSPNode,
                                   operations: list[AtomicOperation]) -> bool:

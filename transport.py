@@ -26,6 +26,7 @@ Used API:
 
 HTTP contract:
   POST /p2p/ping
+  POST /p2p/sync_status
   POST /p2p/join
   POST /p2p/announce
   POST /p2p/leave
@@ -40,6 +41,7 @@ from typing import Any, Protocol
 
 from protocol import PRSPNode
 from session import Session, SessionEffect, SessionResult
+from trace_log import TraceLogger
 
 
 class JsonHttpClient(Protocol):
@@ -96,10 +98,12 @@ class TransportDelivery:
 class HttpTransportAdapter:
     def __init__(self, session: Session,
                  http_client: JsonHttpClient | None = None,
-                 logger=None):
+                 logger=None,
+                 trace: TraceLogger | None = None):
         self.session = session
         self.http = http_client or RequestsJsonHttpClient()
         self.logger = logger or self._default_logger
+        self.trace = trace or getattr(session, "trace", TraceLogger.disabled())
 
     # Outbound effects
 
@@ -108,7 +112,15 @@ class HttpTransportAdapter:
         return [self.execute_effect(effect) for effect in effects]
 
     def execute_effect(self, effect: SessionEffect) -> TransportDelivery:
+        self.trace.event(
+            "transport.execute_effect",
+            effect_type=effect.type,
+            target=effect.target,
+            payload=effect.payload,
+        )
         try:
+            if effect.type == "send_sync_status":
+                return self._send_sync_status(effect)
             if effect.type == "send_ping":
                 return self._send_ping(effect)
             if effect.type == "pull_subtree":
@@ -121,31 +133,120 @@ class HttpTransportAdapter:
                 False, effect.type, effect.target, "unknown effect"
             )
         except Exception as exc:
+            if effect.type == "pull_subtree" and effect.target:
+                node_uuid = effect.payload.get("node_uuid")
+                topic_uuid = effect.payload.get("topic_uuid")
+                if (
+                    node_uuid
+                    and topic_uuid
+                    and node_uuid != topic_uuid
+                    and self._is_not_found(exc)
+                ):
+                    try:
+                        return self._pull_subtree_effect(SessionEffect(
+                            "pull_subtree",
+                            effect.target,
+                            {
+                                "node_uuid": topic_uuid,
+                                "topic_uuid": topic_uuid,
+                            },
+                        ))
+                    except Exception as fallback_exc:
+                        exc = fallback_exc
             self.logger(f"[transport] {effect.type} failed: {exc}")
+            self.trace.event(
+                "transport.execute_effect_failed",
+                effect_type=effect.type,
+                target=effect.target,
+                payload=effect.payload,
+                reason=str(exc),
+            )
             if effect.type == "send_ping" and effect.target:
                 self.session.mark_peer_unreachable(effect.target, str(exc))
+            if effect.type == "send_sync_status" and effect.target:
+                self.session.record_sync_failure(effect.target, str(exc))
+            if effect.type == "pull_subtree" and effect.target:
+                node_uuid = effect.payload.get("node_uuid")
+                topic_uuid = effect.payload.get("topic_uuid")
+                if node_uuid == topic_uuid and self._is_not_found(exc):
+                    self.session.remove_peer_fetch_topic(effect.target, topic_uuid)
             return TransportDelivery(
                 False, effect.type, effect.target, str(exc)
             )
 
+    def _send_sync_status(self, effect: SessionEffect) -> TransportDelivery:
+        summary = effect.payload.get("summary") or {}
+        sync_hash = summary.get("sync_hash")
+        self.trace.event(
+            "transport.send_sync_status",
+            target=effect.target,
+            sync_hash=sync_hash,
+            topic_uuids=sorted((summary.get("topics") or {}).keys()),
+        )
+        response = self.http.post_json(
+            self._url(effect.target, "/p2p/sync_status"),
+            effect.payload,
+            timeout=10,
+        )
+        follow_up = self.session.handle_sync_response(effect.target, response)
+        follow_up_deliveries = self.execute_effects(follow_up.effects)
+        self.trace.event(
+            "transport.send_sync_status_ok",
+            target=effect.target,
+            sync_hash=sync_hash,
+            response_status=response.get("status"),
+            delivered_sync_hash=response.get("delivered_sync_hash"),
+            follow_up_effects=[delivery.effect_type for delivery in follow_up_deliveries],
+        )
+        return TransportDelivery(True, effect.type, effect.target,
+                                 response=response)
+
     def _send_ping(self, effect: SessionEffect) -> TransportDelivery:
+        self.trace.event(
+            "transport.send_ping",
+            target=effect.target,
+            topic_uuid=effect.payload.get("topic_uuid"),
+            changed_uuid=effect.payload.get("changed_uuid"),
+            topic_state_hash=effect.payload.get("topic_state_hash"),
+            health_check=bool(effect.payload.get("health_check")),
+        )
         response = self.http.post_json(
             self._url(effect.target, "/p2p/ping"),
             effect.payload,
             timeout=10,
         )
         self.session.mark_peer_reachable(effect.target)
+        self.trace.event(
+            "transport.send_ping_ok",
+            target=effect.target,
+            topic_uuid=effect.payload.get("topic_uuid"),
+            response_status=response.get("status"),
+        )
         return TransportDelivery(True, effect.type, effect.target,
                                  response=response)
 
     def _pull_subtree_effect(self, effect: SessionEffect) -> TransportDelivery:
         node_uuid = effect.payload["node_uuid"]
+        self.trace.event(
+            "transport.pull_subtree",
+            target=effect.target,
+            node_uuid=node_uuid,
+            topic_uuid=effect.payload.get("topic_uuid"),
+        )
         payload = self.fetch_subtree(effect.target, node_uuid)
         subtree = self._decode_wire_subtree(payload["subtree"], effect.target)
         self.session.apply_peer_subtree(
             effect.target,
             subtree,
             payload.get("parent_uuid"),
+        )
+        self.trace.event(
+            "transport.pull_subtree_ok",
+            target=effect.target,
+            node_uuid=node_uuid,
+            returned_uuid=subtree.uuid,
+            parent_uuid=payload.get("parent_uuid"),
+            state_hash=subtree.state_hash,
         )
         return TransportDelivery(True, effect.type, effect.target,
                                  response=payload)
@@ -182,6 +283,11 @@ class HttpTransportAdapter:
     # Direct transport actions
 
     def fetch_subtree(self, peer_addr: str, node_uuid: str) -> dict:
+        self.trace.event(
+            "transport.fetch_subtree",
+            peer_addr=peer_addr,
+            node_uuid=node_uuid,
+        )
         return self.http.get_json(
             self._url(peer_addr, f"/p2p/subtree/{node_uuid}"),
             timeout=5,
@@ -215,6 +321,7 @@ class HttpTransportAdapter:
                     "topic_uuid": topic_uuids[0],
                     "topic_uuids": topic_uuids,
                     "known_members": sorted(self.session.members),
+                    "topic_members": self.session.topic_members_by_topic(topic_uuids),
                 },
                 timeout=10,
             )
@@ -229,16 +336,22 @@ class HttpTransportAdapter:
         except Exception as exc:
             return {"status": "error", "reason": str(exc)}
 
-        for member in response.get("members", []):
-            if member == self.session.address:
-                continue
-            self.session.add_peer_topics(member, topic_uuids)
+        topic_members = self._response_topic_members(response, topic_uuids)
+        all_members = set()
+        for topic_uuid, members in topic_members.items():
+            for member in members:
+                all_members.add(member)
+                if member != self.session.address:
+                    self.session.add_peer(member, topic_uuid)
         if peer_addr != self.session.address:
             self.session.add_peer_topics(peer_addr, topic_uuids)
-        for member in sorted(self.session.members - {self.session.address}):
-            if member == peer_addr:
-                continue
             for topic_uuid in topic_uuids:
+                all_members.add(peer_addr)
+                topic_members.setdefault(topic_uuid, set()).add(peer_addr)
+        for topic_uuid, members in sorted(topic_members.items()):
+            for member in sorted(members):
+                if member in (self.session.address, peer_addr):
+                    continue
                 self.execute_effect(SessionEffect(
                     "pull_subtree",
                     member,
@@ -248,10 +361,14 @@ class HttpTransportAdapter:
             self.execute_effects(self.session._sync_effects(topic_uuid))
         return {
             "status": "ok",
-            "members": response.get("members", []),
+            "members": sorted(all_members),
             "topic_uuids": topic_uuids,
             "adopted_root_uuid": adopted[0] if adopted else None,
             "adopted_root_uuids": adopted,
+            "topic_members": {
+                topic_uuid: sorted(members)
+                for topic_uuid, members in sorted(topic_members.items())
+            },
         }
 
     def invite_to_discuss(self, peer_addr: str, topic_uuid: str | None = None,
@@ -259,8 +376,13 @@ class HttpTransportAdapter:
         topic_uuids = self._topic_uuids(topic_uuid, topic_uuids)
         if not topic_uuids:
             return {"status": "error", "reason": "topic_uuid is required"}
+        self.trace.event(
+            "transport.invite_to_discuss",
+            peer_addr=peer_addr,
+            topic_uuids=topic_uuids,
+        )
         try:
-            return self.http.post_json(
+            response = self.http.post_json(
                 self._url(peer_addr, "/api/join_discussion"),
                 {
                     "address": self.session.address,
@@ -269,21 +391,55 @@ class HttpTransportAdapter:
                 },
                 timeout=15,
             )
+            self.trace.event(
+                "transport.invite_to_discuss_ok",
+                peer_addr=peer_addr,
+                topic_uuids=topic_uuids,
+                response_status=response.get("status"),
+                response_topic_uuids=response.get("topic_uuids"),
+            )
+            return response
         except TransportHttpError as exc:
+            self.trace.event(
+                "transport.invite_to_discuss_failed",
+                peer_addr=peer_addr,
+                topic_uuids=topic_uuids,
+                reason=str(exc),
+                remote_status=exc.status_code,
+            )
             return {
                 "status": "error",
                 "reason": str(exc),
                 "remote_status": exc.status_code,
             }
         except Exception as exc:
+            self.trace.event(
+                "transport.invite_to_discuss_failed",
+                peer_addr=peer_addr,
+                topic_uuids=topic_uuids,
+                reason=str(exc),
+            )
             return {"status": "error", "reason": str(exc)}
 
     def leave_discussion(self) -> list[TransportDelivery]:
         result = self.session.leave()
         return self.execute_effects(result.effects)
 
+    def disconnect(self) -> list[TransportDelivery]:
+        result = self.session.disconnect()
+        return self.execute_effects(result.effects)
+
+    def leave_topic(self, topic_uuid: str) -> list[TransportDelivery]:
+        result = self.session.leave_topic(topic_uuid)
+        return self.execute_effects(result.effects)
+
     def check_peer_health(self, peer_addr: str, timeout: float = 2) -> TransportDelivery:
-        topic_uuids = sorted(self.session.peer_topic_sets.get(peer_addr) or [])
+        topic_uuids = self.session.fetch_topic_uuids(peer_addr)
+        self.trace.event(
+            "transport.health_ping",
+            peer_addr=peer_addr,
+            topic_uuids=topic_uuids,
+        )
         if not topic_uuids:
             changed = self.session.mark_peer_unreachable(peer_addr, "no shared topics")
             return TransportDelivery(
@@ -296,25 +452,47 @@ class HttpTransportAdapter:
         responses = []
         try:
             for topic_uuid in topic_uuids:
-                topic = self.session.protocol.index.get(topic_uuid)
-                responses.append(self.http.post_json(
-                    self._url(peer_addr, "/p2p/ping"),
-                    {
-                        "from_addr": self.session.address,
-                        "topic_uuid": topic_uuid,
-                        "topic_state_hash": topic.state_hash if topic else None,
-                        "changed_uuid": None,
-                        "health_check": True,
-                    },
-                    timeout=timeout,
-                ))
-                subtree_payload = self.fetch_subtree(peer_addr, topic_uuid)
-                self.session.apply_peer_subtree(
-                    peer_addr,
-                    self._decode_wire_subtree(subtree_payload["subtree"], peer_addr),
-                    subtree_payload.get("parent_uuid"),
-                )
+                try:
+                    topic_state_hash = self.session.node_state_hash(topic_uuid)
+                    response = self.http.post_json(
+                        self._url(peer_addr, "/p2p/ping"),
+                        {
+                            "from_addr": self.session.address,
+                            "topic_uuid": topic_uuid,
+                            "topic_state_hash": topic_state_hash,
+                            "changed_uuid": None,
+                            "deleted_node_uuids": self.session._deleted_nodes_for_topic(topic_uuid),
+                            "health_check": True,
+                        },
+                        timeout=timeout,
+                    )
+                    responses.append(response)
+                    remote_state_hash = response.get("topic_state_hash")
+                    if remote_state_hash is None:
+                        self.session.remove_peer_fetch_topic(peer_addr, topic_uuid)
+                        continue
+                    cached_state_hash = self.session.cached_peer_topic_state_hash(
+                        peer_addr,
+                        topic_uuid,
+                    )
+                    if cached_state_hash != remote_state_hash:
+                        subtree_payload = self.fetch_subtree(peer_addr, topic_uuid)
+                        self.session.apply_peer_subtree(
+                            peer_addr,
+                            self._decode_wire_subtree(subtree_payload["subtree"], peer_addr),
+                            subtree_payload.get("parent_uuid"),
+                        )
+                except Exception as exc:
+                    if self._is_not_found(exc):
+                        self.session.remove_peer_fetch_topic(peer_addr, topic_uuid)
+                    raise
             changed = self.session.mark_peer_reachable(peer_addr)
+            self.trace.event(
+                "transport.health_ping_ok",
+                peer_addr=peer_addr,
+                topic_uuids=topic_uuids,
+                status_changed=changed,
+            )
             return TransportDelivery(
                 True,
                 "health_ping",
@@ -324,6 +502,13 @@ class HttpTransportAdapter:
         except Exception as exc:
             changed = self.session.mark_peer_unreachable(peer_addr, str(exc))
             self.logger(f"[transport] health_ping failed for {peer_addr}: {exc}")
+            self.trace.event(
+                "transport.health_ping_failed",
+                peer_addr=peer_addr,
+                topic_uuids=topic_uuids,
+                reason=str(exc),
+                status_changed=changed,
+            )
             return TransportDelivery(
                 False,
                 "health_ping",
@@ -335,21 +520,69 @@ class HttpTransportAdapter:
     # Incoming P2P endpoints
 
     def p2p_ping(self, payload: dict) -> tuple[dict, int]:
+        self.trace.event("transport.p2p_ping", payload=payload)
         return self._handle_session_result(self.session.handle_ping(payload))
 
+    def p2p_sync_status(self, payload: dict) -> tuple[dict, int]:
+        self.trace.event("transport.p2p_sync_status", payload=payload)
+        result = self.session.handle_sync_status(payload)
+        if result.status != "ok":
+            return {"status": "error", "reason": result.reason}, 409
+        deliveries = self.execute_effects(result.effects)
+        failed = [delivery for delivery in deliveries if not delivery.ok]
+        from_addr = payload.get("from_addr")
+        incoming_summary = payload.get("summary") or {}
+        response_status = "partial" if failed else "ok"
+        response = {
+            "status": response_status,
+            "my_summary": self.session.sync_summary(from_addr),
+            "delivered_sync_hash": incoming_summary.get("sync_hash"),
+        }
+        if failed:
+            response["delivery_errors"] = [
+                {
+                    "effect_type": item.effect_type,
+                    "target": item.target,
+                    "reason": item.reason,
+                }
+                for item in failed
+            ]
+        self.trace.event(
+            "transport.sync_status_result",
+            from_addr=from_addr,
+            status=response_status,
+            effect_count=len(result.effects),
+            failed_count=len(failed),
+            delivered_sync_hash=response["delivered_sync_hash"],
+        )
+        return response, 200
+
     def p2p_join(self, payload: dict) -> tuple[dict, int]:
+        self.trace.event("transport.p2p_join", payload=payload)
         return self._handle_session_result(self.session.handle_join(payload))
 
     def p2p_announce(self, payload: dict) -> tuple[dict, int]:
+        self.trace.event("transport.p2p_announce", payload=payload)
         return self._handle_session_result(self.session.handle_announce(payload))
 
     def p2p_leave(self, payload: dict) -> tuple[dict, int]:
+        self.trace.event("transport.p2p_leave", payload=payload)
         return self._handle_session_result(self.session.handle_leave(payload))
 
     def p2p_subtree(self, node_uuid: str) -> tuple[dict, int]:
         result = self.session.get_subtree(node_uuid)
         if result is None:
+            self.trace.event(
+                "transport.p2p_subtree_not_found",
+                node_uuid=node_uuid,
+            )
             return {"status": "error", "reason": "not found"}, 404
+        self.trace.event(
+            "transport.p2p_subtree_ok",
+            node_uuid=node_uuid,
+            parent_uuid=result.get("parent_uuid"),
+            state_hash=(result.get("subtree") or {}).get("state_hash"),
+        )
         return result, 200
 
     # Internals
@@ -372,6 +605,23 @@ class HttpTransportAdapter:
             values.append(topic_uuid)
         return sorted(str(value) for value in set(values) if value)
 
+    @staticmethod
+    def _response_topic_members(
+            response: dict,
+            topic_uuids: list[str]) -> dict[str, set[str]]:
+        topic_members = response.get("topic_members") or {}
+        fallback_members = response.get("members", [])
+        return {
+            topic_uuid: set(topic_members.get(topic_uuid) or fallback_members)
+            for topic_uuid in topic_uuids
+        }
+
+    @staticmethod
+    def _is_not_found(error: Exception) -> bool:
+        if isinstance(error, TransportHttpError):
+            return error.status_code == 404
+        return str(error).strip().lower() == "not found"
+
     def _handle_session_result(
             self, result: SessionResult) -> tuple[dict, int]:
         if result.status != "ok":
@@ -392,6 +642,13 @@ class HttpTransportAdapter:
                 }
                 for item in failed
             ]
+        self.trace.event(
+            "transport.session_result",
+            status=result.status,
+            effect_count=len(result.effects),
+            failed_count=len(failed),
+            payload=payload,
+        )
         return payload, 200
 
     @staticmethod
