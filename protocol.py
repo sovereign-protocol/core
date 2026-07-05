@@ -43,11 +43,12 @@ def stable_hash(payload: dict) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()[:20]
 
 
-def content_hash(data: dict, weights: dict,
+def content_hash(data: dict, weights: dict, deleted: bool,
                  child_content_hashes: list[str]) -> str:
     return stable_hash({
         "data": data,
         "weights": weights,
+        "deleted": deleted,
         "children": child_content_hashes,
     })
 
@@ -57,6 +58,10 @@ def state_hash(node_content_hash: str, child_state_hashes: list[str]) -> str:
         "content_hash": node_content_hash,
         "children": child_state_hashes,
     })
+
+
+def own_hash(data: dict, weights: dict) -> str:
+    return stable_hash({"data": data, "weights": weights})
 
 
 @dataclass
@@ -125,7 +130,7 @@ class Proposal:
     uuid: str
     author: str
     top_uuid: str
-    base_state_hash: str
+    base_hashes: dict[str, str]
     operations: list[AtomicOperation]
     acceptances: dict[str, str] = field(default_factory=dict)
     objections: dict[str, str] = field(default_factory=dict)
@@ -140,7 +145,7 @@ class Proposal:
             "uuid": self.uuid,
             "author": self.author,
             "top_uuid": self.top_uuid,
-            "base_state_hash": self.base_state_hash,
+            "base_hashes": copy.deepcopy(self.base_hashes),
             "operations": [op.to_dict() for op in self.operations],
             "acceptances": copy.deepcopy(self.acceptances),
             "objections": copy.deepcopy(self.objections),
@@ -157,7 +162,7 @@ class Proposal:
             uuid=payload["uuid"],
             author=payload["author"],
             top_uuid=payload["top_uuid"],
-            base_state_hash=payload["base_state_hash"],
+            base_hashes=copy.deepcopy(payload.get("base_hashes") or {}),
             operations=[
                 AtomicOperation.from_dict(op)
                 for op in payload.get("operations", [])
@@ -183,15 +188,21 @@ class PRSPNode:
         self.proposals: list[Proposal] = []
         self.data = copy.deepcopy(data)
         self.parent_uuid = parent_uuid
+        self.deleted = False
         self.children: list[PRSPNode] = []
         self.content_hash = ""
         self.state_hash = ""
         self.refresh_hashes()
+        self.previous_hash = self.state_hash
+        self.previous_parent_uuid = self.parent_uuid
+        self.reaffirmed_hash: str | None = None
+        self.reaffirmed_parent_uuid: str | None = None
 
     def recompute_content_hash(self) -> str:
         return content_hash(
             self.data,
             self.weights,
+            self.deleted,
             sorted(child.content_hash for child in self.children),
         )
 
@@ -200,6 +211,9 @@ class PRSPNode:
             self.content_hash,
             sorted(child.state_hash for child in self.children),
         )
+
+    def compute_own_hash(self) -> str:
+        return own_hash(self.data, self.weights)
 
     def refresh_hashes(self) -> None:
         new_content_hash = self.recompute_content_hash()
@@ -215,6 +229,15 @@ class PRSPNode:
             child.refresh_hashes_deep()
         self.refresh_hashes()
 
+    def live_children(self) -> list["PRSPNode"]:
+        return [child for child in self.children if not child.deleted]
+
+    def is_reaffirmed(self) -> bool:
+        return (
+            self.reaffirmed_hash == self.state_hash
+            and self.reaffirmed_parent_uuid == self.parent_uuid
+        )
+
     def to_dict(self) -> dict:
         return {
             "uuid": self.uuid,
@@ -222,10 +245,15 @@ class PRSPNode:
             "updated_at": self.updated_at,
             "content_hash": self.content_hash,
             "state_hash": self.state_hash,
+            "previous_hash": self.previous_hash,
+            "previous_parent_uuid": self.previous_parent_uuid,
+            "reaffirmed_hash": self.reaffirmed_hash,
+            "reaffirmed_parent_uuid": self.reaffirmed_parent_uuid,
             "weights": copy.deepcopy(self.weights),
             "proposals": [proposal.to_dict() for proposal in self.proposals],
             "data": copy.deepcopy(self.data),
             "parent_uuid": self.parent_uuid,
+            "deleted": self.deleted,
             "children": [child.to_dict() for child in self.children],
         }
 
@@ -237,6 +265,10 @@ class PRSPNode:
         node.updated_at = payload["updated_at"]
         node.content_hash = payload["content_hash"]
         node.state_hash = payload["state_hash"]
+        node.previous_hash = payload.get("previous_hash", payload["state_hash"])
+        node.previous_parent_uuid = payload.get("previous_parent_uuid", payload.get("parent_uuid"))
+        node.reaffirmed_hash = payload.get("reaffirmed_hash")
+        node.reaffirmed_parent_uuid = payload.get("reaffirmed_parent_uuid")
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.proposals = [
             Proposal.from_dict(proposal)
@@ -244,6 +276,7 @@ class PRSPNode:
         ]
         node.data = copy.deepcopy(payload["data"])
         node.parent_uuid = payload.get("parent_uuid")
+        node.deleted = bool(payload.get("deleted", False))
         node.children = [
             cls.from_dict(child, repair_hashes=repair_hashes)
             for child in payload.get("children", [])
@@ -292,6 +325,7 @@ class ProtocolState:
             return ProtocolResult(False, reason="node not found")
         if self.change_blocked_by_active_proposal([node_uuid]):
             return ProtocolResult(False, reason="blocked by active proposal")
+        node.previous_hash = node.state_hash
         node.data = copy.deepcopy(data)
         node.weights = copy.deepcopy(weights or {})
         node.updated_at = now_iso()
@@ -303,6 +337,28 @@ class ProtocolState:
             return ProtocolResult(False, reason="blocked by active proposal")
         ok = self.delete_locked(node_uuid)
         return ProtocolResult(ok, ok, None if ok else "delete failed")
+
+    def reaffirm(self, node_uuid: str) -> ProtocolResult:
+        if self.change_blocked_by_active_proposal([node_uuid]):
+            return ProtocolResult(False, reason="blocked by active proposal")
+        ok = self.reaffirm_locked(node_uuid)
+        return ProtocolResult(ok, ok, None if ok else "reaffirm failed")
+
+    def reaffirm_locked(self, node_uuid: str) -> bool:
+        node = self.index.get(node_uuid)
+        if not node:
+            return False
+        if (
+            node.reaffirmed_hash == node.state_hash
+            and node.reaffirmed_parent_uuid == node.parent_uuid
+        ):
+            node.reaffirmed_hash = None
+            node.reaffirmed_parent_uuid = None
+        else:
+            node.reaffirmed_hash = node.state_hash
+            node.reaffirmed_parent_uuid = node.parent_uuid
+        node.updated_at = now_iso()
+        return True
 
     def copy(self, source_uuid: str, destination_uuid: str) -> ProtocolResult:
         source = self.index.get(source_uuid)
@@ -363,6 +419,25 @@ class ProtocolState:
 
     # Proposals
 
+    def base_hashes_for_operations(self,
+                                   operations: list[AtomicOperation]) -> dict[str, str]:
+        hashes: dict[str, str] = {}
+        for operation in operations:
+            if operation.type != "modify":
+                continue
+            node_uuid = operation.payload.get("node_uuid")
+            node = self.index.get(node_uuid)
+            if node and node_uuid not in hashes:
+                hashes[node_uuid] = node.compute_own_hash()
+        return hashes
+
+    def base_hashes_match(self, base_hashes: dict[str, str]) -> bool:
+        for node_uuid, recorded_hash in base_hashes.items():
+            node = self.index.get(node_uuid)
+            if not node or node.compute_own_hash() != recorded_hash:
+                return False
+        return True
+
     def propose(self, top_uuid: str,
                 operations: list[AtomicOperation]) -> ProtocolResult:
         top = self.index.get(top_uuid)
@@ -376,7 +451,7 @@ class ProtocolState:
             uuid=str(uuid_mod.uuid4()),
             author=self.author,
             top_uuid=top_uuid,
-            base_state_hash=top.state_hash,
+            base_hashes=self.base_hashes_for_operations(operations),
             operations=copy.deepcopy(operations),
         )
         top.proposals.append(proposal)
@@ -396,7 +471,7 @@ class ProtocolState:
             local.acceptances = {}
             local.objections = {}
             top.proposals.append(local)
-        if top.state_hash != local.base_state_hash:
+        if not self.base_hashes_match(local.base_hashes):
             return ProtocolResult(False, reason="base hash mismatch")
         local.objections.pop(self.author, None)
         local.acceptances[self.author] = now_iso()
@@ -442,7 +517,7 @@ class ProtocolState:
         top, proposal = found
         if proposal.author != self.author or proposal.status != "active":
             return ProtocolResult(False, reason="not author or not active")
-        if top.state_hash != proposal.base_state_hash:
+        if not self.base_hashes_match(proposal.base_hashes):
             return ProtocolResult(False, reason="base hash mismatch")
         if proposal.objections:
             return ProtocolResult(False, reason="known objections")
@@ -483,7 +558,7 @@ class ProtocolState:
             return ProtocolResult(False, reason="local proposal not found")
         accepted = self.author in local.acceptances
         if proposal.status == "integrated" and accepted:
-            if top.state_hash != local.base_state_hash:
+            if not self.base_hashes_match(local.base_hashes):
                 local.status = "integration_failed"
                 local.updated_at = now_iso()
                 self.cascade_hash(top.uuid)
@@ -563,7 +638,10 @@ class ProtocolState:
             node = self.index.get(current_uuid)
             if not node:
                 break
+            old_state_hash = node.state_hash
             node.refresh_hashes()
+            if node.state_hash != old_state_hash:
+                node.previous_hash = old_state_hash
             current_uuid = node.parent_uuid
 
     def clone_subtree(self, node: PRSPNode, parent_uuid: str | None) -> PRSPNode:
@@ -579,17 +657,20 @@ class ProtocolState:
 
     def delete_locked(self, node_uuid: str) -> bool:
         node = self.index.get(node_uuid)
-        if not node or node.parent_uuid is None:
+        if not node or node.parent_uuid is None or node.deleted:
             return False
-        parent = self.index.get(node.parent_uuid)
-        if not parent:
-            return False
-        self.deindex_subtree(node)
-        parent.children = [
-            child for child in parent.children if child.uuid != node.uuid
-        ]
-        self.cascade_hash(parent.uuid)
+        self._mark_deleted_cascade(node)
+        node.refresh_hashes_deep()
+        self.cascade_hash(node.parent_uuid)
         return True
+
+    def _mark_deleted_cascade(self, node: PRSPNode) -> None:
+        if not node.deleted:
+            node.previous_hash = node.state_hash
+            node.deleted = True
+            node.updated_at = now_iso()
+        for child in node.children:
+            self._mark_deleted_cascade(child)
 
     def move_locked(self, source_uuid: str, destination_uuid: str) -> bool:
         return self.move_child_locked(source_uuid, destination_uuid, None)
@@ -608,6 +689,7 @@ class ProtocolState:
         old_parent.children = [
             child for child in old_parent.children if child.uuid != node.uuid
         ]
+        node.previous_parent_uuid = node.parent_uuid
         node.parent_uuid = destination.uuid
         node.updated_at = now_iso()
         insert_at = len(destination.children) if index is None else max(0, min(index, len(destination.children)))
@@ -702,6 +784,7 @@ class ProtocolState:
             node = self.index.get(payload.get("node_uuid"))
             if not node:
                 return False
+            node.previous_hash = node.state_hash
             node.data = copy.deepcopy(payload.get("data", {}))
             node.weights = copy.deepcopy(payload.get("weights", {}))
             node.updated_at = now_iso()
@@ -753,12 +836,17 @@ class ProtocolState:
 
     def proposal_inside_active_proposal(self, top_uuid: str) -> bool:
         top = self.index.get(top_uuid)
+        if not top:
+            return False
         for active_uuid in self.active_proposal_top_uuids(self.root):
+            if active_uuid == top_uuid:
+                continue
             active_top = self.index.get(active_uuid)
-            if active_top and active_uuid != top_uuid and self.is_descendant(active_top, top_uuid):
+            if not active_top:
+                continue
+            if (self.is_descendant(active_top, top_uuid)
+                    or self.is_descendant(top, active_uuid)):
                 return True
-            if top and active_uuid != top_uuid and self.is_descendant(top, active_uuid):
-                return False
         return False
 
     def operations_within_top(self, top: PRSPNode,

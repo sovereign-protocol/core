@@ -461,7 +461,6 @@ class HttpTransportAdapter:
                             "topic_uuid": topic_uuid,
                             "topic_state_hash": topic_state_hash,
                             "changed_uuid": None,
-                            "deleted_node_uuids": self.session._deleted_nodes_for_topic(topic_uuid),
                             "health_check": True,
                         },
                         timeout=timeout,

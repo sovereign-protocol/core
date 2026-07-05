@@ -1,6 +1,6 @@
 import unittest
 
-from protocol import PRSPNode
+from protocol import AtomicOperation, PRSPNode
 from session import Session
 
 
@@ -397,7 +397,31 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(events[0]["type"], "peer_made_changes")
 
-    def test_delete_tombstone_blocks_re_adoption_until_peer_cache_confirms_absence(self):
+    def test_reaffirm_does_not_corrupt_classification_for_unrelated_peers(self):
+        # A edits and reaffirms (deciding to keep its own value against some
+        # divergent peer). A separate, unrelated peer C who never touched
+        # the node and is simply behind must still classify correctly - the
+        # reaffirm must not overwrite the true previous_hash history that
+        # C's comparison depends on.
+        a = Session("si-a")
+        c = Session("si-c")
+        topic = a.create_child(a.protocol.root.uuid, {"name": "topic"}, {}).value
+        c.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+
+        a.modify(topic.uuid, {"name": "a-edit"}, {})
+        a.reaffirm(topic.uuid)
+
+        c.apply_peer_subtree(
+            "si-a",
+            PRSPNode.from_dict(a.protocol.index[topic.uuid].to_dict()),
+            c.protocol.root.uuid,
+        )
+
+        events = c.analyze_peer_transitions("si-a", topic.uuid)
+
+        self.assertEqual(events[0]["type"], "peer_made_changes")
+
+    def test_delete_flags_node_and_waits_for_peer_confirmation_before_pruning(self):
         local = Session("si-a")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
         child = local.create_child(topic.uuid, {"name": "child"}, {}).value
@@ -408,26 +432,21 @@ class SessionTests(unittest.TestCase):
         result = local.delete(child.uuid)
 
         self.assertEqual(result.status, "ok")
-        self.assertEqual(local.deleted_node_uuids[child.uuid], topic.uuid)
-        self.assertNotIn(child.uuid, local.protocol.index)
+        self.assertIn(child.uuid, local.protocol.index)
+        self.assertTrue(local.protocol.index[child.uuid].deleted)
 
+        # Peer's cache still shows the pre-delete state - not confirmed yet,
+        # so the flagged node must stay in the tree.
         local.apply_peer_subtree("si-b", stale_topic, local.protocol.root.uuid)
-        self.assertEqual(local.analyze_peer_transitions("si-b", child.uuid), [])
-        self.assertEqual(
-            local.adopt_subtree(stale_topic.children[0], stale_topic.uuid).status,
-            "error",
-        )
+        self.assertIn(child.uuid, local.protocol.index)
 
-        local.replace_subtree(stale_topic)
-        self.assertNotIn(child.uuid, local.protocol.index)
-        self.assertIn(child.uuid, local.deleted_node_uuids)
-
+        # Once the peer's cache also shows the node deleted, it can be pruned.
         current_topic = PRSPNode.from_dict(local.protocol.index[topic.uuid].to_dict())
         local.apply_peer_subtree("si-b", current_topic, local.protocol.root.uuid)
 
-        self.assertNotIn(child.uuid, local.deleted_node_uuids)
+        self.assertNotIn(child.uuid, local.protocol.index)
 
-    def test_delete_without_topic_peers_does_not_keep_tombstone(self):
+    def test_delete_without_topic_peers_prunes_immediately(self):
         local = Session("si-a")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
         child = local.create_child(topic.uuid, {"name": "child"}, {}).value
@@ -436,7 +455,7 @@ class SessionTests(unittest.TestCase):
         result = local.delete(child.uuid)
 
         self.assertEqual(result.status, "ok")
-        self.assertNotIn(child.uuid, local.deleted_node_uuids)
+        self.assertNotIn(child.uuid, local.protocol.index)
 
     def test_ping_compares_cached_topic_not_aggregate_peer_cache(self):
         local = Session("si-a")
@@ -539,6 +558,62 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertIn("si-b", session.members)
         self.assertEqual(session.peer_topic_sets["si-b"], {"topic-2"})
+
+    def test_integrate_proposal_syncs_effects_for_its_own_topic(self):
+        session = Session("si-a")
+        topic_a = session.create_child(session.protocol.root.uuid, {"name": "a"}, {}).value
+        topic_b = session.create_child(session.protocol.root.uuid, {"name": "b"}, {}).value
+        session.start_discussion(topic_a.uuid)
+        session.start_discussion(topic_b.uuid)
+
+        # Pick whichever topic is NOT the arbitrary "active_topic_uuid" pick,
+        # so the test doesn't depend on random uuid ordering.
+        other_topic = topic_b if session.active_topic_uuid == topic_a.uuid else topic_a
+        session.add_peer("si-b", other_topic.uuid)
+
+        proposal = session.propose(other_topic.uuid, [
+            AtomicOperation.create_child(other_topic.uuid, {"name": "child"}, {})
+        ]).value
+
+        result = session.integrate_proposal(proposal.uuid)
+
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(any(effect.target == "si-b" for effect in result.effects))
+
+    def test_reconcile_integrations_syncs_effects_regardless_of_active_topic_order(self):
+        proposer = Session("si-a")
+        accepter = Session("si-b")
+        topic_a = proposer.create_child(proposer.protocol.root.uuid, {"name": "a"}, {}).value
+        topic_b = proposer.create_child(proposer.protocol.root.uuid, {"name": "b"}, {}).value
+        proposer.start_discussion(topic_a.uuid)
+        proposer.start_discussion(topic_b.uuid)
+        accepter.accept_topic_invitation(PRSPNode.from_dict(topic_a.to_dict()))
+        accepter.accept_topic_invitation(PRSPNode.from_dict(topic_b.to_dict()))
+
+        # Pick whichever topic is NOT the arbitrary "active_topic_uuid" pick
+        # on the accepter's side, so the test doesn't depend on uuid ordering.
+        other_topic = topic_b if accepter.active_topic_uuid == topic_a.uuid else topic_a
+        proposer.add_peer("si-b", other_topic.uuid)
+        accepter.add_peer("si-a", other_topic.uuid)
+
+        proposal = proposer.propose(other_topic.uuid, [
+            AtomicOperation.create_child(other_topic.uuid, {"name": "child"}, {})
+        ]).value
+        proposer.take_back_proposal(proposal.uuid)
+        # Accepter already knows about the proposal (e.g. observed it while
+        # active) and now receives the peer's tree with it marked taken_back.
+        accepter._protocol.object_to_proposal(proposal)
+        accepter.apply_peer_subtree(
+            "si-a",
+            PRSPNode.from_dict(proposer.protocol.index[other_topic.uuid].to_dict()),
+            proposer.protocol.root.uuid,
+        )
+
+        result = accepter.reconcile_integrations()
+
+        self.assertEqual(result.status, "ok")
+        self.assertTrue(result.value)
+        self.assertTrue(any(effect.target == "si-a" for effect in result.effects))
 
 
 if __name__ == "__main__":

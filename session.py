@@ -111,10 +111,8 @@ class Session:
         self.peer_perspectives: dict[str, PRSPNode | None] = {}
         self.peer_status: dict[str, dict[str, Any]] = {}
         self.peer_sync_state: dict[str, dict[str, Any]] = {}
-        self.shared_state_by_peer: dict[str, dict[str, list[str]]] = {}
         self.active_topic_uuids: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
-        self.deleted_node_uuids: dict[str, str] = {}
 
     @property
     def active_topic_uuid(self) -> str | None:
@@ -269,7 +267,6 @@ class Session:
         self.peer_perspectives.clear()
         self.peer_status.clear()
         self.peer_sync_state.clear()
-        self.shared_state_by_peer.clear()
         self.active_topic_uuids.clear()
         return SessionResult("ok", effects=effects)
 
@@ -286,7 +283,6 @@ class Session:
         self.peer_perspectives.clear()
         self.peer_status.clear()
         self.peer_sync_state.clear()
-        self.shared_state_by_peer.clear()
         self.active_topic_uuids.clear()
         return SessionResult("ok", effects=effects)
 
@@ -319,7 +315,6 @@ class Session:
         topic_uuid = message.get("topic_uuid")
         topic_state_hash = message.get("topic_state_hash")
         changed_uuid = message.get("changed_uuid")
-        deleted_node_uuids = message.get("deleted_node_uuids") or []
         if not from_addr:
             return SessionResult("error", reason="missing from_addr")
         if not topic_uuid:
@@ -328,10 +323,6 @@ class Session:
         local_topic_state_hash = self.node_state_hash(topic_uuid)
         self.add_peer(from_addr, topic_uuid)
         self.mark_peer_reachable(from_addr)
-        tombstones_changed = self._apply_remote_tombstones(
-            topic_uuid,
-            deleted_node_uuids,
-        )
         cached = self.peer_perspectives.get(from_addr)
         cached_topic = self._find_in_tree(cached, topic_uuid) if cached else None
         cached_state_hash = cached_topic.state_hash if cached_topic else None
@@ -349,8 +340,6 @@ class Session:
                 from_addr,
                 {"node_uuid": pull_uuid, "topic_uuid": topic_uuid},
             ))
-        if tombstones_changed:
-            effects.extend(self._sync_effects(topic_uuid))
         self.trace_event(
             "session.handle_ping",
             from_addr=from_addr,
@@ -358,7 +347,6 @@ class Session:
             topic_state_hash=topic_state_hash,
             cached_state_hash=cached_state_hash,
             changed_uuid=changed_uuid,
-            deleted_node_uuids=deleted_node_uuids,
             pull_uuid=pull_uuid,
             effects=[effect.type for effect in effects],
         )
@@ -371,7 +359,6 @@ class Session:
         from_addr = message.get("from_addr")
         summary = message.get("summary") or {}
         topics = summary.get("topics") or {}
-        deleted = summary.get("deleted") or {}
         incoming_sync_hash = summary.get("sync_hash")
         if not from_addr:
             return SessionResult("error", reason="missing from_addr")
@@ -384,14 +371,6 @@ class Session:
         state = self.peer_sync_state.setdefault(from_addr, self._new_peer_sync_state())
         state["last_received_sync_hash"] = incoming_sync_hash
 
-        tombstones_changed = False
-        if isinstance(deleted, dict):
-            for topic_uuid, node_uuids in sorted(deleted.items()):
-                tombstones_changed = (
-                    self._apply_remote_tombstones(topic_uuid, node_uuids or [])
-                    or tombstones_changed
-                )
-
         effects = []
         for topic_uuid, topic_state_hash in sorted(topics.items()):
             cached_state_hash = self.cached_peer_topic_state_hash(from_addr, topic_uuid)
@@ -401,8 +380,6 @@ class Session:
                     from_addr,
                     {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
                 ))
-        if tombstones_changed:
-            effects.extend(self._sync_effects(None))
 
         self.trace_event(
             "session.handle_sync_status",
@@ -533,7 +510,6 @@ class Session:
         self.peer_perspectives.pop(from_addr, None)
         self.peer_status.pop(from_addr, None)
         self.peer_sync_state.pop(from_addr, None)
-        self.shared_state_by_peer.pop(from_addr, None)
         return SessionResult("ok")
 
     def mark_peer_reachable(self, peer_addr: str) -> bool:
@@ -573,8 +549,7 @@ class Session:
                 state_hash=subtree.state_hash,
                 action="new_cache",
             )
-            self.prune_resolved_tombstones()
-            self._sync_shared_state_for_tree(peer_addr, subtree)
+            self.prune_deleted_nodes()
             return
 
         subtree_uuids = self._collect_subtree_uuids(subtree)
@@ -599,8 +574,7 @@ class Session:
                     state_hash=subtree.state_hash,
                     action="append_to_parent",
                 )
-                self.prune_resolved_tombstones()
-                self._sync_shared_state_for_tree(peer_addr, subtree)
+                self.prune_deleted_nodes()
                 return
             if cached.data.get("type") == "peer_cache_root":
                 subtree.parent_uuid = cached.uuid
@@ -618,8 +592,7 @@ class Session:
                     state_hash=subtree.state_hash,
                     action="append_to_cache_root",
                 )
-                self.prune_resolved_tombstones()
-                self._sync_shared_state_for_tree(peer_addr, subtree)
+                self.prune_deleted_nodes()
                 return
             if cached.uuid != subtree.uuid:
                 aggregate = self._peer_cache_root(peer_addr)
@@ -637,8 +610,7 @@ class Session:
                     state_hash=subtree.state_hash,
                     action="create_cache_root",
                 )
-                self.prune_resolved_tombstones()
-                self._sync_shared_state_for_tree(peer_addr, subtree)
+                self.prune_deleted_nodes()
                 return
             self.peer_perspectives[peer_addr] = subtree
             self.trace_event(
@@ -649,8 +621,7 @@ class Session:
                 state_hash=subtree.state_hash,
                 action="replace_cache",
             )
-            self.prune_resolved_tombstones()
-            self._sync_shared_state_for_tree(peer_addr, subtree)
+            self.prune_deleted_nodes()
             return
 
         old_state_hash = target.state_hash
@@ -687,12 +658,9 @@ class Session:
             state_hash=subtree.state_hash,
             action="update_existing",
         )
-        self.prune_resolved_tombstones()
-        self._sync_shared_state_for_tree(peer_addr, subtree)
+        self.prune_deleted_nodes()
 
     def get_cached_peer_subtree(self, peer_addr: str, node_uuid: str) -> PRSPNode | None:
-        if node_uuid in self.deleted_node_uuids:
-            return None
         tree = self.peer_perspectives.get(peer_addr)
         if not tree:
             return None
@@ -707,7 +675,32 @@ class Session:
         compare_uuid = node_uuid or peer_root.uuid
         peer_node = self._find_in_tree(peer_root, compare_uuid)
         local_node = self._protocol.index.get(compare_uuid)
-        return self._analyze_transition_node(peer_addr, local_node, peer_node)
+        if not local_node and not peer_node:
+            return []
+        # Nodes are matched by uuid across the whole subtree, not by
+        # structural position, so a node that moved to a different parent
+        # on one side is still compared against its own counterpart (and
+        # its move is attributable via previous_parent_uuid) instead of
+        # showing up as an unrelated local_missing/peer_missing pair.
+        local_by_uuid = self._flatten_by_uuid(local_node) if local_node else {}
+        peer_by_uuid = self._flatten_by_uuid(peer_node) if peer_node else {}
+        other_uuids = sorted((set(local_by_uuid) | set(peer_by_uuid)) - {compare_uuid})
+        events = []
+        for uuid in [compare_uuid, *other_uuids]:
+            events.append(self._analyze_transition_node(
+                peer_addr,
+                local_by_uuid.get(uuid),
+                peer_by_uuid.get(uuid),
+                is_topic_root=(uuid == compare_uuid),
+            ))
+        return events
+
+    @staticmethod
+    def _flatten_by_uuid(node: PRSPNode) -> dict[str, PRSPNode]:
+        out = {node.uuid: node}
+        for child in node.children:
+            out.update(Session._flatten_by_uuid(child))
+        return out
 
     # App-facing protocol wrappers
 
@@ -747,23 +740,31 @@ class Session:
         node = self._protocol.index.get(node_uuid)
         parent_uuid = node.parent_uuid if node else None
         old_state_hash = node.state_hash if node else None
-        topic_uuid = self._topic_for_node(node_uuid)
         result = self._protocol.delete(node_uuid)
         if result.ok:
-            self._prune_shared_state_node(node_uuid)
-        if result.ok and topic_uuid:
-            self.deleted_node_uuids[node_uuid] = topic_uuid
-            self.prune_resolved_tombstones()
+            self.prune_deleted_nodes()
         self.trace_event(
             "protocol.delete",
             node_uuid=node_uuid,
             parent_uuid=parent_uuid,
-            topic_uuid=topic_uuid,
             old_state_hash=old_state_hash,
             ok=result.ok,
             reason=result.reason,
         )
         return self._operation_result(result, parent_uuid or node_uuid)
+
+    def reaffirm(self, node_uuid: str) -> SessionResult:
+        node = self._protocol.index.get(node_uuid)
+        old_state_hash = node.state_hash if node else None
+        result = self._protocol.reaffirm(node_uuid)
+        self.trace_event(
+            "protocol.reaffirm",
+            node_uuid=node_uuid,
+            old_state_hash=old_state_hash,
+            ok=result.ok,
+            reason=result.reason,
+        )
+        return self._operation_result(result, node_uuid)
 
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self._protocol.copy(source_uuid, destination_uuid)
@@ -799,17 +800,6 @@ class Session:
 
     def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
                       remove_descendant_duplicates: bool = False) -> SessionResult:
-        if tree.uuid in self.deleted_node_uuids:
-            self.trace_event(
-                "protocol.adopt_subtree",
-                node_uuid=tree.uuid,
-                parent_uuid=parent_uuid,
-                state_hash=tree.state_hash,
-                ok=False,
-                reason="node deleted",
-            )
-            return SessionResult("error", reason="node deleted")
-        tree = self._without_tombstoned_nodes(tree)
         result = self._protocol.adopt_subtree(
             tree,
             parent_uuid,
@@ -838,9 +828,6 @@ class Session:
                              effects=self._sync_effects(adopted.uuid))
 
     def replace_subtree(self, tree: PRSPNode) -> SessionResult:
-        if tree.uuid in self.deleted_node_uuids:
-            return SessionResult("error", reason="node deleted")
-        tree = self._without_tombstoned_nodes(tree)
         local = self._protocol.index.get(tree.uuid)
         old_state_hash = local.state_hash if local else None
         result = self._protocol.replace_subtree(tree)
@@ -868,24 +855,38 @@ class Session:
 
     def remove_subtree_uuids(self, root_uuid: str, uuids: set[str]) -> SessionResult:
         result = self._protocol.remove_subtree_uuids(root_uuid, uuids)
-        for uuid in uuids:
-            self._prune_shared_state_node(uuid)
         return self._operation_result(result, root_uuid)
 
-    def prune_resolved_tombstones(self) -> None:
-        resolved = []
-        for node_uuid, topic_uuid in sorted(self.deleted_node_uuids.items()):
-            peers = self.peers_for_topic(topic_uuid)
-            if all(self._peer_topic_lacks_uuid(peer, topic_uuid, node_uuid)
-                   for peer in peers):
-                resolved.append(node_uuid)
+    def prune_deleted_nodes(self) -> None:
+        deleted_uuids = self._collect_deleted_uuids(self._protocol.root)
+        if not deleted_uuids:
+            return
+        resolved = set()
+        for node_uuid in sorted(deleted_uuids):
+            topic_uuid = self._topic_for_node(node_uuid)
+            peers = self.peers_for_topic(topic_uuid) if topic_uuid else []
+            if all(
+                self._peer_topic_confirms_deletion(peer, topic_uuid, node_uuid)
+                for peer in peers
+            ):
+                resolved.add(node_uuid)
+        if not resolved:
+            return
+        self._protocol.remove_subtree_uuids(self._protocol.root.uuid, resolved)
         for node_uuid in resolved:
-            topic_uuid = self.deleted_node_uuids.pop(node_uuid, None)
             self.trace_event(
-                "session.tombstone_pruned",
+                "session.deleted_node_pruned",
                 node_uuid=node_uuid,
-                topic_uuid=topic_uuid,
             )
+
+    @staticmethod
+    def _collect_deleted_uuids(node: PRSPNode) -> set[str]:
+        out = set()
+        if node.deleted:
+            out.add(node.uuid)
+        for child in node.children:
+            out.update(Session._collect_deleted_uuids(child))
+        return out
 
     def propose(self, top_uuid: str,
                 operations: list[dict | AtomicOperation]) -> SessionResult:
@@ -903,8 +904,10 @@ class Session:
         return SessionResult("error", reason="proposal amendment is not implemented")
 
     def take_back_proposal(self, proposal_uuid: str) -> SessionResult:
+        proposal = self._protocol.find_proposal(proposal_uuid)
         result = self._protocol.take_back_proposal(proposal_uuid)
-        return self._operation_result(result, self.active_topic_uuid)
+        changed_uuid = proposal.top_uuid if proposal else self.active_topic_uuid
+        return self._operation_result(result, changed_uuid)
 
     def respond_to_proposal(self, proposal_uuid: str, response: str,
                             source_addr: str | None = None) -> SessionResult:
@@ -917,11 +920,13 @@ class Session:
             result = self._protocol.object_to_proposal(proposal)
         else:
             return SessionResult("error", reason="unknown proposal response")
-        return self._operation_result(result, self.active_topic_uuid)
+        return self._operation_result(result, proposal.top_uuid)
 
     def integrate_proposal(self, proposal_uuid: str) -> SessionResult:
+        proposal = self._protocol.find_proposal(proposal_uuid)
         result = self._protocol.integrate_proposal(proposal_uuid)
-        return self._operation_result(result, self.active_topic_uuid)
+        changed_uuid = proposal.top_uuid if proposal else self.active_topic_uuid
+        return self._operation_result(result, changed_uuid)
 
     def reconcile_integrations(self) -> SessionResult:
         changed = False
@@ -936,7 +941,7 @@ class Session:
         return SessionResult(
             "ok",
             value=changed,
-            effects=self._sync_effects(self.active_topic_uuid) if changed else [],
+            effects=self._sync_effects(None) if changed else [],
         )
 
     def get_node(self, node_uuid: str) -> PRSPNode | None:
@@ -996,19 +1001,14 @@ class Session:
 
     def sync_summary(self, peer_addr: str) -> dict[str, Any]:
         topics = {}
-        deleted = {}
         for topic_uuid in sorted(self.peer_topic_sets.get(peer_addr) or []):
             topic = self._protocol.index.get(topic_uuid)
             if not topic:
                 continue
             topics[topic_uuid] = topic.state_hash
-            topic_deleted = self._deleted_nodes_for_topic(topic_uuid)
-            if topic_deleted:
-                deleted[topic_uuid] = topic_deleted
-        sync_hash = stable_hash({"topics": topics, "deleted": deleted})
+        sync_hash = stable_hash({"topics": topics})
         return {
             "topics": topics,
-            "deleted": deleted,
             "sync_hash": sync_hash,
         }
 
@@ -1039,10 +1039,6 @@ class Session:
     def _pull_effects_for_peer_summary(self, peer_addr: str, summary: dict) -> list[SessionEffect]:
         effects = []
         topics = summary.get("topics") or {}
-        deleted = summary.get("deleted") or {}
-        if isinstance(deleted, dict):
-            for topic_uuid, node_uuids in sorted(deleted.items()):
-                self._apply_remote_tombstones(topic_uuid, node_uuids or [])
         for topic_uuid, topic_state_hash in sorted(topics.items()):
             self.add_peer(peer_addr, topic_uuid, fetch_from_peer=topic_uuid not in self._protocol.index)
             if self.cached_peer_topic_state_hash(peer_addr, topic_uuid) != topic_state_hash:
@@ -1062,55 +1058,19 @@ class Session:
                 return topic_uuid
         return None
 
-    def _deleted_nodes_for_topic(self, topic_uuid: str) -> list[str]:
-        return sorted(
-            node_uuid
-            for node_uuid, deleted_topic_uuid in self.deleted_node_uuids.items()
-            if deleted_topic_uuid == topic_uuid
-        )
-
-    def _apply_remote_tombstones(self, topic_uuid: str,
-                                 node_uuids: list[str]) -> bool:
-        changed = False
-        for node_uuid in sorted(set(str(uuid) for uuid in node_uuids if uuid)):
-            if node_uuid == topic_uuid:
-                continue
-            if self.deleted_node_uuids.get(node_uuid) != topic_uuid:
-                self.deleted_node_uuids[node_uuid] = topic_uuid
-            node = self._protocol.index.get(node_uuid)
-            if node and self._is_descendant_or_self(topic_uuid, node_uuid):
-                deleted = self._protocol.delete(node_uuid)
-                changed = changed or deleted.ok
-                if deleted.ok:
-                    self._prune_shared_state_node(node_uuid)
-            self.trace_event(
-                "session.remote_tombstone",
-                topic_uuid=topic_uuid,
-                node_uuid=node_uuid,
-                changed=changed,
-            )
-        if node_uuids:
-            self.prune_resolved_tombstones()
-        return changed
-
-    def _without_tombstoned_nodes(self, tree: PRSPNode) -> PRSPNode:
-        if not self.deleted_node_uuids:
-            return tree
-        payload = tree.to_dict()
-        if self._remove_uuids_from_payload(payload, set(self.deleted_node_uuids)):
-            return PRSPNode.from_dict(payload, repair_hashes=True)
-        return tree
-
-    def _peer_topic_lacks_uuid(self, peer_addr: str,
-                               topic_uuid: str,
-                               node_uuid: str) -> bool:
+    def _peer_topic_confirms_deletion(self, peer_addr: str,
+                                      topic_uuid: str,
+                                      node_uuid: str) -> bool:
         cache = self.peer_perspectives.get(peer_addr)
         if not cache:
             return False
         topic = self._find_in_tree(cache, topic_uuid)
         if not topic:
             return False
-        return self._find_in_tree(topic, node_uuid) is None
+        node = self._find_in_tree(topic, node_uuid)
+        if node is None:
+            return True
+        return bool(node.deleted)
 
     def _sync_effects(self, changed_uuid: str | None) -> list[SessionEffect]:
         effects = []
@@ -1178,7 +1138,6 @@ class Session:
             self.peer_perspectives.pop(peer_addr, None)
             self.peer_status.pop(peer_addr, None)
             self.peer_sync_state.pop(peer_addr, None)
-            self.shared_state_by_peer.pop(peer_addr, None)
 
     @staticmethod
     def _coerce_operations(
@@ -1265,95 +1224,57 @@ class Session:
         for child in root.children:
             yield from Session._iter_tree_proposals(child)
 
-    def _note_agreement(self, peer_addr: str, node_uuid: str, hash_value: str) -> None:
-        per_node = self.shared_state_by_peer.setdefault(peer_addr, {})
-        hashes = per_node.get(node_uuid) or []
-        if hashes[:1] == [hash_value]:
-            return
-        per_node[node_uuid] = [hash_value] + [
-            value for value in hashes if value != hash_value
-        ][:1]
-
-    def _sync_shared_state_for_tree(self, peer_addr: str, node: PRSPNode) -> None:
-        local_node = self._protocol.index.get(node.uuid)
-        if local_node and local_node.state_hash == node.state_hash:
-            self._note_agreement(peer_addr, node.uuid, node.state_hash)
-        for child in node.children:
-            self._sync_shared_state_for_tree(peer_addr, child)
-
-    def _prune_shared_state_node(self, node_uuid: str) -> None:
-        for per_node in self.shared_state_by_peer.values():
-            per_node.pop(node_uuid, None)
-
     def _analyze_transition_node(self, peer_addr: str,
                                  local_node: PRSPNode | None,
-                                 peer_node: PRSPNode | None) -> list[dict]:
-        node = local_node or peer_node
-        if node and node.uuid in self.deleted_node_uuids:
-            return []
-        if not local_node and not peer_node:
-            return []
+                                 peer_node: PRSPNode | None,
+                                 is_topic_root: bool = False) -> dict:
         if not local_node:
-            return [self._transition_event(
-                "local_missing_node",
-                peer_addr,
-                None,
-                peer_node,
-            )]
+            return self._transition_event("local_missing_node", peer_addr, None, peer_node)
         if not peer_node:
-            return [self._transition_event(
-                "peer_missing_node",
-                peer_addr,
-                local_node,
-                None,
-            )]
+            return self._transition_event("peer_missing_node", peer_addr, local_node, None)
 
-        child_events = []
-        local_children = {child.uuid: child for child in local_node.children}
-        peer_children = {child.uuid: child for child in peer_node.children}
-        for child_uuid in sorted(set(local_children) | set(peer_children)):
-            child_events.extend(self._analyze_transition_node(
-                peer_addr,
-                local_children.get(child_uuid),
-                peer_children.get(child_uuid),
-            ))
+        # A topic's own root node is grafted at a different parent in every
+        # peer's local tree (see attach_topic) - that's an artifact of how
+        # topics are shared, not a move either peer made, so only content is
+        # comparable at that level.
+        if is_topic_root:
+            event_type = self._classify_content(local_node, peer_node)
+        else:
+            event_type = self._classify_node(local_node, peer_node)
+        return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
-        event_type = self._transition_type(peer_addr, local_node.uuid, local_node, peer_node)
-        if event_type == "in_agreement":
-            self._note_agreement(peer_addr, local_node.uuid, local_node.state_hash)
-        if event_type == "cannot_compare" and child_events:
-            child_types = {event["type"] for event in child_events}
-            if "divergence" in child_types:
-                event_type = "divergence"
-            elif child_types <= {
-                    "in_agreement",
-                    "peer_made_changes",
-                    "local_made_changes",
-                    "local_missing_node",
-                    "peer_missing_node",
-            } and child_types != {"in_agreement"}:
-                event_type = "divergence"
-
-        return [
-            self._transition_event(
-                event_type,
-                peer_addr,
-                local_node,
-                peer_node,
-            )
-        ] + child_events
-
-    def _transition_type(self, peer_addr: str, node_uuid: str,
-                         local_node: PRSPNode, peer_node: PRSPNode) -> str:
+    @staticmethod
+    def _classify_content(local_node: PRSPNode, peer_node: PRSPNode) -> str:
         if local_node.state_hash == peer_node.state_hash:
             return "in_agreement"
-        shared_hashes = self.shared_state_by_peer.get(peer_addr, {}).get(node_uuid) or []
-        if not shared_hashes:
-            return "cannot_compare"
-        if peer_node.state_hash in shared_hashes:
+        if peer_node.state_hash == local_node.previous_hash:
             return "local_made_changes"
-        if local_node.state_hash in shared_hashes:
+        if local_node.state_hash == peer_node.previous_hash:
             return "peer_made_changes"
+        return "divergence"
+
+    @staticmethod
+    def _classify_move(local_node: PRSPNode, peer_node: PRSPNode) -> str:
+        if local_node.parent_uuid == peer_node.parent_uuid:
+            return "in_agreement"
+        if local_node.parent_uuid == peer_node.previous_parent_uuid:
+            return "peer_made_changes"
+        if peer_node.parent_uuid == local_node.previous_parent_uuid:
+            return "local_made_changes"
+        return "divergence"
+
+    @staticmethod
+    def _classify_node(local_node: PRSPNode, peer_node: PRSPNode) -> str:
+        content = Session._classify_content(local_node, peer_node)
+        move = Session._classify_move(local_node, peer_node)
+        if content == "divergence" or move == "divergence":
+            return "divergence"
+        if content == move:
+            return content
+        if content == "in_agreement":
+            return move
+        if move == "in_agreement":
+            return content
         return "divergence"
 
     @staticmethod

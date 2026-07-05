@@ -30,6 +30,92 @@ class ProtocolTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             PRSPNode.from_dict(payload)
 
+    def test_new_node_starts_settled(self):
+        node = PRSPNode({"name": "node"})
+
+        self.assertEqual(node.previous_hash, node.state_hash)
+        self.assertEqual(node.previous_parent_uuid, node.parent_uuid)
+
+    def test_modify_tracks_previous_hash(self):
+        state = ProtocolState("si-a")
+        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
+        old_hash = child.state_hash
+
+        state.modify(child.uuid, {"name": "renamed"}, {})
+
+        self.assertEqual(child.previous_hash, old_hash)
+        self.assertNotEqual(child.state_hash, old_hash)
+
+    def test_move_child_tracks_previous_parent_uuid(self):
+        state = ProtocolState("si-a")
+        first = state.create_child(state.root.uuid, {"name": "first"}, {}).value
+        second = state.create_child(state.root.uuid, {"name": "second"}, {}).value
+        child = state.create_child(first.uuid, {"name": "child"}, {}).value
+
+        state.move_child(child.uuid, second.uuid)
+
+        self.assertEqual(child.previous_parent_uuid, first.uuid)
+        self.assertEqual(child.parent_uuid, second.uuid)
+
+    def test_reaffirm_sets_reaffirmed_markers_without_touching_true_history(self):
+        state = ProtocolState("si-a")
+        parent = state.create_child(state.root.uuid, {"name": "parent"}, {}).value
+        child = state.create_child(parent.uuid, {"name": "child"}, {}).value
+        state.modify(child.uuid, {"name": "renamed"}, {})
+        state_hash_before = child.state_hash
+        content_hash_before = child.content_hash
+        previous_hash_before = child.previous_hash
+        previous_parent_uuid_before = child.previous_parent_uuid
+
+        result = state.reaffirm(child.uuid)
+
+        self.assertTrue(result.ok)
+        self.assertTrue(child.is_reaffirmed())
+        self.assertEqual(child.reaffirmed_hash, child.state_hash)
+        self.assertEqual(child.reaffirmed_parent_uuid, child.parent_uuid)
+        # True edit history must stay untouched - it's still needed to
+        # classify correctly against peers who know nothing about this
+        # reaffirm.
+        self.assertEqual(child.previous_hash, previous_hash_before)
+        self.assertEqual(child.previous_parent_uuid, previous_parent_uuid_before)
+        self.assertEqual(child.state_hash, state_hash_before)
+        self.assertEqual(child.content_hash, content_hash_before)
+
+    def test_reaffirm_toggles_off_on_second_call(self):
+        state = ProtocolState("si-a")
+        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
+        state.modify(child.uuid, {"name": "renamed"}, {})
+
+        self.assertTrue(state.reaffirm(child.uuid).ok)
+        self.assertTrue(child.is_reaffirmed())
+
+        self.assertTrue(state.reaffirm(child.uuid).ok)
+        self.assertFalse(child.is_reaffirmed())
+        self.assertIsNone(child.reaffirmed_hash)
+        self.assertIsNone(child.reaffirmed_parent_uuid)
+
+    def test_delete_cascades_flag_and_keeps_descendants_indexed(self):
+        state = ProtocolState("si-a")
+        column = state.create_child(state.root.uuid, {"name": "column"}, {}).value
+        card = state.create_child(column.uuid, {"name": "card"}, {}).value
+
+        self.assertTrue(state.delete(column.uuid).ok)
+
+        self.assertIn(column.uuid, state.index)
+        self.assertIn(card.uuid, state.index)
+        self.assertTrue(state.index[column.uuid].deleted)
+        self.assertTrue(state.index[card.uuid].deleted)
+        self.assertEqual(state.root.live_children(), [])
+
+    def test_deleted_flag_changes_hash_and_cascades_to_parent(self):
+        state = ProtocolState("si-a")
+        column = state.create_child(state.root.uuid, {"name": "column"}, {}).value
+        root_hash_before = state.root.state_hash
+
+        state.delete(column.uuid)
+
+        self.assertNotEqual(state.root.state_hash, root_hash_before)
+
     def test_atomic_create_modify_delete(self):
         state = ProtocolState("si-a")
         child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
@@ -38,7 +124,9 @@ class ProtocolTests(unittest.TestCase):
         self.assertTrue(state.modify(child.uuid, {"name": "renamed"}, {}).ok)
         self.assertEqual(state.index[child.uuid].data["name"], "renamed")
         self.assertTrue(state.delete(child.uuid).ok)
-        self.assertNotIn(child.uuid, state.index)
+        self.assertIn(child.uuid, state.index)
+        self.assertTrue(state.index[child.uuid].deleted)
+        self.assertNotIn(child.uuid, [c.uuid for c in state.root.live_children()])
 
     def test_copy_uses_fresh_uuids(self):
         state = ProtocolState("si-a")
@@ -122,6 +210,112 @@ class ProtocolTests(unittest.TestCase):
         proposer.acknowledge_final_proposal_cleanup(proposal.uuid, accepter.author)
 
         self.assertIsNone(proposer.find_proposal(proposal.uuid))
+
+    def test_propose_records_base_hash_only_for_modify_targets(self):
+        state = ProtocolState("si-a")
+        column = state.create_child(state.root.uuid, {"name": "To Do"}, {}).value
+
+        proposal = state.propose(column.uuid, [
+            AtomicOperation.create_child(column.uuid, {"name": "New card"}, {}),
+        ]).value
+
+        self.assertEqual(proposal.base_hashes, {})
+
+    def test_accept_proposal_blocked_when_target_own_fields_changed_elsewhere(self):
+        proposer = ProtocolState("si-a")
+        accepter = ProtocolState("si-b")
+        column = proposer.create_child(proposer.root.uuid, {"name": "To Do"}, {}).value
+        accepter.attach_topic(PRSPNode.from_dict(column.to_dict()))
+        proposal = proposer.propose(column.uuid, [
+            AtomicOperation.modify(column.uuid, {"name": "Renamed"}, {})
+        ]).value
+
+        accepter.modify(column.uuid, {"name": "Renamed by accepter first"}, {})
+
+        result = accepter.accept_proposal(proposal)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "base hash mismatch")
+
+    def test_accept_proposal_not_blocked_by_unrelated_child_change(self):
+        proposer = ProtocolState("si-a")
+        accepter = ProtocolState("si-b")
+        column = proposer.create_child(proposer.root.uuid, {"name": "To Do"}, {}).value
+        proposer.create_child(column.uuid, {"name": "Card"}, {})
+        accepter.attach_topic(PRSPNode.from_dict(proposer.index[column.uuid].to_dict()))
+
+        proposal = proposer.propose(column.uuid, [
+            AtomicOperation.modify(column.uuid, {"name": "Renamed"}, {})
+        ]).value
+
+        # The accepter independently edits the card underneath the column
+        # (unrelated to the rename) before ever seeing the proposal.
+        accepter_column = accepter.index[column.uuid]
+        accepter_card_uuid = accepter_column.children[0].uuid
+        accepter.modify(accepter_card_uuid, {"name": "Card edited by accepter"}, {})
+
+        result = accepter.accept_proposal(proposal)
+
+        self.assertTrue(result.ok)
+
+    def test_propose_blocked_when_nested_inside_active_proposal(self):
+        state = ProtocolState("si-a")
+        topic = state.create_child(state.root.uuid, {"name": "topic"}, {}).value
+        child = state.create_child(topic.uuid, {"name": "child"}, {}).value
+        state.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "top-level"}, {})
+        ])
+
+        result = state.propose(child.uuid, [
+            AtomicOperation.create_child(child.uuid, {"name": "nested"}, {})
+        ])
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "nested proposal blocked")
+
+    def test_propose_blocked_when_it_would_enclose_active_proposal(self):
+        state = ProtocolState("si-a")
+        topic = state.create_child(state.root.uuid, {"name": "topic"}, {}).value
+        child = state.create_child(topic.uuid, {"name": "child"}, {}).value
+        grandchild = state.create_child(child.uuid, {"name": "grandchild"}, {}).value
+        state.propose(grandchild.uuid, [
+            AtomicOperation.create_child(grandchild.uuid, {"name": "deep"}, {})
+        ])
+
+        result = state.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "enclosing"}, {})
+        ])
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "nested proposal blocked")
+
+    def test_propose_allowed_on_same_node_as_active_proposal(self):
+        state = ProtocolState("si-a")
+        topic = state.create_child(state.root.uuid, {"name": "topic"}, {}).value
+        state.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "first"}, {})
+        ])
+
+        result = state.propose(topic.uuid, [
+            AtomicOperation.create_child(topic.uuid, {"name": "second"}, {})
+        ])
+
+        self.assertTrue(result.ok)
+
+    def test_propose_not_blocked_by_unrelated_active_proposal(self):
+        state = ProtocolState("si-a")
+        topic = state.create_child(state.root.uuid, {"name": "topic"}, {}).value
+        child1 = state.create_child(topic.uuid, {"name": "child1"}, {}).value
+        child2 = state.create_child(topic.uuid, {"name": "child2"}, {}).value
+        state.propose(child1.uuid, [
+            AtomicOperation.create_child(child1.uuid, {"name": "on-child1"}, {})
+        ])
+
+        result = state.propose(child2.uuid, [
+            AtomicOperation.create_child(child2.uuid, {"name": "on-child2"}, {})
+        ])
+
+        self.assertTrue(result.ok)
 
 
 if __name__ == "__main__":
