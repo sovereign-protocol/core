@@ -15,6 +15,7 @@
       <div class="toolbar">
         <span id="statusText" class="top-status">Loading</span>
         <button id="inviteBtn">Invite</button>
+        <button id="connectTokenBtn">Connect via token</button>
         <button id="leaveBtn">Leave</button>
       </div>
     </header>
@@ -574,6 +575,14 @@
       return match ? match[1] : text.replace(/^https?:\/\//, "") || "peer";
     }
 
+    function decodeConnectToken(token) {
+      const payload = JSON.parse(atob(token.trim()));
+      if (!payload.address || !Array.isArray(payload.topic_uuids) || !payload.topic_uuids.length) {
+        throw new Error("Invalid token");
+      }
+      return payload;
+    }
+
     function peerStatus(address) {
       return appState.network?.peer_status?.[address]
         || appState.network?.peers?.[address]?.status
@@ -756,6 +765,20 @@
               topic_uuid: form.get("topic").trim(),
             });
             log("Invite sent");
+          },
+        );
+
+      el("connectTokenBtn").onclick = () =>
+        openModal(
+          "Connect via token",
+          [{ name: "token", label: "Invitation token", multiline: true }],
+          async (form) => {
+            const payload = decodeConnectToken(form.get("token"));
+            await api("/api/join_discussion", {
+              address: payload.address,
+              topic_uuids: payload.topic_uuids,
+            });
+            log("Connected");
           },
         );
 
