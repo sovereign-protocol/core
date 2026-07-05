@@ -90,7 +90,6 @@ def create_logic(session: Session, config: dict) -> ManualLogic:
 
 def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
     async def api_state(request: Request):
-        logic.session.reconcile_integrations()
         return JSONResponse(logic.state())
 
     async def api_start_discussion(request: Request):

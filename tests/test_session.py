@@ -1,6 +1,6 @@
 import unittest
 
-from protocol import AtomicOperation, PRSPNode
+from protocol import PRSPNode
 from session import Session
 
 
@@ -374,7 +374,11 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(events[0]["type"], "peer_missing_node")
 
-    def test_analyze_peer_transition_detects_peer_made_changes_after_multiple_edits(self):
+    def test_analyze_peer_transition_multiple_unsynced_edits_read_as_divergence(self):
+        # One-slot history trade-off (see BACKLOG): after two peer edits with
+        # no adoption in between, the peer's previous_hash no longer bridges
+        # to our state, so the honest verdict is divergence rather than
+        # "peer is just behind".
         local = Session("si-a")
         peer = Session("si-c")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
@@ -395,7 +399,7 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-c", topic.uuid)
 
-        self.assertEqual(events[0]["type"], "peer_made_changes")
+        self.assertEqual(events[0]["type"], "divergence")
 
     def test_reaffirm_does_not_corrupt_classification_for_unrelated_peers(self):
         # A edits and reaffirms (deciding to keep its own value against some
@@ -420,6 +424,41 @@ class SessionTests(unittest.TestCase):
         events = c.analyze_peer_transitions("si-a", topic.uuid)
 
         self.assertEqual(events[0]["type"], "peer_made_changes")
+
+    def test_apply_peer_subtree_update_propagates_deleted_flag_and_history(self):
+        local = Session("si-a")
+        peer = Session("si-b")
+        topic = peer.create_child(peer.protocol.root.uuid, {"name": "topic"}, {}).value
+        child = peer.create_child(topic.uuid, {"name": "child"}, {}).value
+        peer.start_discussion(topic.uuid)
+        peer.add_peer("si-a", topic.uuid)
+        local.add_peer("si-b", topic.uuid)
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            peer.protocol.root.uuid,
+        )
+
+        peer.modify(child.uuid, {"name": "renamed"}, {})
+        peer.delete(child.uuid)
+        # Pull just the changed node, hitting the update-in-place merge path.
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[child.uuid].to_dict()),
+            topic.uuid,
+        )
+
+        cached_child = local._find_in_tree(local.peer_perspectives["si-b"], child.uuid)
+        peer_child = peer.protocol.index[child.uuid]
+        self.assertTrue(cached_child.deleted)
+        self.assertEqual(cached_child.previous_hash, peer_child.previous_hash)
+        # If the merge left a stale deleted flag, the cache's recomputed
+        # topic hash would never match what the peer reports, causing an
+        # endless re-pull loop.
+        self.assertEqual(
+            local.cached_peer_topic_state_hash("si-b", topic.uuid),
+            peer.protocol.index[topic.uuid].state_hash,
+        )
 
     def test_delete_flags_node_and_waits_for_peer_confirmation_before_pruning(self):
         local = Session("si-a")
@@ -558,63 +597,6 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertIn("si-b", session.members)
         self.assertEqual(session.peer_topic_sets["si-b"], {"topic-2"})
-
-    def test_integrate_proposal_syncs_effects_for_its_own_topic(self):
-        session = Session("si-a")
-        topic_a = session.create_child(session.protocol.root.uuid, {"name": "a"}, {}).value
-        topic_b = session.create_child(session.protocol.root.uuid, {"name": "b"}, {}).value
-        session.start_discussion(topic_a.uuid)
-        session.start_discussion(topic_b.uuid)
-
-        # Pick whichever topic is NOT the arbitrary "active_topic_uuid" pick,
-        # so the test doesn't depend on random uuid ordering.
-        other_topic = topic_b if session.active_topic_uuid == topic_a.uuid else topic_a
-        session.add_peer("si-b", other_topic.uuid)
-
-        proposal = session.propose(other_topic.uuid, [
-            AtomicOperation.create_child(other_topic.uuid, {"name": "child"}, {})
-        ]).value
-
-        result = session.integrate_proposal(proposal.uuid)
-
-        self.assertEqual(result.status, "ok")
-        self.assertTrue(any(effect.target == "si-b" for effect in result.effects))
-
-    def test_reconcile_integrations_syncs_effects_regardless_of_active_topic_order(self):
-        proposer = Session("si-a")
-        accepter = Session("si-b")
-        topic_a = proposer.create_child(proposer.protocol.root.uuid, {"name": "a"}, {}).value
-        topic_b = proposer.create_child(proposer.protocol.root.uuid, {"name": "b"}, {}).value
-        proposer.start_discussion(topic_a.uuid)
-        proposer.start_discussion(topic_b.uuid)
-        accepter.accept_topic_invitation(PRSPNode.from_dict(topic_a.to_dict()))
-        accepter.accept_topic_invitation(PRSPNode.from_dict(topic_b.to_dict()))
-
-        # Pick whichever topic is NOT the arbitrary "active_topic_uuid" pick
-        # on the accepter's side, so the test doesn't depend on uuid ordering.
-        other_topic = topic_b if accepter.active_topic_uuid == topic_a.uuid else topic_a
-        proposer.add_peer("si-b", other_topic.uuid)
-        accepter.add_peer("si-a", other_topic.uuid)
-
-        proposal = proposer.propose(other_topic.uuid, [
-            AtomicOperation.create_child(other_topic.uuid, {"name": "child"}, {})
-        ]).value
-        proposer.take_back_proposal(proposal.uuid)
-        # Accepter already knows about the proposal (e.g. observed it while
-        # active) and now receives the peer's tree with it marked taken_back.
-        accepter._protocol.object_to_proposal(proposal)
-        accepter.apply_peer_subtree(
-            "si-a",
-            PRSPNode.from_dict(proposer.protocol.index[other_topic.uuid].to_dict()),
-            proposer.protocol.root.uuid,
-        )
-
-        result = accepter.reconcile_integrations()
-
-        self.assertEqual(result.status, "ok")
-        self.assertTrue(result.value)
-        self.assertTrue(any(effect.target == "si-a" for effect in result.effects))
-
 
 if __name__ == "__main__":
     unittest.main()

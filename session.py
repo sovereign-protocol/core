@@ -13,12 +13,10 @@ Offered API:
   leave()
   get_network_info()
   protocol operation wrappers: create_child, modify, delete, copy, move,
-    propose, amend_proposal, take_back_proposal, respond_to_proposal,
-    integrate_proposal, reconcile_integrations
+    reaffirm
 
 Used API:
-  protocol.ProtocolState, protocol.PRSPNode, protocol.AtomicOperation,
-  and protocol.Proposal only.
+  protocol.ProtocolState and protocol.PRSPNode only.
 
 Transport contract:
   Session never sends data. It returns SessionEffect values that a server or
@@ -32,7 +30,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any
 
-from protocol import AtomicOperation, PRSPNode, Proposal, ProtocolState, stable_hash
+from protocol import PRSPNode, ProtocolState, stable_hash
 from trace_log import TraceLogger
 
 
@@ -118,10 +116,6 @@ class Session:
     def active_topic_uuid(self) -> str | None:
         return sorted(self.active_topic_uuids)[0] if self.active_topic_uuids else None
 
-    @active_topic_uuid.setter
-    def active_topic_uuid(self, value: str | None) -> None:
-        self.active_topic_uuids = {value} if value else set()
-
     # Read-only protocol access / persistence
 
     def load_protocol_root(self, root: PRSPNode) -> None:
@@ -147,13 +141,6 @@ class Session:
         cached = self.peer_perspectives.get(peer_addr)
         topic = self._find_in_tree(cached, topic_uuid) if cached else None
         return topic.state_hash if topic else None
-
-    def node_content_hash(self, node_uuid: str) -> str | None:
-        node = self._protocol.index.get(node_uuid)
-        return node.content_hash if node else None
-
-    def node_uuids(self) -> list[str]:
-        return sorted(self._protocol.index)
 
     # Discussion/session state
 
@@ -499,9 +486,15 @@ class Session:
             for topic_uuid in topic_uuids:
                 self._remove_peer_topic(from_addr, topic_uuid)
                 tree = self.peer_perspectives.get(from_addr)
-                if tree:
-                    self._remove_uuid_from_tree(tree, topic_uuid)
-                    self._refresh_tree_hashes(tree)
+                if not tree:
+                    continue
+                if tree.uuid == topic_uuid:
+                    # The cache root is the topic itself - dropping children
+                    # can't remove it, so drop the whole perspective.
+                    self.peer_perspectives.pop(from_addr, None)
+                    continue
+                self._remove_uuid_from_tree(tree, topic_uuid)
+                self._refresh_tree_hashes(tree)
             return SessionResult("ok")
         self.members.discard(from_addr)
         self.peer_topics.pop(from_addr, None)
@@ -630,8 +623,11 @@ class Session:
         target.updated_at = subtree.updated_at
         target.content_hash = subtree.content_hash
         target.state_hash = subtree.state_hash
+        target.previous_hash = subtree.previous_hash
+        target.previous_parent_uuid = subtree.previous_parent_uuid
+        target.deleted = subtree.deleted
+        target.reaffirmed = subtree.reaffirmed
         target.weights = subtree.weights
-        target.proposals = subtree.proposals
         target.data = subtree.data
         target.children = subtree.children
         if parent_uuid and target.parent_uuid != parent_uuid:
@@ -888,62 +884,6 @@ class Session:
             out.update(Session._collect_deleted_uuids(child))
         return out
 
-    def propose(self, top_uuid: str,
-                operations: list[dict | AtomicOperation]) -> SessionResult:
-        result = self._protocol.propose(
-            top_uuid,
-            self._coerce_operations(operations),
-        )
-        if not result.ok:
-            return SessionResult("error", reason=result.reason)
-        return SessionResult("ok", value=result.value,
-                             effects=self._sync_effects(top_uuid))
-
-    def amend_proposal(self, proposal_uuid: str,
-                       operations: list[dict]) -> SessionResult:
-        return SessionResult("error", reason="proposal amendment is not implemented")
-
-    def take_back_proposal(self, proposal_uuid: str) -> SessionResult:
-        proposal = self._protocol.find_proposal(proposal_uuid)
-        result = self._protocol.take_back_proposal(proposal_uuid)
-        changed_uuid = proposal.top_uuid if proposal else self.active_topic_uuid
-        return self._operation_result(result, changed_uuid)
-
-    def respond_to_proposal(self, proposal_uuid: str, response: str,
-                            source_addr: str | None = None) -> SessionResult:
-        proposal = self._find_visible_proposal(proposal_uuid, source_addr)
-        if not proposal:
-            return SessionResult("error", reason="proposal not found")
-        if response == "accept":
-            result = self._protocol.accept_proposal(proposal)
-        elif response == "object":
-            result = self._protocol.object_to_proposal(proposal)
-        else:
-            return SessionResult("error", reason="unknown proposal response")
-        return self._operation_result(result, proposal.top_uuid)
-
-    def integrate_proposal(self, proposal_uuid: str) -> SessionResult:
-        proposal = self._protocol.find_proposal(proposal_uuid)
-        result = self._protocol.integrate_proposal(proposal_uuid)
-        changed_uuid = proposal.top_uuid if proposal else self.active_topic_uuid
-        return self._operation_result(result, changed_uuid)
-
-    def reconcile_integrations(self) -> SessionResult:
-        changed = False
-        for tree in self.peer_perspectives.values():
-            if not tree:
-                continue
-            for proposal in self._iter_tree_proposals(tree):
-                if proposal.status not in ("integrated", "taken_back"):
-                    continue
-                result = self._protocol.reconcile_final_proposal(proposal)
-                changed = changed or result.ok
-        return SessionResult(
-            "ok",
-            value=changed,
-            effects=self._sync_effects(None) if changed else [],
-        )
-
     def get_node(self, node_uuid: str) -> PRSPNode | None:
         node = self._protocol.index.get(node_uuid)
         return self._snapshot_node(node) if node else None
@@ -1140,17 +1080,6 @@ class Session:
             self.peer_sync_state.pop(peer_addr, None)
 
     @staticmethod
-    def _coerce_operations(
-            operations: list[dict | AtomicOperation]) -> list[AtomicOperation]:
-        out = []
-        for operation in operations:
-            if isinstance(operation, AtomicOperation):
-                out.append(operation)
-            else:
-                out.append(AtomicOperation.from_dict(operation))
-        return out
-
-    @staticmethod
     def _message_topic_uuids(message: dict) -> list[str]:
         topic_uuids = message.get("topic_uuids")
         if topic_uuids:
@@ -1198,31 +1127,6 @@ class Session:
             {},
         )
         return created.value.uuid
-
-    def _find_visible_proposal(self, proposal_uuid: str,
-                               source_addr: str | None) -> Proposal | None:
-        local = self._protocol.find_proposal(proposal_uuid)
-        if local:
-            return local
-        trees = []
-        if source_addr:
-            trees.append(self.peer_perspectives.get(source_addr))
-        else:
-            trees.extend(self.peer_perspectives.values())
-        for tree in trees:
-            if not tree:
-                continue
-            for proposal in self._iter_tree_proposals(tree):
-                if proposal.uuid == proposal_uuid:
-                    return proposal
-        return None
-
-    @staticmethod
-    def _iter_tree_proposals(root: PRSPNode):
-        for proposal in root.proposals:
-            yield proposal
-        for child in root.children:
-            yield from Session._iter_tree_proposals(child)
 
     def _analyze_transition_node(self, peer_addr: str,
                                  local_node: PRSPNode | None,
@@ -1313,19 +1217,6 @@ class Session:
         for uuid in subtree_uuids:
             if uuid != keep_uuid:
                 Session._remove_uuid_from_tree(root, uuid)
-
-    @staticmethod
-    def _remove_uuids_from_payload(root: dict, uuids: set[str]) -> bool:
-        changed = False
-        kept = []
-        for child in root.get("children", []):
-            if child.get("uuid") in uuids:
-                changed = True
-                continue
-            changed = Session._remove_uuids_from_payload(child, uuids) or changed
-            kept.append(child)
-        root["children"] = kept
-        return changed
 
     @staticmethod
     def _find_in_tree(root: PRSPNode, uuid: str | None) -> PRSPNode | None:
