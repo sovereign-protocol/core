@@ -15,6 +15,7 @@
       <div class="toolbar">
         <span id="statusText" class="top-status">Loading</span>
         <button id="inviteBtn">Invite</button>
+        <button id="buildTokenBtn">Build token for topic</button>
         <button id="connectTokenBtn">Connect via token</button>
         <button id="leaveBtn">Leave</button>
       </div>
@@ -38,16 +39,21 @@
         <div id="tree" class="tree"></div>
       </section>
 
+      <div id="colSplitter" class="splitter splitter-v" title="Drag to resize"></div>
+
       <aside class="panel side-panel">
         <div class="panel-head side-head">
           <div>
             <h2>Known Perspectives</h2>
           </div>
         </div>
+        <div id="observedTopics" class="observed-topics"></div>
         <div id="peers" class="peers"></div>
       </aside>
 
-      <section class="panel detail-panel">
+      <div id="rowSplitter" class="splitter splitter-h" title="Drag to resize"></div>
+
+      <section class="panel detail-panel detail-panel-local">
         <div class="panel-head detail-head">
           <h2>Values</h2>
           <span id="localDetailMeta" class="detail-meta">No selection</span>
@@ -56,7 +62,7 @@
         <div id="localValues" class="detail-list"></div>
       </section>
 
-      <section class="panel detail-panel">
+      <section class="panel detail-panel detail-panel-peer">
         <div class="panel-head detail-head">
           <h2>Values</h2>
           <span id="peerDetailMeta" class="detail-meta">No selection</span>
@@ -88,6 +94,7 @@
       let selectedPeer = null;
       let busy = false;
       let lastRefreshError = "";
+      const collapsedUuids = new Set();
 
       const el = (id) => document.getElementById(id);
       const selfColor = "#9aa4b2";
@@ -158,6 +165,7 @@
           (network.topic_uuid ? ` | topic ${short(network.topic_uuid)}` : "");
         renderNetworkPeers();
         el("tree").replaceChildren(renderNode(appState.root, 0, "local", null));
+        renderObservedTopics();
         renderPeers();
         renderSelectedDetails();
         syncLayoutOffsets();
@@ -243,6 +251,28 @@
           row.classList.add("current-topic");
         }
 
+        const childNodes = node.children || [];
+        const ghostNodes = mode === "local" ? ghostChildren(node.uuid) : [];
+        const hasChildren = childNodes.length > 0 || ghostNodes.length > 0;
+        const collapsed = collapsedUuids.has(node.uuid);
+
+        const toggle = document.createElement("button");
+        toggle.type = "button";
+        toggle.className = "node-toggle";
+        if (hasChildren) {
+          toggle.textContent = collapsed ? "▶" : "▼";
+          toggle.title = collapsed ? "Expand" : "Collapse";
+          toggle.onclick = (event) => {
+            event.stopPropagation();
+            if (collapsed) collapsedUuids.delete(node.uuid);
+            else collapsedUuids.add(node.uuid);
+            render();
+          };
+        } else {
+          toggle.classList.add("node-toggle-empty");
+          toggle.disabled = true;
+        }
+
         const select = document.createElement("button");
         select.className = "node-main";
         select.type = "button";
@@ -277,13 +307,13 @@
           actions.append(iconButton("Accept", () => openAcceptModal(node.uuid)));
         }
 
-        row.append(select, actions);
+        row.append(toggle, select, actions);
         wrap.append(row);
-        for (const child of node.children || []) {
-          wrap.append(renderNode(child, depth + 1, mode, sourceAddr));
-        }
-        if (mode === "local") {
-          for (const ghost of ghostChildren(node.uuid)) {
+        if (!collapsed) {
+          for (const child of childNodes) {
+            wrap.append(renderNode(child, depth + 1, mode, sourceAddr));
+          }
+          for (const ghost of ghostNodes) {
             wrap.append(renderNode(ghost.node, depth + 1, "ghost", ghost.sourceAddr));
           }
         }
@@ -349,6 +379,36 @@
         if (!topicUuid) return false;
         const topic = findNode(appState.root, topicUuid);
         return Boolean(findNode(topic, nodeUuid));
+      }
+
+      function renderObservedTopics() {
+        const container = el("observedTopics");
+        container.replaceChildren();
+        const entries = Object.entries(appState.observed_topics || {});
+        for (const [addr, topicUuids] of entries) {
+          for (const topicUuid of topicUuids) {
+            const row = document.createElement("div");
+            row.className = "observed-topic-row";
+            const label = document.createElement("span");
+            label.className = "observed-topic-label";
+            label.textContent = `Watching ${peerLabel(addr)} - ${short(topicUuid)}`;
+            label.title = `${addr}\n${topicUuid}`;
+            const unwatchBtn = document.createElement("button");
+            unwatchBtn.type = "button";
+            unwatchBtn.textContent = "Unwatch";
+            unwatchBtn.onclick = async () => {
+              try {
+                await api("/api/unwatch_topic", { address: addr, topic_uuid: topicUuid });
+                log("Stopped watching");
+                await loadState(true);
+              } catch (error) {
+                log(error.message, true);
+              }
+            };
+            row.append(label, unwatchBtn);
+            container.append(row);
+          }
+        }
       }
 
       function renderPeers() {
@@ -514,12 +574,23 @@
         area.replaceChildren();
         for (const field of fields) {
           const label = document.createElement("label");
+          let input;
+          if (field.type === "checkbox") {
+            input = document.createElement("input");
+            input.type = "checkbox";
+            input.checked = !!field.checked;
+            input.name = field.name;
+            label.className = "checkbox-field";
+            label.append(input, document.createTextNode(" " + field.label));
+            area.append(label);
+            continue;
+          }
           label.textContent = field.label;
-          const input = field.multiline
+          input = field.multiline
             ? document.createElement("textarea")
             : document.createElement("input");
-          input.name = field.name;
           input.value = field.value || "";
+          input.name = field.name;
           label.append(input);
           area.append(label);
         }
@@ -581,6 +652,10 @@
         throw new Error("Invalid token");
       }
       return payload;
+    }
+
+    function encodeConnectToken(address, topicUuids) {
+      return btoa(JSON.stringify({ address, topic_uuids: topicUuids }));
     }
 
     function peerStatus(address) {
@@ -680,6 +755,100 @@
         );
       }
 
+      const LAYOUT_SPLIT_STORAGE_KEY = "manualLayoutSplit";
+      const SPLIT_MIN_FR = 15;
+      const SPLIT_MAX_FR = 85;
+
+      function clampSplitFr(value) {
+        return Math.min(SPLIT_MAX_FR, Math.max(SPLIT_MIN_FR, value));
+      }
+
+      function setSplitVar(name, value) {
+        document.documentElement.style.setProperty(name, String(value));
+      }
+
+      function getSplitVar(name, fallback) {
+        const raw = getComputedStyle(document.documentElement).getPropertyValue(name);
+        const value = parseFloat(raw);
+        return Number.isFinite(value) ? value : fallback;
+      }
+
+      function saveLayoutSplit() {
+        try {
+          localStorage.setItem(
+            LAYOUT_SPLIT_STORAGE_KEY,
+            JSON.stringify({
+              col1: getSplitVar("--col1-fr", 62),
+              row1: getSplitVar("--row1-fr", 74),
+            }),
+          );
+        } catch {
+          // localStorage may be unavailable (private mode, etc.) - not fatal.
+        }
+      }
+
+      function restoreLayoutSplit() {
+        try {
+          const saved = JSON.parse(localStorage.getItem(LAYOUT_SPLIT_STORAGE_KEY) || "null");
+          if (!saved) return;
+          if (Number.isFinite(saved.col1)) {
+            const col1 = clampSplitFr(saved.col1);
+            setSplitVar("--col1-fr", col1);
+            setSplitVar("--col2-fr", 100 - col1);
+          }
+          if (Number.isFinite(saved.row1)) {
+            const row1 = clampSplitFr(saved.row1);
+            setSplitVar("--row1-fr", row1);
+            setSplitVar("--row2-fr", 100 - row1);
+          }
+        } catch {
+          // Ignore corrupt/unavailable storage - defaults already apply.
+        }
+      }
+
+      function setupSplitter(handle, { axis, varName, otherVarName, sizeProp }) {
+        handle.addEventListener("pointerdown", (event) => {
+          event.preventDefault();
+          handle.setPointerCapture(event.pointerId);
+          handle.classList.add("active");
+          const layout = document.querySelector(".layout");
+          const totalPx = layout.getBoundingClientRect()[sizeProp];
+          const startPos = axis === "x" ? event.clientX : event.clientY;
+          const startFr = getSplitVar(varName, 50);
+
+          const onMove = (moveEvent) => {
+            const pos = axis === "x" ? moveEvent.clientX : moveEvent.clientY;
+            const deltaFr = ((pos - startPos) / totalPx) * 100;
+            const nextFr = clampSplitFr(startFr + deltaFr);
+            setSplitVar(varName, nextFr);
+            setSplitVar(otherVarName, 100 - nextFr);
+          };
+          const onUp = () => {
+            handle.classList.remove("active");
+            handle.releasePointerCapture(event.pointerId);
+            document.removeEventListener("pointermove", onMove);
+            document.removeEventListener("pointerup", onUp);
+            saveLayoutSplit();
+          };
+          document.addEventListener("pointermove", onMove);
+          document.addEventListener("pointerup", onUp);
+        });
+      }
+
+      restoreLayoutSplit();
+      setupSplitter(el("colSplitter"), {
+        axis: "x",
+        varName: "--col1-fr",
+        otherVarName: "--col2-fr",
+        sizeProp: "width",
+      });
+      setupSplitter(el("rowSplitter"), {
+        axis: "y",
+        varName: "--row1-fr",
+        otherVarName: "--row2-fr",
+        sizeProp: "height",
+      });
+
       el("addBtn").onclick = () =>
         openNodeModal("Add Child", { name: "New node" }, {}, async (data, weights) => {
           await api("/api/manual/create_child", {
@@ -758,27 +927,73 @@
           [
             { name: "address", label: "Peer address", value: "http://127.0.0.1:8002" },
             { name: "topic", label: "Topic UUID", value: selectedUuid || "" },
+            {
+              name: "readOnly",
+              label: "read-only",
+              type: "checkbox",
+            },
           ],
           async (form) => {
+            const readOnly = form.get("readOnly") === "on";
             await api("/api/manual/invite", {
               address: form.get("address").trim(),
               topic_uuid: form.get("topic").trim(),
+              read_only: readOnly,
             });
-            log("Invite sent");
+            log(readOnly ? "Read-only invite sent" : "Invite sent");
+          },
+        );
+
+      el("buildTokenBtn").onclick = () =>
+        openModal(
+          "Build token for topic",
+          [
+            { name: "address", label: "Peer address", value: "http://127.0.0.1:8001" },
+            { name: "topic", label: "Topic UUID (the board's top topic)", value: "" },
+            {
+              name: "readOnly",
+              label: "read-only",
+              type: "checkbox",
+            },
+          ],
+          async (form) => {
+            const address = form.get("address").trim();
+            const topicUuid = form.get("topic").trim();
+            if (!topicUuid) throw new Error("Topic UUID is required");
+            const readOnly = form.get("readOnly") === "on";
+            const token = encodeConnectToken(address, [topicUuid]);
+            await navigator.clipboard.writeText(token);
+            await api(readOnly ? "/api/observe_topic" : "/api/join_discussion", {
+              address,
+              topic_uuids: [topicUuid],
+            });
+            log(
+              readOnly
+                ? "Token copied - watching read-only"
+                : "Token copied and perspective fetched - watch the tree for changes over time",
+            );
           },
         );
 
       el("connectTokenBtn").onclick = () =>
         openModal(
           "Connect via token",
-          [{ name: "token", label: "Invitation token", multiline: true }],
+          [
+            { name: "token", label: "Invitation token", multiline: true },
+            {
+              name: "readOnly",
+              label: "read-only",
+              type: "checkbox",
+            },
+          ],
           async (form) => {
             const payload = decodeConnectToken(form.get("token"));
-            await api("/api/join_discussion", {
+            const readOnly = form.get("readOnly") === "on";
+            await api(readOnly ? "/api/observe_topic" : "/api/join_discussion", {
               address: payload.address,
               topic_uuids: payload.topic_uuids,
             });
-            log("Connected");
+            log(readOnly ? "Watching perspective (read-only)" : "Connected");
           },
         );
 

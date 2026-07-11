@@ -35,6 +35,10 @@ class ManualLogic:
                 addr: tree.to_dict() if tree else None
                 for addr, tree in sorted(self.session.peer_perspectives.items())
             },
+            "observed_topics": {
+                addr: sorted(topics)
+                for addr, topics in sorted(self.session.observed_topics.items())
+            },
         }
 
     def start_discussion(self, topic_uuid: str) -> SessionResult:
@@ -108,6 +112,7 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
                 runtime.adapter.invite_to_discuss,
                 data["address"].strip().rstrip("/"),
                 topic_uuid,
+                read_only=bool(data.get("read_only")),
             )
             if invite.get("status") == "ok":
                 runtime.notify_change()

@@ -12,6 +12,7 @@ Offered API:
   execute_effects(effects)
   fetch_subtree(peer_addr, node_uuid)
   join_discussion(peer_addr, topic_uuid)
+  observe_topic(peer_addr, topic_uuid)
   invite_to_discuss(peer_addr, topic_uuid)
   leave_discussion()
   p2p_ping(payload)
@@ -320,7 +321,6 @@ class HttpTransportAdapter:
                     "from_addr": self.session.address,
                     "topic_uuid": topic_uuids[0],
                     "topic_uuids": topic_uuids,
-                    "known_members": sorted(self.session.members),
                     "topic_members": self.session.topic_members_by_topic(topic_uuids),
                 },
                 timeout=10,
@@ -336,7 +336,9 @@ class HttpTransportAdapter:
         except Exception as exc:
             return {"status": "error", "reason": str(exc)}
 
-        topic_members = self._response_topic_members(response, topic_uuids)
+        topic_members = self.session.topic_members_from_map(
+            response.get("topic_members") or {}, topic_uuids,
+        )
         all_members = set()
         for topic_uuid, members in topic_members.items():
             for member in members:
@@ -371,8 +373,45 @@ class HttpTransportAdapter:
             },
         }
 
+    def observe_topic(self, peer_addr: str, topic_uuid: str | None = None,
+                      topic_uuids: list[str] | None = None) -> dict:
+        # Read-only counterpart to join_discussion: caches the peer's
+        # subtree (peer_perspectives only, never merged into our own tree)
+        # and never calls /p2p/join, so the target never learns we exist
+        # and never expects anything back from us - no membership, no
+        # adopting, no ping/sync obligations either direction.
+        topic_uuids = self._topic_uuids(topic_uuid, topic_uuids)
+        if not topic_uuids:
+            return {"status": "error", "reason": "topic_uuid is required"}
+        peer_addr = peer_addr.rstrip("/")
+        self.trace.event(
+            "transport.observe_topic",
+            peer_addr=peer_addr,
+            topic_uuids=topic_uuids,
+        )
+        try:
+            for uuid in topic_uuids:
+                tree_payload = self.fetch_subtree(peer_addr, uuid)
+                tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
+                self.session.apply_peer_subtree(
+                    peer_addr,
+                    tree,
+                    tree_payload.get("parent_uuid"),
+                )
+                self.session.watch_topic(peer_addr, uuid)
+        except TransportHttpError as exc:
+            return {
+                "status": "error",
+                "reason": str(exc),
+                "remote_status": exc.status_code,
+            }
+        except Exception as exc:
+            return {"status": "error", "reason": str(exc)}
+        return {"status": "ok", "topic_uuids": topic_uuids}
+
     def invite_to_discuss(self, peer_addr: str, topic_uuid: str | None = None,
-                          topic_uuids: list[str] | None = None) -> dict:
+                          topic_uuids: list[str] | None = None,
+                          read_only: bool = False) -> dict:
         topic_uuids = self._topic_uuids(topic_uuid, topic_uuids)
         if not topic_uuids:
             return {"status": "error", "reason": "topic_uuid is required"}
@@ -380,10 +419,16 @@ class HttpTransportAdapter:
             "transport.invite_to_discuss",
             peer_addr=peer_addr,
             topic_uuids=topic_uuids,
+            read_only=read_only,
         )
+        # A read-only invite asks the invitee's own server to observe us
+        # (cache-only, never becomes our peer) instead of fully joining -
+        # same distinction as observe_topic vs join_discussion, just
+        # initiated by us instead of them.
+        target_path = "/api/observe_topic" if read_only else "/api/join_discussion"
         try:
             response = self.http.post_json(
-                self._url(peer_addr, "/api/join_discussion"),
+                self._url(peer_addr, target_path),
                 {
                     "address": self.session.address,
                     "topic_uuid": topic_uuids[0],
@@ -603,17 +648,6 @@ class HttpTransportAdapter:
         if topic_uuid:
             values.append(topic_uuid)
         return sorted(str(value) for value in set(values) if value)
-
-    @staticmethod
-    def _response_topic_members(
-            response: dict,
-            topic_uuids: list[str]) -> dict[str, set[str]]:
-        topic_members = response.get("topic_members") or {}
-        fallback_members = response.get("members", [])
-        return {
-            topic_uuid: set(topic_members.get(topic_uuid) or fallback_members)
-            for topic_uuid in topic_uuids
-        }
 
     @staticmethod
     def _is_not_found(error: Exception) -> bool:

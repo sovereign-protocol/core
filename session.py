@@ -10,6 +10,8 @@ Offered API:
   handle_announce(message)
   handle_leave(message)
   apply_peer_subtree(peer_addr, subtree, parent_uuid)
+  watch_topic(peer_addr, topic_uuid)
+  unwatch_topic(peer_addr, topic_uuid)
   leave()
   get_network_info()
   protocol operation wrappers: create_child, modify, delete, copy, move,
@@ -111,10 +113,107 @@ class Session:
         self.peer_sync_state: dict[str, dict[str, Any]] = {}
         self.active_topic_uuids: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
+        # Read-only observation: addresses/topics we poll for their cached
+        # perspective only. Deliberately kept separate from
+        # members/peer_topic_sets - an observed address is never a peer, so
+        # it's invisible to health checks, network info, and sync effects.
+        self.observed_topics: dict[str, set[str]] = {}
 
     @property
     def active_topic_uuid(self) -> str | None:
         return sorted(self.active_topic_uuids)[0] if self.active_topic_uuids else None
+
+    # Identity - a session-owned meta-topic. Any app gets "who am I"/"who is
+    # this peer" for free through these, instead of reimplementing its own
+    # profile node and lookup logic.
+
+    def _folder(self, parent: PRSPNode, name: str,
+               node_type: str = "folder") -> PRSPNode:
+        for child in parent.children:
+            if child.data.get("name") == name and child.data.get("type") in ("folder", node_type):
+                return child
+        return self.create_child(parent.uuid, {"type": node_type, "name": name}, {}).value
+
+    @property
+    def identity(self) -> PRSPNode:
+        container = self._folder(self.protocol.root, "shared_user_data")
+        for child in container.children:
+            if (child.data.get("type") == "shared_user_profile"
+                    and child.data.get("address") == self.address):
+                return self._ensure_identity_defaults(child)
+        return self.create_child(
+            container.uuid,
+            {
+                "type": "shared_user_profile",
+                "name": "public_profile",
+                "address": self.address,
+                "display_name": "",
+                "picture": "",
+            },
+            {},
+        ).value
+
+    def _ensure_identity_defaults(self, node: PRSPNode) -> PRSPNode:
+        data = dict(node.data)
+        changed = False
+        if data.get("type") != "shared_user_profile":
+            data["type"] = "shared_user_profile"
+            changed = True
+        if data.get("name") != "public_profile":
+            data["name"] = "public_profile"
+            changed = True
+        if not data.get("address"):
+            data["address"] = self.address
+            changed = True
+        if "display_name" not in data:
+            data["display_name"] = ""
+            changed = True
+        if "picture" not in data:
+            data["picture"] = ""
+            changed = True
+        if changed:
+            self.modify(node.uuid, data, node.weights)
+            return self.get_node(node.uuid) or node
+        return node
+
+    def set_identity(self, display_name: str, picture: str = "") -> SessionResult:
+        profile = self.identity
+        data = dict(profile.data)
+        data.update({
+            "type": "shared_user_profile",
+            "address": self.address,
+            "name": "public_profile",
+            "display_name": display_name or "",
+            "picture": picture or "",
+        })
+        return self.modify(profile.uuid, data, profile.weights)
+
+    def find_peer_identity(self, address: str) -> PRSPNode | None:
+        for tree in self.peer_perspectives.values():
+            found = self._find_identity_in_tree(tree, address)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def _find_identity_in_tree(node: PRSPNode | None,
+                               address: str | None = None) -> PRSPNode | None:
+        if not node:
+            return None
+        if (node.data.get("type") == "shared_user_profile"
+                and (address is None or node.data.get("address") == address)):
+            return node
+        for child in node.children:
+            found = Session._find_identity_in_tree(child, address)
+            if found:
+                return found
+        return None
+
+    @staticmethod
+    def is_identity_node(node: PRSPNode | None) -> bool:
+        if not node:
+            return False
+        return node.data.get("type") == "shared_user_profile"
 
     # Read-only protocol access / persistence
 
@@ -162,7 +261,6 @@ class Session:
         self.peer_topics.setdefault(peer_addr, topic_uuid)
         self.peer_status.setdefault(peer_addr, self._new_peer_status())
         self.peer_sync_state.setdefault(peer_addr, self._new_peer_sync_state())
-        self.active_topic_uuids.add(topic_uuid)
 
     def add_peer_topics(self, peer_addr: str, topic_uuids: list[str] | set[str],
                         fetch_from_peer: bool = True) -> None:
@@ -206,6 +304,14 @@ class Session:
         return {
             topic_uuid: sorted(self.topic_members(topic_uuid))
             for topic_uuid in sorted(set(topic_uuids))
+        }
+
+    @staticmethod
+    def topic_members_from_map(topic_members: dict,
+                               topic_uuids: list[str]) -> dict[str, set[str]]:
+        return {
+            topic_uuid: set(topic_members.get(topic_uuid, []))
+            for topic_uuid in topic_uuids
         }
 
     def accept_topic_invitation(self, tree: PRSPNode,
@@ -254,6 +360,7 @@ class Session:
         self.peer_perspectives.clear()
         self.peer_status.clear()
         self.peer_sync_state.clear()
+        self.observed_topics.clear()
         self.active_topic_uuids.clear()
         return SessionResult("ok", effects=effects)
 
@@ -270,6 +377,7 @@ class Session:
         self.peer_perspectives.clear()
         self.peer_status.clear()
         self.peer_sync_state.clear()
+        self.observed_topics.clear()
         self.active_topic_uuids.clear()
         return SessionResult("ok", effects=effects)
 
@@ -414,8 +522,9 @@ class Session:
         from_addr = message.get("from_addr")
         topic_uuids = self._message_topic_uuids(message)
         pull_topic_uuids = message.get("pull_topic_uuids") or topic_uuids
-        topic_members = message.get("topic_members") or {}
-        legacy_known_members = set(message.get("known_members") or [])
+        topic_members = self.topic_members_from_map(
+            message.get("topic_members") or {}, topic_uuids,
+        )
         if not from_addr:
             return SessionResult("error", reason="missing from_addr")
         if not topic_uuids:
@@ -429,8 +538,7 @@ class Session:
                 fetch_from_peer=topic_uuid in pull_topic_set,
             )
         for topic_uuid in topic_uuids:
-            members = set(topic_members.get(topic_uuid) or legacy_known_members)
-            for member in sorted(members):
+            for member in sorted(topic_members.get(topic_uuid, set())):
                 if member == self.address:
                     continue
                 self.add_peer(
@@ -662,6 +770,29 @@ class Session:
             return None
         node = self._find_in_tree(tree, node_uuid)
         return PRSPNode.from_dict(node.to_dict()) if node else None
+
+    def watch_topic(self, peer_addr: str, topic_uuid: str) -> None:
+        self.observed_topics.setdefault(peer_addr, set()).add(topic_uuid)
+
+    def unwatch_topic(self, peer_addr: str, topic_uuid: str) -> bool:
+        topics = self.observed_topics.get(peer_addr)
+        if not topics or topic_uuid not in topics:
+            return False
+        topics.discard(topic_uuid)
+        if not topics:
+            self.observed_topics.pop(peer_addr, None)
+            # Only drop the cached perspective if nothing else still needs
+            # it (a real peer relationship for a different topic keeps it).
+            if peer_addr not in self.peer_topic_sets:
+                self.peer_perspectives.pop(peer_addr, None)
+        return True
+
+    def observed_topic_pairs(self) -> list[tuple[str, str]]:
+        return sorted(
+            (peer_addr, topic_uuid)
+            for peer_addr, topic_uuids in self.observed_topics.items()
+            for topic_uuid in topic_uuids
+        )
 
     def analyze_peer_transitions(self, peer_addr: str,
                                  node_uuid: str | None = None) -> list[dict]:
@@ -1133,8 +1264,19 @@ class Session:
                                  peer_node: PRSPNode | None,
                                  is_topic_root: bool = False) -> dict:
         if not local_node:
+            # A node that only the peer still has, and only as a tombstone,
+            # isn't something to adopt - both sides already agree there's
+            # nothing live here. Without this, a deleted node that has been
+            # pruned locally keeps reappearing as "missing" every time the
+            # peer's cache is compared, so auto-adopt re-materializes the
+            # tombstone only for the next prune pass to remove it again -
+            # an endless adopt/prune churn.
+            if peer_node.deleted:
+                return self._transition_event("in_agreement", peer_addr, None, peer_node)
             return self._transition_event("local_missing_node", peer_addr, None, peer_node)
         if not peer_node:
+            if local_node.deleted:
+                return self._transition_event("in_agreement", peer_addr, local_node, None)
             return self._transition_event("peer_missing_node", peer_addr, local_node, None)
 
         # A topic's own root node is grafted at a different parent in every

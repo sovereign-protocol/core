@@ -136,19 +136,24 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
 
-    def test_handle_join_tracks_known_members_and_returns_pull_effects(self):
+    def test_handle_join_ignores_unrelated_members_without_topic_backing(self):
+        # A join request that only names "si-c" via an unrelated/legacy
+        # global member list - not per-topic topic_members - must not
+        # register si-c against this topic. There's no real member data for
+        # topic-1 beyond the joiner itself, and treating an absent topic key
+        # as "fall back to some other list" is exactly the bug that let a
+        # peer from an unrelated topic leak into this one.
         session = Session("si-a")
 
         result = session.handle_join({
             "from_addr": "si-b",
             "topic_uuid": "topic-1",
-            "known_members": ["si-c"],
         })
 
         self.assertEqual(result.status, "ok")
-        self.assertEqual(session.members, {"si-a", "si-b", "si-c"})
+        self.assertEqual(session.members, {"si-a", "si-b"})
         self.assertEqual(session.peer_topics["si-b"], "topic-1")
-        self.assertEqual(session.peer_topics["si-c"], "topic-1")
+        self.assertNotIn("si-c", session.peer_topics)
         self.assertEqual(
             [(effect.type, effect.target, effect.payload["node_uuid"])
              for effect in result.effects],
@@ -565,6 +570,60 @@ class SessionTests(unittest.TestCase):
             ],
         )
 
+    def test_watch_topic_tracks_pairs_independently_of_membership(self):
+        session = Session("si-a")
+
+        session.watch_topic("si-b", "topic-1")
+        session.watch_topic("si-b", "topic-2")
+        session.watch_topic("si-c", "topic-1")
+
+        self.assertEqual(
+            session.observed_topic_pairs(),
+            [("si-b", "topic-1"), ("si-b", "topic-2"), ("si-c", "topic-1")],
+        )
+        self.assertNotIn("si-b", session.members)
+        self.assertNotIn("si-b", session.peer_topic_sets)
+
+    def test_unwatch_topic_stops_tracking_and_drops_unused_cache(self):
+        session = Session("si-a")
+        peer_topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
+        session.watch_topic("si-b", "topic-1")
+        session.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer_topic.to_dict()),
+            session.protocol.root.uuid,
+        )
+
+        removed = session.unwatch_topic("si-b", "topic-1")
+
+        self.assertTrue(removed)
+        self.assertEqual(session.observed_topics, {})
+        # Nothing else needs si-b's cache, so it's cleaned up too.
+        self.assertNotIn("si-b", session.peer_perspectives)
+
+    def test_unwatch_topic_keeps_cache_if_still_a_real_peer(self):
+        session = Session("si-a")
+        session.watch_topic("si-b", "topic-1")
+        session.add_peer("si-b", "topic-2")
+        session.peer_perspectives["si-b"] = session.protocol.root
+
+        session.unwatch_topic("si-b", "topic-1")
+
+        self.assertIn("si-b", session.peer_perspectives)
+
+    def test_unwatch_topic_returns_false_when_not_watching(self):
+        session = Session("si-a")
+
+        self.assertFalse(session.unwatch_topic("si-b", "topic-1"))
+
+    def test_leave_clears_observed_topics(self):
+        session = Session("si-a")
+        session.watch_topic("si-b", "topic-1")
+
+        session.leave()
+
+        self.assertEqual(session.observed_topics, {})
+
     def test_leave_topic_removes_only_that_topic(self):
         session = Session("si-a")
         session.add_peer("si-b", "topic-1")
@@ -597,6 +656,56 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertIn("si-b", session.members)
         self.assertEqual(session.peer_topic_sets["si-b"], {"topic-2"})
+
+    def test_identity_is_lazily_created_and_stable(self):
+        # No KanbanLogic/app involved at all - identity is a Session-owned
+        # meta-topic, so any app (or none) gets it for free.
+        session = Session("si-a")
+
+        profile = session.identity
+
+        self.assertEqual(profile.data["type"], "shared_user_profile")
+        self.assertEqual(profile.data["address"], "si-a")
+        self.assertEqual(profile.data["display_name"], "")
+        self.assertEqual(session.identity.uuid, profile.uuid)
+
+    def test_set_identity_updates_display_fields(self):
+        session = Session("si-a")
+
+        result = session.set_identity("Alice", "https://example.test/a.png")
+
+        self.assertEqual(result.status, "ok")
+        profile = session.identity
+        self.assertEqual(profile.data["display_name"], "Alice")
+        self.assertEqual(profile.data["picture"], "https://example.test/a.png")
+
+    def test_find_peer_identity_searches_cached_peer_perspectives(self):
+        session = Session("si-a")
+        peer_profile = PRSPNode({
+            "type": "shared_user_profile",
+            "name": "public_profile",
+            "address": "si-b",
+            "display_name": "Bob",
+            "picture": "",
+        })
+        peer_profile.refresh_hashes()
+        session.peer_perspectives["si-b"] = peer_profile
+
+        found = session.find_peer_identity("si-b")
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.data["display_name"], "Bob")
+        self.assertIsNone(session.find_peer_identity("si-c"))
+
+    def test_is_identity_node(self):
+        session = Session("si-a")
+
+        self.assertTrue(session.is_identity_node(session.identity))
+        other = session.create_child(
+            session.protocol.root.uuid, {"type": "folder", "name": "x"}, {},
+        ).value
+        self.assertFalse(session.is_identity_node(other))
+        self.assertFalse(session.is_identity_node(None))
 
 if __name__ == "__main__":
     unittest.main()

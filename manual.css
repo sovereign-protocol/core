@@ -13,6 +13,10 @@
   --shadow: 0 1px 3px rgba(20, 30, 40, 0.12);
   --topbar-height: 0px;
   --statusbar-space: 92px;
+  --col1-fr: 62;
+  --col2-fr: 38;
+  --row1-fr: 74;
+  --row2-fr: 26;
 }
 
 * {
@@ -26,7 +30,12 @@ body {
   min-height: 100vh;
   background: var(--bg);
   color: var(--text);
-  font: 14px/1.4 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font:
+    14px/1.4 system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
 }
 
 body.busy {
@@ -162,12 +171,84 @@ button:hover {
 
 .layout {
   display: grid;
-  grid-template-columns: minmax(0, 1fr) minmax(310px, 38vw);
-  grid-template-rows: minmax(0, 1fr) minmax(96px, 22vh);
-  gap: 14px;
+  grid-template-columns:
+    minmax(120px, calc(var(--col1-fr) * 1% - 3px))
+    6px
+    minmax(120px, calc(var(--col2-fr) * 1% - 3px));
+  grid-template-rows:
+    minmax(160px, calc(var(--row1-fr) * 1% - 3px))
+    6px
+    minmax(80px, calc(var(--row2-fr) * 1% - 3px));
+  gap: 0;
   height: calc(100vh - var(--topbar-height) - var(--statusbar-space));
   padding: 14px;
   overflow: hidden;
+}
+
+.main-panel {
+  grid-column: 1;
+  grid-row: 1;
+  margin: 0 7px 7px 0;
+}
+.side-panel {
+  grid-column: 3;
+  grid-row: 1;
+  margin: 0 0 7px 7px;
+}
+.detail-panel-local {
+  grid-column: 1;
+  grid-row: 3;
+  margin: 7px 7px 0 0;
+}
+.detail-panel-peer {
+  grid-column: 3;
+  grid-row: 3;
+  margin: 7px 0 0 7px;
+}
+
+.splitter {
+  position: relative;
+  z-index: 5;
+  background: transparent;
+  touch-action: none;
+}
+
+.splitter::after {
+  content: "";
+  position: absolute;
+  background: var(--line);
+  border-radius: 3px;
+}
+
+.splitter-v {
+  grid-column: 2;
+  grid-row: 1 / 4;
+  cursor: col-resize;
+}
+
+.splitter-v::after {
+  top: 0;
+  bottom: 0;
+  left: 2px;
+  width: 2px;
+}
+
+.splitter-h {
+  grid-column: 1 / 4;
+  grid-row: 2;
+  cursor: row-resize;
+}
+
+.splitter-h::after {
+  left: 0;
+  right: 0;
+  top: 2px;
+  height: 2px;
+}
+
+.splitter:hover::after,
+.splitter.active::after {
+  background: var(--accent);
 }
 
 .panel {
@@ -185,6 +266,47 @@ button:hover {
 .main-panel,
 .side-panel {
   min-height: 0;
+}
+
+.side-panel {
+  grid-template-rows: auto auto minmax(0, 1fr);
+}
+
+.observed-topics {
+  display: grid;
+  gap: 4px;
+  padding: 0 10px;
+}
+
+.observed-topics:empty {
+  padding: 0;
+}
+
+.observed-topic-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px dashed var(--line);
+  border-radius: 6px;
+  margin-bottom: 6px;
+  background: #fbfcfe;
+  font-size: 12px;
+}
+
+.observed-topic-label {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--muted);
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.observed-topic-row button {
+  min-height: 24px;
+  padding: 2px 8px;
+  font-size: 12px;
 }
 
 .panel-head {
@@ -271,7 +393,7 @@ button:hover {
 .node-row {
   position: relative;
   display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: center;
   gap: 8px;
   min-height: 38px;
@@ -279,6 +401,29 @@ button:hover {
   border: 1px solid var(--line);
   border-radius: 6px;
   background: #fff;
+}
+
+.node-toggle {
+  min-width: 22px;
+  min-height: 22px;
+  padding: 0;
+  margin-left: 6px;
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  background: #fff;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.node-toggle:hover {
+  background: #f4fbfc;
+  color: var(--text);
+}
+
+.node-toggle-empty {
+  visibility: hidden;
 }
 
 .node-row::before {
@@ -498,6 +643,16 @@ label {
   font-weight: 600;
 }
 
+label.checkbox-field {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+label.checkbox-field input {
+  width: auto;
+}
+
 input,
 textarea {
   width: 100%;
@@ -505,7 +660,12 @@ textarea {
   border-radius: 6px;
   padding: 8px 9px;
   color: var(--text);
-  font: 13px/1.45 system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  font:
+    13px/1.45 system-ui,
+    -apple-system,
+    BlinkMacSystemFont,
+    "Segoe UI",
+    sans-serif;
 }
 
 .kv-section {
@@ -588,6 +748,32 @@ menu {
   .layout {
     grid-template-columns: 1fr;
     grid-template-rows: minmax(0, 1fr) minmax(0, 1fr) 120px 120px;
+  }
+
+  .splitter {
+    display: none;
+  }
+
+  .main-panel,
+  .side-panel,
+  .detail-panel-local,
+  .detail-panel-peer {
+    grid-column: 1;
+    margin: 0 0 14px 0;
+  }
+
+  .main-panel {
+    grid-row: 1;
+  }
+  .side-panel {
+    grid-row: 2;
+  }
+  .detail-panel-local {
+    grid-row: 3;
+  }
+  .detail-panel-peer {
+    grid-row: 4;
+    margin-bottom: 0;
   }
 
   .main-panel,

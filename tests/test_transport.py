@@ -385,6 +385,7 @@ class TransportTests(unittest.TestCase):
         http.post_responses["http://b/p2p/join"] = {
             "status": "ok",
             "members": ["http://b", "http://c"],
+            "topic_members": {topic.uuid: ["http://b", "http://c"]},
         }
         peer_topic = PRSPNode.from_dict(topic.to_dict())
         peer_topic.data["name"] = "peer-topic"
@@ -449,6 +450,38 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(session.peer_topic_sets["http://c"], {topic_one.uuid})
         self.assertEqual(session.peer_topic_sets["http://d"], {topic_two.uuid})
 
+    def test_observe_topic_caches_perspective_without_becoming_a_peer(self):
+        session = Session("http://a")
+        http = FakeHttpClient()
+        adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
+        topic = PRSPNode({"name": "topic"})
+        http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
+            "subtree": topic.to_dict(),
+            "parent_uuid": None,
+        }
+
+        result = adapter.observe_topic("http://b", topic.uuid)
+
+        self.assertEqual(result["status"], "ok")
+        cached = session.get_cached_peer_subtree("http://b", topic.uuid)
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.data["name"], "topic")
+        # The whole point: no /p2p/join call, no membership, no active
+        # topic registration - the target never learns we exist.
+        self.assertEqual(http.posts, [])
+        self.assertNotIn("http://b", session.members)
+        self.assertNotIn(topic.uuid, session.active_topic_uuids)
+        self.assertNotIn("http://b", session.peer_topic_sets)
+        self.assertEqual(session.observed_topics, {"http://b": {topic.uuid}})
+
+    def test_observe_topic_requires_a_topic(self):
+        session = Session("http://a")
+        adapter = HttpTransportAdapter(session, FakeHttpClient(), logger=lambda _: None)
+
+        result = adapter.observe_topic("http://b")
+
+        self.assertEqual(result["status"], "error")
+
     def test_leave_discussion_executes_leave_effects(self):
         session = Session("http://a")
         session.add_peer("http://b", "topic")
@@ -475,6 +508,25 @@ class TransportTests(unittest.TestCase):
         self.assertEqual(result["status"], "error")
         self.assertEqual(result["reason"], "remote failed")
         self.assertEqual(result["remote_status"], 500)
+
+    def test_invite_to_discuss_targets_join_discussion_by_default(self):
+        session = Session("http://a")
+        http = FakeHttpClient()
+        adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
+
+        adapter.invite_to_discuss("http://b", "topic-1")
+
+        self.assertEqual(http.posts[0][0], "http://b/api/join_discussion")
+
+    def test_invite_to_discuss_read_only_targets_observe_topic_instead(self):
+        session = Session("http://a")
+        http = FakeHttpClient()
+        adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
+
+        adapter.invite_to_discuss("http://b", "topic-1", read_only=True)
+
+        self.assertEqual(http.posts[0][0], "http://b/api/observe_topic")
+        self.assertEqual(http.posts[0][1]["address"], "http://a")
 
 
 if __name__ == "__main__":
