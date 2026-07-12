@@ -54,6 +54,30 @@ button.danger {
   stroke-linejoin: round;
 }
 
+/* Toggleable participant-picker pills, used by both apps' card-edit
+   modals. Colors are page-specific (each page supplies its own
+   .user-choice border/background/color); the selected state uses the
+   shared teal accent everywhere. */
+.user-picker {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.user-choice {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  border-radius: 16px;
+  padding: 2px 8px 2px 3px;
+}
+
+.user-choice.selected {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+
 /* The standard row-level delete affordance: muted by default, reads as
    dangerous only on hover/focus rather than shouting all the time. */
 .delete-icon-btn {

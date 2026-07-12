@@ -23,6 +23,10 @@ const ICON_DELETE =
   '<path d="M4 7h16"></path><path d="M10 11v6"></path><path d="M14 11v6"></path>' +
   '<path d="M6 7l1 12a2 2 0 0 0 2 2h6a2 2 0 0 0 2-2l1-12"></path>' +
   '<path d="M9 7V4a1 1 0 0 1 1-1h4a1 1 0 0 1 1 1v3"></path>';
+const ICON_SHARE =
+  '<circle cx="18" cy="5" r="3"></circle><circle cx="6" cy="12" r="3"></circle>' +
+  '<circle cx="18" cy="19" r="3"></circle>' +
+  '<path d="M8.59 13.51 15.42 17.49"></path><path d="M15.41 6.51 8.59 10.49"></path>';
 
 function iconButton(svgInner, label, action) {
   const button = document.createElement("button");
