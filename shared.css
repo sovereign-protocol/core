@@ -1,0 +1,135 @@
+/*
+  Shared UI kit - loaded by every page before its own stylesheet, so
+  page-specific rules can still override where a real (theme) difference
+  is intentional. Only structural/interaction rules live here; page-owned
+  color tokens (surface/background/text) stay in each page's own CSS -
+  the two exceptions are --teal and --danger, which are the app's shared
+  accent/danger colors and are meant to be identical everywhere.
+*/
+
+:root {
+  --teal: #0f7a64;
+  --teal-soft: rgba(15, 122, 100, 0.22);
+  --danger: #8f2525;
+}
+
+button {
+  font: inherit;
+  border-radius: 6px;
+  min-height: 32px;
+  padding: 0 10px;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+button.primary {
+  background: var(--teal);
+  border-color: var(--teal);
+  color: #ffffff;
+}
+
+button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #ffffff;
+}
+
+.icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 32px;
+  min-height: 32px;
+  padding: 0;
+  flex: 0 0 auto;
+}
+
+.icon-svg {
+  width: 16px;
+  height: 16px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.8;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+
+/* The standard row-level delete affordance: muted by default, reads as
+   dangerous only on hover/focus rather than shouting all the time. */
+.delete-icon-btn {
+  color: var(--muted);
+}
+
+.delete-icon-btn:hover,
+.delete-icon-btn:focus-visible {
+  color: var(--danger);
+  border-color: var(--danger);
+}
+
+.confirm-text {
+  margin: 8px 0 0;
+  color: var(--muted);
+}
+
+dialog {
+  border-radius: 8px;
+  padding: 18px;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.35);
+}
+
+dialog::backdrop {
+  background: rgba(10, 12, 15, 0.5);
+}
+
+dialog input,
+dialog select,
+dialog textarea {
+  width: 100%;
+  border-radius: 6px;
+  padding: 8px;
+  font: inherit;
+}
+
+/* A standalone Delete button (if present) is pushed to the far left via the
+   auto-margin below; Cancel/Save (or whatever remains) stay right-aligned
+   as a natural flex cluster - works the same whether there are 2 or 3
+   buttons, no empty spacer element needed. Excluding :last-child keeps a
+   trailing .danger button (e.g. confirmModal's red "Confirm") grouped with
+   its neighbors instead of being isolated to the left. */
+dialog menu {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 8px;
+  margin: 12px 0 0;
+  padding: 0;
+}
+
+dialog menu .danger:not(:last-child) {
+  margin-right: auto;
+}
+
+/* Floating, auto-dismissing action feedback - shown/hidden purely by
+   whether it has text, so pages never need to manage a "hidden" class. */
+.toast {
+  position: fixed;
+  left: 16px;
+  bottom: 16px;
+  z-index: 1000;
+  min-width: 180px;
+  border-radius: 8px;
+  padding: 10px 14px;
+  font-size: 14px;
+  box-shadow: 0 14px 34px rgba(0, 0, 0, 0.24);
+  background: rgba(0, 86, 20, 0.9);
+  color: #19e137;
+}
+
+.toast:empty {
+  display: none;
+}
+
+.toast.error {
+  background: rgba(98, 14, 14, 0.92);
+  color: #ff9090;
+}
