@@ -15,7 +15,7 @@ Offered API:
   leave()
   get_network_info()
   protocol operation wrappers: create_child, modify, delete, copy, move,
-    reaffirm
+    set_perspective_state
 
 Used API:
   protocol.ProtocolState and protocol.PRSPNode only.
@@ -734,7 +734,7 @@ class Session:
         target.previous_hash = subtree.previous_hash
         target.previous_parent_uuid = subtree.previous_parent_uuid
         target.deleted = subtree.deleted
-        target.reaffirmed = subtree.reaffirmed
+        target.perspective_state = subtree.perspective_state
         target.weights = subtree.weights
         target.data = subtree.data
         target.children = subtree.children
@@ -880,18 +880,43 @@ class Session:
         )
         return self._operation_result(result, parent_uuid or node_uuid)
 
-    def reaffirm(self, node_uuid: str) -> SessionResult:
+    def set_perspective_state(self, node_uuid: str, state: str) -> SessionResult:
         node = self._protocol.index.get(node_uuid)
         old_state_hash = node.state_hash if node else None
-        result = self._protocol.reaffirm(node_uuid)
+        result = self._protocol.set_perspective_state(node_uuid, state)
         self.trace_event(
-            "protocol.reaffirm",
+            "protocol.set_perspective_state",
             node_uuid=node_uuid,
+            state=state,
             old_state_hash=old_state_hash,
             ok=result.ok,
             reason=result.reason,
         )
         return self._operation_result(result, node_uuid)
+
+    @staticmethod
+    def keep_mine_active(local_node: PRSPNode, peer_node: PRSPNode) -> bool:
+        # `pushed_back` is a standing decision - exempt from staleness so it
+        # survives further peer churn on purpose (see BACKLOG.md item 10).
+        if local_node.perspective_state == "pushed_back":
+            return True
+        if local_node.perspective_state != "kept_mine":
+            return False
+        # `kept_mine` is only ever a decision about *content* - if a move
+        # has appeared since (in either direction), the merged transition
+        # type can stay a clean "peer_made_changes" even though keep_mine
+        # never considered the move at all, so it must not mask it. See the
+        # worked example in BACKLOG.md item 10 for why this can't be folded
+        # into a single "does the hash chain still connect" check.
+        if Session._classify_move(local_node, peer_node) != "in_agreement":
+            return False
+        if Session._classify_content(local_node, peer_node) == "divergence":
+            return False
+        return True
+
+    @staticmethod
+    def peer_pushed_back(peer_node: PRSPNode | None) -> bool:
+        return bool(peer_node and peer_node.perspective_state == "pushed_back")
 
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self._protocol.copy(source_uuid, destination_uuid)
@@ -1334,6 +1359,10 @@ class Session:
             "node_uuid": node.uuid if node else None,
             "local_state_hash": local_node.state_hash if local_node else None,
             "peer_state_hash": peer_node.state_hash if peer_node else None,
+            "keep_mine_active": (
+                Session.keep_mine_active(local_node, peer_node)
+                if local_node and peer_node else None
+            ),
         }
 
     @staticmethod
@@ -1377,4 +1406,3 @@ class Session:
         for child in node.children:
             Session._refresh_tree_hashes(child)
         node.refresh_hashes()
-

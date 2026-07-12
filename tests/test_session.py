@@ -406,11 +406,11 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(events[0]["type"], "divergence")
 
-    def test_reaffirm_does_not_corrupt_classification_for_unrelated_peers(self):
-        # A edits and reaffirms (deciding to keep its own value against some
+    def test_keep_mine_does_not_corrupt_classification_for_unrelated_peers(self):
+        # A edits and keeps its own value against some
         # divergent peer). A separate, unrelated peer C who never touched
         # the node and is simply behind must still classify correctly - the
-        # reaffirm must not overwrite the true previous_hash history that
+        # keep_mine must not overwrite the true previous_hash history that
         # C's comparison depends on.
         a = Session("si-a")
         c = Session("si-c")
@@ -418,7 +418,7 @@ class SessionTests(unittest.TestCase):
         c.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
 
         a.modify(topic.uuid, {"name": "a-edit"}, {})
-        a.reaffirm(topic.uuid)
+        a.set_perspective_state(topic.uuid, "kept_mine")
 
         c.apply_peer_subtree(
             "si-a",
@@ -429,6 +429,104 @@ class SessionTests(unittest.TestCase):
         events = c.analyze_peer_transitions("si-a", topic.uuid)
 
         self.assertEqual(events[0]["type"], "peer_made_changes")
+
+    @staticmethod
+    def _node(state_hash, previous_hash, parent_uuid, previous_parent_uuid,
+              perspective_state="none"):
+        node = PRSPNode({"name": "x"})
+        node.state_hash = state_hash
+        node.previous_hash = previous_hash
+        node.parent_uuid = parent_uuid
+        node.previous_parent_uuid = previous_parent_uuid
+        node.perspective_state = perspective_state
+        return node
+
+    def test_keep_mine_active_stays_true_for_a_clean_untouched_keep_mine(self):
+        local_node = self._node("h0", "h0", "p", "p", perspective_state="kept_mine")
+        peer_node = self._node("h1", "h0", "p", "p")
+
+        self.assertTrue(Session.keep_mine_active(local_node, peer_node))
+
+    def test_keep_mine_active_goes_false_after_a_second_peer_content_edit(self):
+        # peer's previous_hash no longer reaches back to what local kept_mine
+        # against - the one-slot history can't reconstruct a clean chain, so
+        # classification degrades to divergence and the stale keep_mine must
+        # not keep masking it.
+        local_node = self._node("h0", "h0", "p", "p", perspective_state="kept_mine")
+        peer_node = self._node("h2", "h1", "p", "p")
+
+        self.assertFalse(Session.keep_mine_active(local_node, peer_node))
+
+    def test_keep_mine_active_goes_false_when_a_move_appears(self):
+        # Content is still a clean single step (peer_made_changes on its
+        # own), and so is the move on its own - _classify_node would merge
+        # these into a clean "peer_made_changes", never "divergence". A
+        # content-only keep_mine must still not mask a move it never
+        # considered - this is the case a single chain-connectivity check
+        # can't catch on its own (see BACKLOG.md item 10).
+        local_node = self._node("h0", "h0", "p1", "p1", perspective_state="kept_mine")
+        peer_node = self._node("h1", "h0", "p2", "p1")
+
+        self.assertFalse(Session.keep_mine_active(local_node, peer_node))
+
+    def test_keep_mine_active_ignores_state_when_state_is_none(self):
+        local_node = self._node("h0", "h0", "p", "p", perspective_state="none")
+        peer_node = self._node("h1", "h0", "p", "p")
+
+        self.assertFalse(Session.keep_mine_active(local_node, peer_node))
+
+    def test_pushed_back_stays_active_across_a_second_peer_content_edit(self):
+        local_node = self._node("h0", "h0", "p", "p", perspective_state="pushed_back")
+        peer_node = self._node("h2", "h1", "p", "p")
+
+        self.assertTrue(Session.keep_mine_active(local_node, peer_node))
+
+    def test_pushed_back_stays_active_when_a_move_appears(self):
+        local_node = self._node("h0", "h0", "p1", "p1", perspective_state="pushed_back")
+        peer_node = self._node("h1", "h0", "p2", "p1")
+
+        self.assertTrue(Session.keep_mine_active(local_node, peer_node))
+
+    def test_peer_pushed_back_reads_the_peers_own_state(self):
+        pushed_back_peer = self._node("h1", "h0", "p", "p", perspective_state="pushed_back")
+        kept_mine_peer = self._node("h1", "h0", "p", "p", perspective_state="kept_mine")
+
+        self.assertTrue(Session.peer_pushed_back(pushed_back_peer))
+        self.assertFalse(Session.peer_pushed_back(kept_mine_peer))
+        self.assertFalse(Session.peer_pushed_back(None))
+
+    def test_transition_event_carries_keep_mine_active_end_to_end(self):
+        # Proves the field is actually threaded through
+        # analyze_peer_transitions, not just correct in isolation.
+        local = Session("si-a")
+        peer = Session("si-b")
+        topic = peer.create_child(peer.protocol.root.uuid, {"name": "topic"}, {}).value
+        child = peer.create_child(topic.uuid, {"name": "child"}, {}).value
+        local.accept_topic_invitation(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict())
+        )
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        local_child_uuid = child.uuid
+        local.set_perspective_state(local_child_uuid, "kept_mine")
+
+        peer.modify(child.uuid, {"name": "peer changed"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        events = {
+            event["node_uuid"]: event
+            for event in local.analyze_peer_transitions("si-b", topic.uuid)
+        }
+
+        self.assertEqual(events[local_child_uuid]["type"], "peer_made_changes")
+        self.assertTrue(events[local_child_uuid]["keep_mine_active"])
 
     def test_apply_peer_subtree_update_propagates_deleted_flag_and_history(self):
         local = Session("si-a")

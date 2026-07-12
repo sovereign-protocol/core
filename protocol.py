@@ -31,6 +31,9 @@ from datetime import datetime, timezone
 from typing import Any
 
 
+PERSPECTIVE_STATES = ("none", "kept_mine", "pushed_back")
+
+
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
@@ -81,7 +84,7 @@ class PRSPNode:
         self.refresh_hashes()
         self.previous_hash = self.state_hash
         self.previous_parent_uuid = self.parent_uuid
-        self.reaffirmed = False
+        self.perspective_state = "none"
 
     def recompute_content_hash(self) -> str:
         return content_hash(
@@ -114,8 +117,11 @@ class PRSPNode:
     def live_children(self) -> list["PRSPNode"]:
         return [child for child in self.children if not child.deleted]
 
-    def is_reaffirmed(self) -> bool:
-        return self.reaffirmed
+    def is_kept_mine(self) -> bool:
+        return self.perspective_state == "kept_mine"
+
+    def is_pushed_back(self) -> bool:
+        return self.perspective_state == "pushed_back"
 
     def to_dict(self) -> dict:
         return {
@@ -126,7 +132,7 @@ class PRSPNode:
             "state_hash": self.state_hash,
             "previous_hash": self.previous_hash,
             "previous_parent_uuid": self.previous_parent_uuid,
-            "reaffirmed": self.reaffirmed,
+            "perspective_state": self.perspective_state,
             "weights": copy.deepcopy(self.weights),
             "data": copy.deepcopy(self.data),
             "parent_uuid": self.parent_uuid,
@@ -144,7 +150,8 @@ class PRSPNode:
         node.state_hash = payload["state_hash"]
         node.previous_hash = payload.get("previous_hash", payload["state_hash"])
         node.previous_parent_uuid = payload.get("previous_parent_uuid", payload.get("parent_uuid"))
-        node.reaffirmed = bool(payload.get("reaffirmed", False))
+        perspective_state = payload.get("perspective_state", "none")
+        node.perspective_state = perspective_state if perspective_state in PERSPECTIVE_STATES else "none"
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.data = copy.deepcopy(payload["data"])
         node.parent_uuid = payload.get("parent_uuid")
@@ -206,15 +213,17 @@ class ProtocolState:
         ok = self.delete_locked(node_uuid)
         return ProtocolResult(ok, ok, None if ok else "delete failed")
 
-    def reaffirm(self, node_uuid: str) -> ProtocolResult:
-        ok = self.reaffirm_locked(node_uuid)
-        return ProtocolResult(ok, ok, None if ok else "reaffirm failed")
+    def set_perspective_state(self, node_uuid: str, state: str) -> ProtocolResult:
+        ok = self.set_perspective_state_locked(node_uuid, state)
+        return ProtocolResult(ok, ok, None if ok else "set_perspective_state failed")
 
-    def reaffirm_locked(self, node_uuid: str) -> bool:
+    def set_perspective_state_locked(self, node_uuid: str, state: str) -> bool:
+        if state not in PERSPECTIVE_STATES:
+            return False
         node = self.index.get(node_uuid)
         if not node:
             return False
-        node.reaffirmed = not node.reaffirmed
+        node.perspective_state = state
         node.updated_at = now_iso()
         return True
 
@@ -305,7 +314,7 @@ class ProtocolState:
             node.refresh_hashes()
             if node.state_hash != old_state_hash:
                 node.previous_hash = old_state_hash
-                node.reaffirmed = False
+                node.perspective_state = "none"
             current_uuid = node.parent_uuid
 
     def clone_subtree(self, node: PRSPNode, parent_uuid: str | None) -> PRSPNode:
@@ -332,7 +341,7 @@ class ProtocolState:
         if not node.deleted:
             node.previous_hash = node.state_hash
             node.deleted = True
-            node.reaffirmed = False
+            node.perspective_state = "none"
             node.updated_at = now_iso()
         for child in node.children:
             self._mark_deleted_cascade(child)
@@ -355,11 +364,11 @@ class ProtocolState:
             child for child in old_parent.children if child.uuid != node.uuid
         ]
         # A same-parent call is a reorder, not a move: leave the one-slot
-        # move history (and any reaffirm) alone so a lagging peer can still
+        # move history (and any keep_mine) alone so a lagging peer can still
         # attribute the last real move.
         if node.parent_uuid != destination.uuid:
             node.previous_parent_uuid = node.parent_uuid
-            node.reaffirmed = False
+            node.perspective_state = "none"
         node.parent_uuid = destination.uuid
         node.updated_at = now_iso()
         insert_at = len(destination.children) if index is None else max(0, min(index, len(destination.children)))
