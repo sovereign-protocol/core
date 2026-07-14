@@ -74,6 +74,23 @@ Offered API:
     delete_topic(topic_uuid) -> SessionResult
       Storage/bookkeeping cleanup only (POST /api/relay/delete_topic) -
       never touches a peer's own already-adopted local board, if any.
+    write_presence() -> None
+      Heartbeat, called once per poll tick (app_server.py's
+      relay_poll_loop) regardless of whether any topic content changed -
+      head.json's own "updated_at" is ambiguous between "fine, nothing to
+      publish" and "stopped running," this isn't.
+    peer_liveness(peer_id) -> dict
+      {"state": "alive"|"stale"|"unknown", "last_seen_seconds_ago": float,
+      "threshold_seconds": float, "peer_poll_interval_seconds": float}.
+      Compares the peer's presence file's server-side mtime against our
+      own last write_presence() mtime - both readings come from the same
+      storage backend's clock, so this is skew-free between machines with
+      no explicit clock offset ever computed. "stale" means no heartbeat
+      within a margin over both sides' poll intervals, not a live
+      reachability check (relay has no such thing) - closer to a chat
+      app's "last seen" than an online/offline dot.
+    known_peer_identities() -> list[str]
+      Peers we've actually applied something from, per our own bookkeeping.
 
 Used API:
   kanban_logic.KanbanLogic (boards/user_profile only), protocol.PRSPNode,
@@ -99,7 +116,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from relay_storage import LocalFolderRelayStorage, SftpRelayStorage
+from relay_storage import LocalFolderRelayStorage, SftpRelayStorage, now_iso
 
 
 def _storage_fingerprint(config: dict) -> str:
@@ -137,12 +154,24 @@ def default_relay_state_file(config: dict, identity: str) -> str:
     )
 
 
+PRESENCE_LIVENESS_MARGIN = 2.0
+
+
 class RelayLogic:
     def __init__(self, session: Session, config: dict):
         self.session = session
         self.kanban = KanbanLogic(session, config)
         self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
         self.storage = self._build_storage(config)
+        self.poll_interval_seconds = float(config.get("relay_poll_interval_seconds", 3))
+        # Set on every write_presence() call to the storage backend's own
+        # server-side mtime for our own just-written heartbeat - this is
+        # "what does the server consider *now*", used as the reference
+        # point for peer_liveness() instead of this process's own wall
+        # clock. Comparing two server-reported mtimes (ours and a peer's)
+        # cancels out clock skew between machines entirely, with no
+        # explicit offset calculation needed - see peer_liveness().
+        self._own_presence_mtime: float | None = None
         self._state_path = config.get("relay_state_file") or default_relay_state_file(config, self.identity)
         self._state = self._load_state()
 
@@ -234,6 +263,57 @@ class RelayLogic:
         self._state["desired"] = sorted(desired)
         self._save_state()
         return SessionResult("ok", value=topic_uuids)
+
+    def write_presence(self) -> None:
+        # A heartbeat, written every poll tick regardless of whether any
+        # topic content changed - distinct from head.json's "updated_at"
+        # (which only moves when content changes, so silence there is
+        # ambiguous between "peer is fine, nothing to publish" and "peer
+        # stopped running"). Also refreshes _own_presence_mtime, the
+        # reference point peer_liveness() compares every peer's own
+        # heartbeat mtime against.
+        if not self.storage:
+            return
+        payload = {
+            "identity": self.identity,
+            "updated_at": now_iso(),
+            "poll_interval_seconds": self.poll_interval_seconds,
+        }
+        mtime = self.storage.write_presence(self.identity, payload)
+        if mtime is not None:
+            self._own_presence_mtime = mtime
+
+    def known_peer_identities(self) -> list[str]:
+        # Peers we've actually exchanged something with, per our own applied
+        # bookkeeping - a reasonable "who should I even be checking
+        # liveness for" set, without needing a separate identity registry.
+        return sorted({
+            peer_id
+            for peers in self._state.get("applied", {}).values()
+            for peer_id in peers
+        })
+
+    def peer_liveness(self, peer_id: str) -> dict:
+        if not self.storage or self._own_presence_mtime is None:
+            return {"state": "unknown"}
+        content, mtime = self.storage.read_presence_with_mtime(peer_id)
+        if content is None or mtime is None:
+            return {"state": "unknown"}
+        peer_interval = float(content.get("poll_interval_seconds") or self.poll_interval_seconds)
+        # Both mtimes come from the same server clock, so this difference
+        # is skew-free regardless of how far apart the two machines' own
+        # wall clocks actually are - no explicit offset ever computed or
+        # stored. A negative distance (their heartbeat is newer than our
+        # own last one) just means they're doing great; only a distance
+        # past the margin indicates they've gone quiet.
+        distance = self._own_presence_mtime - mtime
+        threshold = PRESENCE_LIVENESS_MARGIN * (self.poll_interval_seconds + peer_interval)
+        return {
+            "state": "alive" if distance <= threshold else "stale",
+            "last_seen_seconds_ago": round(distance, 3),
+            "threshold_seconds": round(threshold, 3),
+            "peer_poll_interval_seconds": peer_interval,
+        }
 
     def publish_due_topics(self) -> list[str]:
         if not self.storage:
@@ -331,6 +411,10 @@ class RelayLogic:
             "root": str(self.storage.root) if self.storage else None,
             "state_file": self._state_path,
             "desired": list(self._state.get("desired", [])),
+            "presence": {
+                peer_id: self.peer_liveness(peer_id)
+                for peer_id in self.known_peer_identities()
+            },
             "topics": {
                 topic_uuid: {
                     "published_hash": self._state["published"].get(topic_uuid),

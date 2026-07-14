@@ -11,7 +11,7 @@ Offered API:
   LocalFolderRelayStorage(root)
   SftpRelayStorage(host, username, remote_root, port=22, password=None,
                    private_key_path=None, private_key_passphrase=None)
-    Both implement the same six methods:
+    Both implement the same eight methods:
     write_snapshot(topic_uuid, peer_id, state_hash, payload)
     read_head(topic_uuid, peer_id) -> dict | None
     read_snapshot(topic_uuid, peer_id, state_hash) -> dict | None
@@ -21,6 +21,15 @@ Offered API:
       Removes the whole topic subtree (every peer's snapshots under it) -
       not scoped to one peer, since a topic is a shared mailbox namespace,
       not owned by whichever identity happens to publish under it.
+    write_presence(peer_id, payload) -> float | None
+      Writes a per-identity (not per-topic) heartbeat file and returns the
+      storage backend's own server-side mtime for it - the write and the
+      mtime read happen back to back deliberately, so a caller can use that
+      mtime as "what does the server consider *now*" without any separate
+      clock-sync step (see relay_logic.py's liveness design).
+    read_presence_with_mtime(peer_id) -> tuple[dict | None, float | None]
+      Content and server-side mtime together, in one call - reading them
+      separately would risk a race between the two.
 
 Used API:
   LocalFolderRelayStorage: Python standard library only.
@@ -31,6 +40,7 @@ Used API:
 Layout (identical on both backends):
   <root>/topics/<topic_uuid>/peers/<peer_id>/head.json
   <root>/topics/<topic_uuid>/peers/<peer_id>/snapshots/<state_hash>.json
+  <root>/identities/<peer_id>/presence.json
 
 SftpRelayStorage deliberately stores plaintext JSON, same as the local
 backend - no content encryption yet (MVP scope, agreed with the user: the
@@ -103,6 +113,20 @@ class LocalFolderRelayStorage:
         topic_dir = self.root / "topics" / topic_uuid
         if topic_dir.is_dir():
             shutil.rmtree(topic_dir)
+
+    def write_presence(self, peer_id: str, payload: dict) -> float | None:
+        path = self._presence_path(peer_id)
+        self._write_json(path, payload)
+        return path.stat().st_mtime
+
+    def read_presence_with_mtime(self, peer_id: str) -> tuple[dict | None, float | None]:
+        path = self._presence_path(peer_id)
+        if not path.is_file():
+            return None, None
+        return self._read_json(path), path.stat().st_mtime
+
+    def _presence_path(self, peer_id: str) -> Path:
+        return self.root / "identities" / peer_id / "presence.json"
 
     def _peer_dir(self, topic_uuid: str, peer_id: str) -> Path:
         return self.root / "topics" / topic_uuid / "peers" / peer_id
@@ -191,6 +215,30 @@ class SftpRelayStorage:
             else:
                 sftp.remove(full)
         sftp.rmdir(path)
+
+    def write_presence(self, peer_id: str, payload: dict) -> float | None:
+        path = self._presence_path(peer_id)
+        self._write_json(path, payload)
+        return self._stat_mtime(path)
+
+    def read_presence_with_mtime(self, peer_id: str) -> tuple[dict | None, float | None]:
+        path = self._presence_path(peer_id)
+        content = self._read_json(path)
+        if content is None:
+            return None, None
+        return content, self._stat_mtime(path)
+
+    def _presence_path(self, peer_id: str) -> str:
+        return posixpath.join(self.root, "identities", peer_id, "presence.json")
+
+    def _stat_mtime(self, path: str) -> float | None:
+        def operation(sftp):
+            try:
+                return sftp.stat(path).st_mtime
+            except FileNotFoundError:
+                return None
+
+        return self._with_retry(operation)
 
     def _peer_dir(self, topic_uuid: str, peer_id: str) -> str:
         return posixpath.join(self.root, "topics", topic_uuid, "peers", peer_id)
