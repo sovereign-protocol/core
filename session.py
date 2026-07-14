@@ -38,6 +38,7 @@ Transport contract:
 from __future__ import annotations
 
 import time
+import uuid as uuid_mod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
@@ -145,17 +146,21 @@ class Session:
 
     @property
     def identity(self) -> PRSPNode:
+        # The shared_user_data folder only ever holds this session's own
+        # identity node - no address match needed to find "mine" among
+        # others, unlike the old address-keyed lookup this replaced.
         container = self._folder(self.protocol.root, "shared_user_data")
         for child in container.children:
-            if (child.data.get("type") == "shared_user_profile"
-                    and child.data.get("address") == self.address):
+            if child.data.get("type") == "shared_user_profile":
                 return self._ensure_identity_defaults(child)
         return self.create_child(
             container.uuid,
             {
                 "type": "shared_user_profile",
                 "name": "public_profile",
-                "address": self.address,
+                "version": 1,
+                "identity_key": str(uuid_mod.uuid4()),
+                "email": "",
                 "display_name": "",
                 "picture": "",
             },
@@ -171,8 +176,14 @@ class Session:
         if data.get("name") != "public_profile":
             data["name"] = "public_profile"
             changed = True
-        if not data.get("address"):
-            data["address"] = self.address
+        if not data.get("version"):
+            data["version"] = 1
+            changed = True
+        if not data.get("identity_key"):
+            data["identity_key"] = str(uuid_mod.uuid4())
+            changed = True
+        if "email" not in data:
+            data["email"] = ""
             changed = True
         if "display_name" not in data:
             data["display_name"] = ""
@@ -185,35 +196,49 @@ class Session:
             return self.get_node(node.uuid) or node
         return node
 
-    def set_identity(self, display_name: str, picture: str = "") -> SessionResult:
+    def set_identity(self, display_name: str, picture: str = "",
+                     email: str | None = None) -> SessionResult:
         profile = self.identity
         data = dict(profile.data)
         data.update({
             "type": "shared_user_profile",
-            "address": self.address,
             "name": "public_profile",
             "display_name": display_name or "",
             "picture": picture or "",
         })
+        if email is not None:
+            data["email"] = email
         return self.modify(profile.uuid, data, profile.weights)
 
-    def find_peer_identity(self, address: str) -> PRSPNode | None:
+    def find_peer_identity(self, identity_key: str) -> PRSPNode | None:
+        # Searches across every cached peer perspective's values, not one
+        # peer's cache keyed by address - this is what lets identity survive
+        # a peer's address changing, since lookup never depends on which
+        # dict key the matching tree happens to be cached under.
         for tree in self.peer_perspectives.values():
-            found = self._find_identity_in_tree(tree, address)
+            found = self._find_identity_in_tree(tree, identity_key)
             if found:
                 return found
         return None
 
+    def peer_identity(self, peer_addr: str) -> PRSPNode | None:
+        # Address-scoped lookup: the bootstrap step for going from "a peer
+        # address we're tracking" to "their identity" - find_peer_identity
+        # alone can't do this once it's keyed by identity_key instead of
+        # address, since a bare address gives no identity_key to search for.
+        tree = self.peer_perspectives.get(peer_addr)
+        return self._find_identity_in_tree(tree) if tree else None
+
     @staticmethod
     def _find_identity_in_tree(node: PRSPNode | None,
-                               address: str | None = None) -> PRSPNode | None:
+                               identity_key: str | None = None) -> PRSPNode | None:
         if not node:
             return None
         if (node.data.get("type") == "shared_user_profile"
-                and (address is None or node.data.get("address") == address)):
+                and (identity_key is None or node.data.get("identity_key") == identity_key)):
             return node
         for child in node.children:
-            found = Session._find_identity_in_tree(child, address)
+            found = Session._find_identity_in_tree(child, identity_key)
             if found:
                 return found
         return None

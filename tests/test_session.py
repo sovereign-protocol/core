@@ -780,9 +780,14 @@ class SessionTests(unittest.TestCase):
         profile = session.identity
 
         self.assertEqual(profile.data["type"], "shared_user_profile")
-        self.assertEqual(profile.data["address"], "si-a")
+        self.assertEqual(profile.data["version"], 1)
+        self.assertTrue(profile.data["identity_key"])
+        self.assertEqual(profile.data["email"], "")
         self.assertEqual(profile.data["display_name"], "")
         self.assertEqual(session.identity.uuid, profile.uuid)
+        # identity_key is generated once and stays stable across repeated
+        # access, not regenerated on every lazy-create check.
+        self.assertEqual(session.identity.data["identity_key"], profile.data["identity_key"])
 
     def test_set_identity_updates_display_fields(self):
         session = Session("si-a")
@@ -794,23 +799,74 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(profile.data["display_name"], "Alice")
         self.assertEqual(profile.data["picture"], "https://example.test/a.png")
 
+    def test_set_identity_can_set_email_without_clearing_identity_key(self):
+        session = Session("si-a")
+        identity_key = session.identity.data["identity_key"]
+
+        session.set_identity("Alice", email="alice@example.test")
+
+        profile = session.identity
+        self.assertEqual(profile.data["email"], "alice@example.test")
+        self.assertEqual(profile.data["identity_key"], identity_key)
+
     def test_find_peer_identity_searches_cached_peer_perspectives(self):
         session = Session("si-a")
         peer_profile = PRSPNode({
             "type": "shared_user_profile",
             "name": "public_profile",
-            "address": "si-b",
+            "version": 1,
+            "identity_key": "key-b",
+            "email": "",
             "display_name": "Bob",
             "picture": "",
         })
         peer_profile.refresh_hashes()
         session.peer_perspectives["si-b"] = peer_profile
 
-        found = session.find_peer_identity("si-b")
+        found = session.find_peer_identity("key-b")
 
         self.assertIsNotNone(found)
         self.assertEqual(found.data["display_name"], "Bob")
-        self.assertIsNone(session.find_peer_identity("si-c"))
+        self.assertIsNone(session.find_peer_identity("key-c"))
+
+    def test_find_peer_identity_survives_address_change(self):
+        # The whole point of keying identity lookup by identity_key instead
+        # of address: the same identity, cached under two different
+        # peer_perspectives dict keys (simulating Bob reconnecting from a
+        # new address), must still resolve to one identity.
+        session = Session("si-a")
+        bob_v1 = PRSPNode({
+            "type": "shared_user_profile", "name": "public_profile",
+            "version": 1, "identity_key": "key-bob", "email": "",
+            "display_name": "Bob", "picture": "",
+        })
+        bob_v1.refresh_hashes()
+        session.peer_perspectives["old-address"] = bob_v1
+        bob_v2 = PRSPNode({
+            "type": "shared_user_profile", "name": "public_profile",
+            "version": 1, "identity_key": "key-bob", "email": "",
+            "display_name": "Bob", "picture": "",
+        })
+        bob_v2.refresh_hashes()
+        session.peer_perspectives["new-address"] = bob_v2
+
+        found = session.find_peer_identity("key-bob")
+
+        self.assertIsNotNone(found)
+        self.assertEqual(found.data["display_name"], "Bob")
+
+    def test_peer_identity_scoped_to_one_address(self):
+        session = Session("si-a")
+        bob = PRSPNode({
+            "type": "shared_user_profile", "name": "public_profile",
+            "version": 1, "identity_key": "key-bob", "email": "",
+            "display_name": "Bob", "picture": "",
+        })
+        bob.refresh_hashes()
+        session.peer_perspectives["addr-bob"] = bob
+
+        self.assertEqual(session.peer_identity("addr-bob").data["display_name"], "Bob")
+        self.assertIsNone(session.peer_identity("addr-nobody"))
 
     def test_is_identity_node(self):
         session = Session("si-a")
