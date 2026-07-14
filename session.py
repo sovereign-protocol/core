@@ -249,6 +249,18 @@ class Session:
         self.active_topic_uuids.add(topic_uuid)
         return SessionResult("ok", value=topic_uuid)
 
+    def note_relay_peer_topic(self, peer_addr: str, topic_uuid: str) -> None:
+        # Relay peers (peer_addr like "relay:<identity>") never go through
+        # add_peer - that would also add them to self.members, which
+        # pending_sync_effects/_sync_effects iterate to decide who to push
+        # real HTTP effects to, and a relay identity isn't HTTP-reachable at
+        # that address. But kanban_logic's auto-adopt gates candidates on
+        # peer_topic_sets (_peer_discusses_node) to know a cached peer
+        # perspective actually applies to a given topic - without this, a
+        # relay-sourced cache update would be silently invisible to
+        # auto-adopt even though the data arrived correctly.
+        self.peer_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
+
     def add_peer(self, peer_addr: str, topic_uuid: str,
                  fetch_from_peer: bool = True) -> None:
         if peer_addr == self.address:
@@ -537,6 +549,18 @@ class Session:
                 topic_uuid,
                 fetch_from_peer=topic_uuid in pull_topic_set,
             )
+            # Bug fix: accepting a join means we're now actively discussing
+            # this topic too, not just tracking the joiner as a peer -
+            # without this, the side that only ever *generated* a share
+            # token (never called start_discussion themselves, since
+            # generating a token is a pure client-side operation) never
+            # gets its own board marked active. active_topic_uuids gates
+            # auto-adopt (_is_active_discussion_node), so that side's
+            # auto-adopt silently never ran for this board at all - not a
+            # classification bug, the check was never reached in the first
+            # place. No-ops harmlessly if we don't have this topic locally
+            # yet (start_discussion just returns an error result, ignored).
+            self.start_discussion(topic_uuid)
         for topic_uuid in topic_uuids:
             for member in sorted(topic_members.get(topic_uuid, set())):
                 if member == self.address:
@@ -1328,9 +1352,17 @@ class Session:
     def _classify_move(local_node: PRSPNode, peer_node: PRSPNode) -> str:
         if local_node.parent_uuid == peer_node.parent_uuid:
             return "in_agreement"
-        if local_node.parent_uuid == peer_node.previous_parent_uuid:
+        peer_moved_from_local = local_node.parent_uuid == peer_node.previous_parent_uuid
+        local_moved_from_peer = peer_node.parent_uuid == local_node.previous_parent_uuid
+        if peer_moved_from_local and local_moved_from_peer:
+            if peer_node.updated_at > local_node.updated_at:
+                return "peer_made_changes"
+            if local_node.updated_at > peer_node.updated_at:
+                return "local_made_changes"
+            return "divergence"
+        if peer_moved_from_local:
             return "peer_made_changes"
-        if peer_node.parent_uuid == local_node.previous_parent_uuid:
+        if local_moved_from_peer:
             return "local_made_changes"
         return "divergence"
 

@@ -475,6 +475,23 @@ class SessionTests(unittest.TestCase):
 
         self.assertFalse(Session.keep_mine_active(local_node, peer_node))
 
+    def test_opposing_moves_are_divergence(self):
+        local_node = self._node("h0", "h0", "doing", "todo")
+        peer_node = self._node("h0", "h0", "todo", "doing")
+        local_node.updated_at = "2026-01-01T00:00:00.000+00:00"
+        peer_node.updated_at = "2026-01-01T00:00:00.000+00:00"
+
+        self.assertEqual(Session._classify_move(local_node, peer_node), "divergence")
+        self.assertEqual(Session._classify_node(local_node, peer_node), "divergence")
+
+    def test_opposing_moves_use_newer_timestamp_as_clean_move(self):
+        local_node = self._node("h0", "h0", "todo", "doing")
+        peer_node = self._node("h0", "h0", "doing", "todo")
+        local_node.updated_at = "2026-01-01T00:00:00.000+00:00"
+        peer_node.updated_at = "2026-01-01T00:00:01.000+00:00"
+
+        self.assertEqual(Session._classify_move(local_node, peer_node), "peer_made_changes")
+
     def test_pushed_back_stays_active_across_a_second_peer_content_edit(self):
         local_node = self._node("h0", "h0", "p", "p", perspective_state="pushed_back")
         peer_node = self._node("h2", "h1", "p", "p")
