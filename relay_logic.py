@@ -81,6 +81,7 @@ Used API:
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import re
@@ -98,14 +99,39 @@ from starlette.routing import Route
 from relay_storage import LocalFolderRelayStorage, SftpRelayStorage
 
 
+def _storage_fingerprint(config: dict) -> str:
+    backend = config.get("relay_backend", "local")
+    if backend == "sftp":
+        host = config.get("relay_sftp_host") or ""
+        if "://" in host:
+            host = host.split("://", 1)[1]
+        parts = [
+            "sftp", host, str(config.get("relay_sftp_port", 22)),
+            config.get("relay_sftp_username") or "",
+            config.get("relay_sftp_root", "/"),
+        ]
+    else:
+        parts = ["local", config.get("relay_root") or ""]
+    return "|".join(parts)
+
+
 def default_relay_state_file(config: dict, identity: str) -> str:
-    # Keyed by relay_identity, not port - app_server.py's config dict never
-    # actually carries a "port" key, so that would collide across every
-    # instance sharing one codebase checkout (exactly the "same machine,
-    # local folder" scenario this feature is meant to support).
+    # Keyed by relay_identity AND a fingerprint of which storage
+    # backend/location this identity is actually talking to - not just
+    # identity alone. Otherwise switching backends (or root path) while
+    # keeping the same identity string silently inherits stale bookkeeping
+    # from a totally different, unrelated storage location - found live:
+    # an SFTP-backed instance using identity "A" reused a local-folder
+    # test's leftover "already published/applied" state, making it look
+    # like syncing had already succeeded against a server it had never
+    # actually contacted.
     app_name = str(config.get("app_module") or "app").replace(".", "_")
     safe_identity = re.sub(r"[^A-Za-z0-9_-]+", "_", identity).strip("_") or "default"
-    return str(Path(__file__).with_name("data") / f"relay_state_{app_name}_{safe_identity}.json")
+    fingerprint = hashlib.sha256(_storage_fingerprint(config).encode("utf-8")).hexdigest()[:12]
+    return str(
+        Path(__file__).with_name("data")
+        / f"relay_state_{app_name}_{safe_identity}_{fingerprint}.json"
+    )
 
 
 class RelayLogic:
