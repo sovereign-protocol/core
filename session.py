@@ -14,6 +14,15 @@ Offered API:
   unwatch_topic(peer_addr, topic_uuid)
   leave()
   get_network_info()
+  peer_discusses_node(peer_addr, node_uuid)
+  accept_peer_node(peer_addr, node_uuid, adopt_absence=False)
+  reconcile_peer_changes(peer_addr, topic_uuid, node_is_eligible=None,
+    node_adopt_mode=None, allow_wholesale_replace=False)
+    Generic peer-content reconciliation (the "adopt incoming changes"
+    mechanism): walks a peer's transitions for one topic and adopts
+    whatever isn't blocked by a local keep-mine/pushed-back decision. Apps
+    supply only their own eligibility policy via the two callables - the
+    walk itself, and the keep-mine/pushed-back guards, are app-agnostic.
   protocol operation wrappers: create_child, modify, delete, copy, move,
     set_perspective_state
 
@@ -30,7 +39,7 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Callable
 
 from protocol import PRSPNode, ProtocolState, stable_hash
 from trace_log import TraceLogger
@@ -795,6 +804,12 @@ class Session:
         node = self._find_in_tree(tree, node_uuid)
         return PRSPNode.from_dict(node.to_dict()) if node else None
 
+    def peer_discusses_node(self, peer_addr: str, node_uuid: str) -> bool:
+        return any(
+            self._is_descendant_or_self(topic_uuid, node_uuid)
+            for topic_uuid in self.peer_topic_sets.get(peer_addr, set())
+        )
+
     def watch_topic(self, peer_addr: str, topic_uuid: str) -> None:
         self.observed_topics.setdefault(peer_addr, set()).add(topic_uuid)
 
@@ -942,6 +957,25 @@ class Session:
     def peer_pushed_back(peer_node: PRSPNode | None) -> bool:
         return bool(peer_node and peer_node.perspective_state == "pushed_back")
 
+    @staticmethod
+    def _subtree_has_kept_mine(node: PRSPNode) -> bool:
+        # A wholesale subtree replace may only run when nothing under it has
+        # a local perspective decision - a wholesale replace would silently
+        # overwrite a node the user explicitly decided to keep.
+        if node.perspective_state != "none":
+            return True
+        return any(Session._subtree_has_kept_mine(child) for child in node.children)
+
+    @staticmethod
+    def _subtree_has_pushed_back(node: PRSPNode) -> bool:
+        # Same guard, but over the *incoming peer* subtree: a wholesale
+        # replace bypasses the per-node peer_pushed_back check entirely, so
+        # a peer's pushed_back node anywhere in what would be replaced must
+        # block it the same way a local keep-mine decision already does.
+        if node.perspective_state == "pushed_back":
+            return True
+        return any(Session._subtree_has_pushed_back(child) for child in node.children)
+
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self._protocol.copy(source_uuid, destination_uuid)
         if not result.ok:
@@ -1028,6 +1062,144 @@ class Session:
         )
         return SessionResult("ok", value=self._snapshot_node(replaced),
                              effects=self._sync_effects(replaced.uuid))
+
+    def accept_peer_node(self, peer_addr: str, node_uuid: str,
+                         adopt_absence: bool = False) -> SessionResult:
+        if adopt_absence:
+            return self.delete(node_uuid)
+        peer = self.get_cached_peer_subtree(peer_addr, node_uuid)
+        if not peer:
+            return SessionResult("error", reason="peer node not found")
+        local = self._protocol.index.get(node_uuid)
+        parent_uuid = peer.parent_uuid if peer.parent_uuid in self._protocol.index else None
+        if not parent_uuid and local:
+            parent_uuid = local.parent_uuid
+        if not parent_uuid or parent_uuid not in self._protocol.index:
+            return SessionResult("error", reason="local parent not found")
+        return self.adopt_subtree(peer, parent_uuid, remove_descendant_duplicates=True)
+
+    def reconcile_peer_changes(
+        self,
+        peer_addr: str,
+        topic_uuid: str,
+        node_is_eligible: Callable[[PRSPNode, str], bool] | None = None,
+        node_adopt_mode: Callable[[PRSPNode], str] | None = None,
+        allow_wholesale_replace: bool = False,
+    ) -> bool:
+        # Generic "adopt incoming changes" walk - every app on this protocol
+        # wants the same thing (adopt whatever a peer changed for one topic,
+        # respecting local keep-mine/pushed-back decisions); the only thing
+        # that's ever genuinely app-specific is which individual nodes are
+        # eligible to auto-adopt (node_is_eligible) and whether a given node
+        # should be merged field-only or grafted as a whole subtree
+        # (node_adopt_mode - "shallow" vs "full", default "full").
+        node_is_eligible = node_is_eligible or (lambda node, event_type: True)
+        node_adopt_mode = node_adopt_mode or (lambda node: "full")
+
+        peer_topic = self.get_cached_peer_subtree(peer_addr, topic_uuid)
+        if not peer_topic:
+            self.trace_event("session.reconcile_skip", reason="no_cached_subtree",
+                              peer_addr=peer_addr, topic_uuid=topic_uuid)
+            return False
+        local_topic = self._protocol.index.get(topic_uuid)
+        if not local_topic:
+            self.trace_event("session.reconcile_skip", reason="no_local_topic",
+                              peer_addr=peer_addr, topic_uuid=topic_uuid)
+            return False
+        if peer_topic.state_hash == local_topic.state_hash:
+            self.trace_event("session.reconcile_skip", reason="hashes_equal",
+                              peer_addr=peer_addr, topic_uuid=topic_uuid)
+            return False
+
+        peer_events = self.analyze_peer_transitions(peer_addr, topic_uuid)
+        self.trace_event(
+            "session.reconcile_peer_events",
+            peer_addr=peer_addr,
+            topic_uuid=topic_uuid,
+            events=[{"type": e["type"], "node_uuid": e.get("node_uuid")} for e in peer_events],
+        )
+        if not any(event["type"] != "in_agreement" for event in peer_events):
+            self.trace_event("session.reconcile_skip", reason="all_in_agreement",
+                              peer_addr=peer_addr, topic_uuid=topic_uuid)
+            return False
+
+        top_event = peer_events[0] if peer_events else None
+        self.trace_event(
+            "session.reconcile_start",
+            peer_addr=peer_addr,
+            topic_uuid=topic_uuid,
+            local_state_hash=local_topic.state_hash,
+        )
+
+        # The topic root's own event only ever decides this wholesale-replace
+        # shortcut - it must NOT gate whether the per-node loop below runs at
+        # all. A root of "in_agreement" or "local_made_changes" just means
+        # the topic's own top-level fields didn't change (or we're ahead
+        # there) - a descendant node can still independently have a real
+        # peer_made_changes/local_missing_node event that the per-node
+        # loop's own guards already know how to evaluate safely.
+        if (top_event and top_event["type"] == "peer_made_changes" and allow_wholesale_replace
+                and not self._subtree_has_kept_mine(local_topic)
+                and not self._subtree_has_pushed_back(peer_topic)):
+            self.trace_event(
+                "session.reconcile_replace_subtree",
+                peer_addr=peer_addr,
+                topic_uuid=topic_uuid,
+                local_state_hash=top_event.get("local_state_hash"),
+                peer_state_hash=top_event.get("peer_state_hash"),
+            )
+            self.replace_subtree(peer_topic)
+            self.trace_event("session.reconcile_done", peer_addr=peer_addr,
+                              topic_uuid=topic_uuid, changed=True)
+            return True
+
+        changed = False
+        for event in peer_events:
+            if event["type"] not in ("peer_made_changes", "local_missing_node"):
+                continue
+            peer_node = self.get_cached_peer_subtree(peer_addr, event["node_uuid"])
+            local_node = self._protocol.index.get(event["node_uuid"])
+            reference_node = local_node or peer_node
+            if not reference_node:
+                continue
+            if local_node and self.keep_mine_active(local_node, peer_node):
+                continue
+            if peer_node and self.peer_pushed_back(peer_node):
+                continue
+            if not node_is_eligible(reference_node, event["type"]):
+                continue
+            if (event["type"] == "peer_made_changes"
+                    and ((local_node and self._subtree_has_kept_mine(local_node))
+                         or (peer_node and self._subtree_has_pushed_back(peer_node)))):
+                # A full subtree adopt of an *existing* local node would
+                # silently overwrite a kept-mine decision (or ignore a
+                # peer's own pushed-back one) on a descendant several
+                # levels down - the node-level keep_mine_active/
+                # peer_pushed_back guards above only ever check this node's
+                # own perspective_state, not its children's. A brand-new
+                # node (local_missing_node) has no local content to protect
+                # so isn't subject to this - only an update to something
+                # that already exists locally can clobber something.
+                continue
+            self.trace_event(
+                "session.reconcile_node",
+                peer_addr=peer_addr,
+                topic_uuid=topic_uuid,
+                node_uuid=event["node_uuid"],
+                event_type=event["type"],
+                peer_state_hash=event.get("peer_state_hash"),
+            )
+            if node_adopt_mode(reference_node) == "shallow" and event["type"] == "peer_made_changes" and peer_node:
+                # Update the node's own fields only - never cascade into its
+                # children, so an allowed shallow change can't smuggle in a
+                # filtered-out descendant change underneath it.
+                result = self.modify(event["node_uuid"], peer_node.data, peer_node.weights)
+            else:
+                result = self.accept_peer_node(peer_addr, event["node_uuid"])
+            changed = changed or result.status == "ok"
+        self.trace_event("session.reconcile_done", peer_addr=peer_addr,
+                          topic_uuid=topic_uuid, changed=changed)
+        return changed
 
     def remove_subtree_uuids(self, root_uuid: str, uuids: set[str]) -> SessionResult:
         result = self._protocol.remove_subtree_uuids(root_uuid, uuids)

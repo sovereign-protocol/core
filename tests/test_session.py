@@ -822,5 +822,237 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(session.is_identity_node(other))
         self.assertFalse(session.is_identity_node(None))
 
+    # reconcile_peer_changes / accept_peer_node / peer_discusses_node -
+    # generic peer-content reconciliation, generalized out of
+    # kanban_logic.py's adopt_incoming_changes. Deliberately exercised here
+    # with non-kanban node types ("note"/"note_item"/"leaf") to prove the
+    # mechanism carries no kanban-specific assumptions.
+
+    def test_peer_discusses_node(self):
+        session = Session("si-a")
+        topic = session.create_child(
+            session.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        child = session.create_child(topic.uuid, {"type": "note_item"}, {}).value
+        session.peer_topic_sets["si-b"] = {topic.uuid}
+
+        self.assertTrue(session.peer_discusses_node("si-b", child.uuid))
+        self.assertFalse(session.peer_discusses_node("si-b", "no-such-uuid"))
+        self.assertFalse(session.peer_discusses_node("si-c", child.uuid))
+
+    def test_accept_peer_node_adopts_and_deletes_on_absence(self):
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "x"}, {}).value
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        result = local.accept_peer_node("si-b", child.uuid)
+        self.assertEqual(result.status, "ok")
+        self.assertIn(child.uuid, local.protocol.index)
+        self.assertEqual(local.protocol.index[child.uuid].data["text"], "x")
+
+        result = local.accept_peer_node("si-b", child.uuid, adopt_absence=True)
+        self.assertEqual(result.status, "ok")
+        self.assertNotIn(child.uuid, local.protocol.index)
+
+    def test_reconcile_peer_changes_no_cached_subtree_is_a_no_op(self):
+        session = Session("si-a")
+        self.assertFalse(session.reconcile_peer_changes("si-b", "no-such-topic"))
+
+    def test_reconcile_peer_changes_adopts_eligible_change_by_default(self):
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "original"}, {}).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        peer.modify(child.uuid, {"type": "note_item", "text": "updated"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        changed = local.reconcile_peer_changes("si-b", topic.uuid)
+
+        self.assertTrue(changed)
+        self.assertEqual(local.protocol.index[child.uuid].data["text"], "updated")
+
+    def test_reconcile_peer_changes_respects_node_is_eligible(self):
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "original"}, {}).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        peer.modify(child.uuid, {"type": "note_item", "text": "updated"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        changed = local.reconcile_peer_changes(
+            "si-b", topic.uuid, node_is_eligible=lambda node, event_type: False,
+        )
+
+        self.assertFalse(changed)
+        self.assertEqual(local.protocol.index[child.uuid].data["text"], "original")
+
+    def test_reconcile_peer_changes_shallow_mode_uses_field_only_modify(self):
+        # node_adopt_mode="shallow" must route through modify (own fields
+        # only) rather than accept_peer_node (whole-subtree graft) - proven
+        # by asserting the field updates via a single clean peer-side
+        # change (state_hash chains only compare cleanly one hop at a time;
+        # the deeper "doesn't smuggle a simultaneously-added child" property
+        # this exists for is already covered end-to-end by the kanban-level
+        # auto-adopt tests in test_kanban_new_logic.py, which exercise it
+        # through the real incremental sync path).
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        folder = peer.create_child(topic.uuid, {"type": "folder", "text": "orig"}, {}).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        peer.modify(folder.uuid, {"type": "folder", "text": "new"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        changed = local.reconcile_peer_changes(
+            "si-b", topic.uuid,
+            node_adopt_mode=lambda node: "shallow" if node.data.get("type") == "folder" else "full",
+        )
+
+        self.assertTrue(changed)
+        self.assertEqual(local.protocol.index[folder.uuid].data["text"], "new")
+
+    def test_reconcile_peer_changes_filters_ineligible_new_nodes(self):
+        # A brand-new peer node (never seen locally) is always classified
+        # "local_missing_node" regardless of hop count - independent
+        # coverage of node_is_eligible for that event type specifically,
+        # since test_reconcile_peer_changes_respects_node_is_eligible above
+        # only covers "peer_made_changes".
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        leaf = peer.create_child(topic.uuid, {"type": "leaf", "text": "new"}, {}).value
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        # Topic's own event is also "peer_made_changes" here (its hash
+        # cascaded from gaining the leaf, even though its own fields didn't
+        # change), so node_adopt_mode must stay "shallow" - otherwise a
+        # full adopt of the topic root would drag the filtered leaf back in
+        # as a side effect, same as a real app's eligibility closure must
+        # do for its own container types. (Not asserting on `changed`
+        # itself: the topic root's shallow modify still reports "ok" even
+        # though its data is identical - the property under test is that
+        # the filtered leaf never appears locally, regardless.)
+        local.reconcile_peer_changes(
+            "si-b", topic.uuid,
+            node_is_eligible=lambda node, event_type: node.data.get("type") != "leaf",
+            node_adopt_mode=lambda node: "shallow",
+        )
+
+        self.assertNotIn(leaf.uuid, local.protocol.index)
+
+    def test_reconcile_peer_changes_wholesale_replace_when_allowed(self):
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "orig"}, {}).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        # A single peer-side operation keeps the topic root's own hash chain
+        # a clean one-hop "peer_made_changes" from local's frozen baseline
+        # (state_hash/previous_hash only encode one hop back - two separate
+        # peer operations before syncing would classify as "divergence"
+        # instead, same as a real concurrent-edit case would).
+        peer.modify(child.uuid, {"type": "note_item", "text": "new"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        changed = local.reconcile_peer_changes("si-b", topic.uuid, allow_wholesale_replace=True)
+
+        self.assertTrue(changed)
+        self.assertEqual(local.protocol.index[child.uuid].data["text"], "new")
+
+    def test_reconcile_peer_changes_wholesale_replace_blocked_by_local_kept_mine(self):
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "orig"}, {}).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        local.set_perspective_state(child.uuid, "kept_mine")
+
+        peer.modify(child.uuid, {"type": "note_item", "text": "new"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        # allow_wholesale_replace=True, but a kept_mine node anywhere in the
+        # local subtree must block the shortcut entirely - the kept_mine
+        # child's content must survive regardless of what the per-node loop
+        # then does with the rest of the subtree.
+        local.reconcile_peer_changes(
+            "si-b", topic.uuid, allow_wholesale_replace=True,
+        )
+
+        self.assertEqual(local.protocol.index[child.uuid].data["text"], "orig")
+
 if __name__ == "__main__":
     unittest.main()
