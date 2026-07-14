@@ -5,9 +5,28 @@ Functionality:
   Store-and-forward sync for peers who are never online at the same time,
   and/or not directly reachable (no inbound NAT traversal needed). Each peer
   identity publishes its current view of every board it has into a shared
-  storage location (see relay_storage.py), and periodically polls every
-  other known identity's published view, applying whatever changed through
-  the *existing* sovereign-perspective reconciliation machinery.
+  storage location (see relay_storage.py - a local folder or a remote SFTP
+  server, selected via config), and periodically polls every other known
+  identity's published view, applying whatever changed through the
+  *existing* sovereign-perspective reconciliation machinery.
+
+  Storage backend selection (config["relay_backend"], default "local"):
+    "local" - config["relay_root"] (local folder path).
+    "sftp"  - config["relay_sftp_host"] (required to activate), plus
+      relay_sftp_port (default 22), relay_sftp_username, relay_sftp_root
+      (remote path, default "/"), and either relay_sftp_password or
+      relay_sftp_private_key_path (+ optional
+      relay_sftp_private_key_passphrase). The password/passphrase never
+      need to live in the config file itself - each is resolved in
+      priority order: the config key directly (only for local, throwaway
+      testing), then an env var (SKANBAN_SFTP_PASSWORD /
+      SKANBAN_SFTP_PRIVATE_KEY_PASSPHRASE), then a "<key>_file" config
+      entry pointing at a file holding just the secret (works even when
+      the server wasn't launched from the same shell an env var was set
+      in). Credentials never appear in a channel_descriptor() payload
+      either way - that only ever advertises host/port/root/identity (see
+      relay_storage.py's module docstring for the plaintext-content/
+      trust-on-first-use tradeoffs of this MVP pass).
 
   This is deliberately not built on Session.add_peer/pending_sync_effects/
   HttpTransportAdapter - those assume every registered member is directly
@@ -55,7 +74,8 @@ Offered API:
 
 Used API:
   kanban_logic.KanbanLogic (boards/user_profile only), protocol.PRSPNode,
-  session.Session, relay_storage.LocalFolderRelayStorage.
+  session.Session, relay_storage.LocalFolderRelayStorage,
+  relay_storage.SftpRelayStorage.
 """
 
 from __future__ import annotations
@@ -75,7 +95,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from relay_storage import LocalFolderRelayStorage
+from relay_storage import LocalFolderRelayStorage, SftpRelayStorage
 
 
 def default_relay_state_file(config: dict, identity: str) -> str:
@@ -93,10 +113,55 @@ class RelayLogic:
         self.session = session
         self.kanban = KanbanLogic(session, config)
         self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
-        root = config.get("relay_root")
-        self.storage = LocalFolderRelayStorage(root) if root else None
+        self.storage = self._build_storage(config)
         self._state_path = config.get("relay_state_file") or default_relay_state_file(config, self.identity)
         self._state = self._load_state()
+
+    @staticmethod
+    def _build_storage(config: dict):
+        backend = config.get("relay_backend", "local")
+        if backend == "sftp":
+            host = config.get("relay_sftp_host")
+            if not host:
+                return None
+            # Three ways to supply the secret, in priority order, none of
+            # which require writing it directly into a config file that
+            # could end up committed: an explicit config value (lowest
+            # priority - only for local, throwaway testing), an environment
+            # variable, or a path to a file holding just the secret (works
+            # even when the process reading it wasn't started from the same
+            # shell that set an env var - e.g. a file the user edits
+            # directly, that this code never needs to be told the contents
+            # of ahead of time).
+            return SftpRelayStorage(
+                host=host,
+                port=int(config.get("relay_sftp_port", 22)),
+                username=config.get("relay_sftp_username"),
+                remote_root=config.get("relay_sftp_root", "/"),
+                password=RelayLogic._secret(
+                    config, "relay_sftp_password", "SKANBAN_SFTP_PASSWORD",
+                ),
+                private_key_path=config.get("relay_sftp_private_key_path"),
+                private_key_passphrase=RelayLogic._secret(
+                    config, "relay_sftp_private_key_passphrase",
+                    "SKANBAN_SFTP_PRIVATE_KEY_PASSPHRASE",
+                ),
+            )
+        root = config.get("relay_root")
+        return LocalFolderRelayStorage(root) if root else None
+
+    @staticmethod
+    def _secret(config: dict, config_key: str, env_var: str) -> str | None:
+        value = config.get(config_key)
+        if value:
+            return value
+        value = os.environ.get(env_var)
+        if value:
+            return value
+        file_path = config.get(f"{config_key}_file")
+        if file_path:
+            return Path(file_path).read_text(encoding="utf-8").strip()
+        return None
 
     def relay_topic_uuids(self) -> list[str]:
         return [board.uuid for board in self.kanban.boards()]
@@ -104,6 +169,15 @@ class RelayLogic:
     def channel_descriptor(self) -> dict | None:
         if not self.storage:
             return None
+        if isinstance(self.storage, SftpRelayStorage):
+            return {
+                "type": "sftp",
+                "version": 1,
+                "host": self.storage.host,
+                "port": self.storage.port,
+                "root": self.storage.root,
+                "identity": self.identity,
+            }
         return {
             "type": "relay",
             "version": 1,
