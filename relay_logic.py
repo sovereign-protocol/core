@@ -34,19 +34,24 @@ Functionality:
 Offered API:
   create_logic(session, config) -> RelayLogic     (extra-app-module hook)
   build_routes(logic, runtime, config) -> list[Route]  (extra-app-module hook)
+  channel_descriptor(runtime, config) -> dict | None  (extra-app-module hook)
+    Advertises relay as a connectable channel for /api/connect_token, if
+    configured - {"type": "relay", "version": 1, "root": ..., "identity": ...}.
   RelayLogic
     relay_topic_uuids() -> list[str]
     publish_due_topics() -> list[str]
     poll_and_apply() -> list[tuple[str, str]]
     status_payload() -> dict
-    accept_connect_token(token) -> SessionResult
-      Records the token's topic_uuids as "desired" - the consent step that
-      lets poll_and_apply graft a not-yet-locally-known board into our own
-      board list the first time it shows up in the relay, instead of merely
+    channel_descriptor() -> dict | None
+    mark_topics_desired(topic_uuids) -> SessionResult
+      Records topic_uuids as "desired" - the consent step that lets
+      poll_and_apply graft a not-yet-locally-known board into our own board
+      list the first time it shows up in the relay, instead of merely
       caching it as an (invisible, unowned) peer perspective forever. This
-      is how two peers can share a board via relay alone, with no live
-      HTTP join ever required - the token just needs to reach the other
-      side out-of-band (however two people already exchange a token today).
+      is how two peers can share a board via relay alone, with no live HTTP
+      join ever required - called by the unified /api/connect accept flow
+      (app_server.py) once it decides the relay channel is usable, same as
+      the HTTP channel's own accept path is called for the http channel.
 
 Used API:
   kanban_logic.KanbanLogic (boards/user_profile only), protocol.PRSPNode,
@@ -55,7 +60,6 @@ Used API:
 
 from __future__ import annotations
 
-import base64
 import copy
 import json
 import os
@@ -97,21 +101,24 @@ class RelayLogic:
     def relay_topic_uuids(self) -> list[str]:
         return [board.uuid for board in self.kanban.boards()]
 
-    def accept_connect_token(self, token: str) -> SessionResult:
-        # A connect token (boardofboards.html's encodeConnectToken) is just
-        # {address, topic_uuids} - the address is for the live-HTTP join
-        # flow and is ignored here. Recording the topic_uuids as "desired"
-        # is the consent step: poll_and_apply below will only ever graft a
-        # topic into our own board list if it's in this set, so merely
-        # sharing a relay_root with someone never exposes their boards to
-        # us - we still need to be handed a token first, same as a live join.
-        try:
-            payload = json.loads(base64.b64decode(token.strip()).decode("utf-8"))
-            topic_uuids = payload.get("topic_uuids")
-            if not isinstance(topic_uuids, list) or not topic_uuids:
-                raise ValueError("no topic_uuids in token")
-        except Exception as exc:
-            return SessionResult("error", reason=f"invalid token: {exc}")
+    def channel_descriptor(self) -> dict | None:
+        if not self.storage:
+            return None
+        return {
+            "type": "relay",
+            "version": 1,
+            "root": str(self.storage.root),
+            "identity": self.identity,
+        }
+
+    def mark_topics_desired(self, topic_uuids: list[str]) -> SessionResult:
+        # Recording topic_uuids as "desired" is the consent step:
+        # poll_and_apply below will only ever graft a topic into our own
+        # board list if it's in this set, so merely sharing a relay_root
+        # with someone never exposes their boards to us - we still need to
+        # be handed a token first, same as a live join.
+        if not isinstance(topic_uuids, list) or not topic_uuids:
+            return SessionResult("error", reason="no topic_uuids given")
         desired = set(self._state.setdefault("desired", []))
         desired.update(str(uuid) for uuid in topic_uuids)
         self._state["desired"] = sorted(desired)
@@ -250,18 +257,15 @@ def create_logic(session: Session, config: dict) -> RelayLogic:
     return logic
 
 
+def channel_descriptor(runtime, config: dict) -> dict | None:
+    logic = config.get("_relay_logic_instance")
+    return logic.channel_descriptor() if logic else None
+
+
 def build_routes(logic: RelayLogic, runtime, config: dict) -> list[Route]:
     async def api_relay_status(request: Request):
         return JSONResponse(logic.status_payload())
 
-    async def api_relay_accept_token(request: Request):
-        data = await request.json()
-        result = logic.accept_connect_token(data.get("token", ""))
-        if result.status != "ok":
-            return JSONResponse({"status": "error", "reason": result.reason}, status_code=400)
-        return JSONResponse({"status": "ok", "topic_uuids": result.value})
-
     return [
         Route("/api/relay/status", api_relay_status),
-        Route("/api/relay/accept_token", api_relay_accept_token, methods=["POST"]),
     ]

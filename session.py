@@ -120,6 +120,11 @@ class Session:
         self.peer_fetch_topic_sets: dict[str, set[str]] = {}
         self.peer_perspectives: dict[str, PRSPNode | None] = {}
         self.peer_status: dict[str, dict[str, Any]] = {}
+        # Which channel type last successfully delivered to/from a peer
+        # address - purely informational (the only transport-shaped thing
+        # an app is allowed to surface to its UI, per the connect-channel
+        # design), never read by any sync/reconciliation logic itself.
+        self.peer_channel: dict[str, str] = {}
         self.peer_sync_state: dict[str, dict[str, Any]] = {}
         self.active_topic_uuids: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
@@ -229,6 +234,24 @@ class Session:
         tree = self.peer_perspectives.get(peer_addr)
         return self._find_identity_in_tree(tree) if tree else None
 
+    def apply_peer_identity_snapshot(self, peer_addr: str, identity: dict) -> None:
+        # A connect token carries the sender's identity inline so it's
+        # visible immediately, without waiting on whichever channel(s) end
+        # up actually usable to fetch it - deliberately unconditional
+        # (never goes through reconcile_peer_changes/keep_mine/pushed_back):
+        # an identity assertion isn't collaborative content with divergence
+        # to resolve, it's just "the latest thing this peer said about
+        # themselves." Degrades gracefully (no-op) on anything it doesn't
+        # recognize, rather than raising - a peer running a newer identity
+        # version should never be able to break an older one's connect flow.
+        if not isinstance(identity, dict) or identity.get("data", {}).get("version") != 1:
+            return
+        try:
+            node = PRSPNode.from_dict(identity)
+        except (ValueError, KeyError):
+            return
+        self.apply_peer_subtree(peer_addr, node, None)
+
     @staticmethod
     def _find_identity_in_tree(node: PRSPNode | None,
                                identity_key: str | None = None) -> PRSPNode | None:
@@ -294,6 +317,9 @@ class Session:
         # relay-sourced cache update would be silently invisible to
         # auto-adopt even though the data arrived correctly.
         self.peer_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
+
+    def note_peer_channel(self, peer_addr: str, channel_type: str) -> None:
+        self.peer_channel[peer_addr] = channel_type
 
     def add_peer(self, peer_addr: str, topic_uuid: str,
                  fetch_from_peer: bool = True) -> None:
@@ -1292,6 +1318,7 @@ class Session:
                     "topic_uuid": self.peer_topics.get(addr),
                     "topic_uuids": sorted(self.peer_topic_sets.get(addr) or []),
                     "status": self.peer_status.get(addr, self._new_peer_status()),
+                    "channel": self.peer_channel.get(addr),
                 }
                 for addr, tree in self.peer_perspectives.items()
             },

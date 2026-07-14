@@ -868,6 +868,37 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.peer_identity("addr-bob").data["display_name"], "Bob")
         self.assertIsNone(session.peer_identity("addr-nobody"))
 
+    def test_apply_peer_identity_snapshot_caches_unconditionally(self):
+        session = Session("si-a")
+        bob_session = Session("si-b")
+        bob_session.set_identity("Bob")
+        payload = bob_session.identity.to_dict()
+
+        session.apply_peer_identity_snapshot("si-b", payload)
+
+        cached = session.find_peer_identity(payload["data"]["identity_key"])
+        self.assertIsNotNone(cached)
+        self.assertEqual(cached.data["display_name"], "Bob")
+
+    def test_apply_peer_identity_snapshot_ignores_unrecognized_version(self):
+        session = Session("si-a")
+        bob_session = Session("si-b")
+        bob_session.set_identity("Bob")
+        payload = bob_session.identity.to_dict()
+        payload["data"]["version"] = 99
+
+        session.apply_peer_identity_snapshot("si-b", payload)
+
+        self.assertEqual(session.peer_perspectives, {})
+
+    def test_apply_peer_identity_snapshot_ignores_malformed_input(self):
+        session = Session("si-a")
+
+        session.apply_peer_identity_snapshot("si-b", {"not": "a real node"})
+        session.apply_peer_identity_snapshot("si-c", "not even a dict")
+
+        self.assertEqual(session.peer_perspectives, {})
+
     def test_is_identity_node(self):
         session = Session("si-a")
 
