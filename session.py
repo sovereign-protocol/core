@@ -360,9 +360,21 @@ class Session:
         topics.discard(topic_uuid)
 
     def topic_members(self, topic_uuid: str) -> set[str]:
+        # "member" here specifically means "a real, HTTP-reachable address
+        # worth telling other peers about" - peer_topic_sets alone isn't
+        # enough evidence of that. A relay pseudo-address (e.g. "relay:B")
+        # also lives in peer_topic_sets (note_relay_peer_topic - deliberate,
+        # so kanban's auto-adopt/eligibility checks still recognize it) but
+        # was never registered via add_peer specifically to keep it out of
+        # self.members and everything self.members feeds (pending_sync_effects,
+        # mesh-propagation via handle_join/join_discussion's own member
+        # loops). Without this filter, mentioning a relay identity in one
+        # topic_members exchange would propagate it into every peer's own
+        # self.members via handle_join's blind add_peer loop, not just the
+        # two sides actually using that relay channel.
         members = {self.address} if topic_uuid in self.active_topic_uuids else set()
         for peer, topics in self.peer_topic_sets.items():
-            if topic_uuid in topics:
+            if topic_uuid in topics and peer in self.members:
                 members.add(peer)
         return members
 

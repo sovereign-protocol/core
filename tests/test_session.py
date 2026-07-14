@@ -19,6 +19,30 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(session.active_topic_uuid, topic.uuid)
         self.assertEqual(session.members, {"si-a"})
 
+    def test_topic_members_excludes_relay_pseudo_addresses(self):
+        # Regression, found live: a relay pseudo-address (e.g. "relay:B")
+        # lives in peer_topic_sets (Session.note_relay_peer_topic -
+        # deliberate, so kanban's eligibility checks recognize it) but is
+        # never registered via add_peer, specifically to keep it out of
+        # self.members. topic_members used to union in peer_topic_sets
+        # unconditionally, so mentioning that topic anywhere near a real
+        # HTTP join (topic_members_by_topic feeds both the outgoing join
+        # request and handle_join's response) would leak "relay:B" into
+        # self.members via handle_join's blind add_peer loop over whatever
+        # the other side reports - not just on the two sides actually using
+        # that relay channel, but on every peer who later joins that topic.
+        session = Session("si-a")
+        topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
+        session.start_discussion(topic.uuid)
+        session.note_relay_peer_topic("relay:B", topic.uuid)
+        session.add_peer("si-c", topic.uuid)
+
+        members = session.topic_members(topic.uuid)
+
+        self.assertEqual(members, {"si-a", "si-c"})
+        self.assertNotIn("relay:B", members)
+        self.assertNotIn("relay:B", session.topic_members_by_topic([topic.uuid])[topic.uuid])
+
     def test_start_discussion_allows_multiple_topics(self):
         session = Session("si-a")
         first = session.create_child(
