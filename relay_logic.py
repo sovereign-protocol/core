@@ -71,6 +71,9 @@ Offered API:
       join ever required - called by the unified /api/connect accept flow
       (app_server.py) once it decides the relay channel is usable, same as
       the HTTP channel's own accept path is called for the http channel.
+    delete_topic(topic_uuid) -> SessionResult
+      Storage/bookkeeping cleanup only (POST /api/relay/delete_topic) -
+      never touches a peer's own already-adopted local board, if any.
 
 Used API:
   kanban_logic.KanbanLogic (boards/user_profile only), protocol.PRSPNode,
@@ -337,6 +340,20 @@ class RelayLogic:
             },
         }
 
+    def delete_topic(self, topic_uuid: str) -> SessionResult:
+        # Purely a storage/bookkeeping cleanup - never touches whatever a
+        # peer may have already grafted into their own local board list
+        # from this topic (that's kanban_logic's own board-delete, a
+        # separate, app-level decision this has no business making).
+        if not self.storage:
+            return SessionResult("error", reason="relay not configured")
+        self.storage.delete_topic(topic_uuid)
+        self._state["published"].pop(topic_uuid, None)
+        self._state["applied"].pop(topic_uuid, None)
+        self._state["desired"] = [t for t in self._state.get("desired", []) if t != topic_uuid]
+        self._save_state()
+        return SessionResult("ok", value=topic_uuid)
+
     def _load_state(self) -> dict[str, Any]:
         path = Path(self._state_path)
         if path.is_file():
@@ -373,6 +390,14 @@ def build_routes(logic: RelayLogic, runtime, config: dict) -> list[Route]:
     async def api_relay_status(request: Request):
         return JSONResponse(logic.status_payload())
 
+    async def api_relay_delete_topic(request: Request):
+        data = await request.json()
+        result = logic.delete_topic(data.get("topic_uuid", ""))
+        if result.status != "ok":
+            return JSONResponse({"status": "error", "reason": result.reason}, status_code=400)
+        return JSONResponse({"status": "ok", "topic_uuid": result.value})
+
     return [
         Route("/api/relay/status", api_relay_status),
+        Route("/api/relay/delete_topic", api_relay_delete_topic, methods=["POST"]),
     ]

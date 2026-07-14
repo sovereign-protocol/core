@@ -11,12 +11,16 @@ Offered API:
   LocalFolderRelayStorage(root)
   SftpRelayStorage(host, username, remote_root, port=22, password=None,
                    private_key_path=None, private_key_passphrase=None)
-    Both implement the same five methods:
+    Both implement the same six methods:
     write_snapshot(topic_uuid, peer_id, state_hash, payload)
     read_head(topic_uuid, peer_id) -> dict | None
     read_snapshot(topic_uuid, peer_id, state_hash) -> dict | None
     list_peers(topic_uuid) -> list[str]
     list_topics() -> list[str]
+    delete_topic(topic_uuid) -> None
+      Removes the whole topic subtree (every peer's snapshots under it) -
+      not scoped to one peer, since a topic is a shared mailbox namespace,
+      not owned by whichever identity happens to publish under it.
 
 Used API:
   LocalFolderRelayStorage: Python standard library only.
@@ -94,6 +98,12 @@ class LocalFolderRelayStorage:
             return []
         return sorted(entry.name for entry in topics_dir.iterdir() if entry.is_dir())
 
+    def delete_topic(self, topic_uuid: str) -> None:
+        import shutil
+        topic_dir = self.root / "topics" / topic_uuid
+        if topic_dir.is_dir():
+            shutil.rmtree(topic_dir)
+
     def _peer_dir(self, topic_uuid: str, peer_id: str) -> Path:
         return self.root / "topics" / topic_uuid / "peers" / peer_id
 
@@ -161,6 +171,26 @@ class SftpRelayStorage:
 
     def list_topics(self) -> list[str]:
         return self._list_dir(posixpath.join(self.root, "topics"))
+
+    def delete_topic(self, topic_uuid: str) -> None:
+        def operation(sftp):
+            self._rmtree(sftp, posixpath.join(self.root, "topics", topic_uuid))
+
+        self._with_retry(operation)
+
+    @staticmethod
+    def _rmtree(sftp, path: str) -> None:
+        try:
+            attrs = sftp.listdir_attr(path)
+        except FileNotFoundError:
+            return
+        for entry in attrs:
+            full = posixpath.join(path, entry.filename)
+            if stat.S_ISDIR(entry.st_mode or 0):
+                SftpRelayStorage._rmtree(sftp, full)
+            else:
+                sftp.remove(full)
+        sftp.rmdir(path)
 
     def _peer_dir(self, topic_uuid: str, peer_id: str) -> str:
         return posixpath.join(self.root, "topics", topic_uuid, "peers", peer_id)
