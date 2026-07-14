@@ -229,7 +229,15 @@ class RelayLogic:
         return None
 
     def relay_topic_uuids(self) -> list[str]:
-        return [board.uuid for board in self.kanban.boards()]
+        # Includes our own identity node alongside owned boards: identity is
+        # otherwise only ever delivered once, inline in a connect token at
+        # accept time (Session.apply_peer_identity_snapshot) - a later
+        # display-name/picture edit would never reach an already-connected
+        # relay peer without this, since relay has no other identity-sync
+        # path. poll_and_apply already caches any non-"kanban_board" topic
+        # via apply_peer_subtree without attempting to graft it, so no
+        # change is needed on the receiving side.
+        return [board.uuid for board in self.kanban.boards()] + [self.session.identity.uuid]
 
     def channel_descriptor(self) -> dict | None:
         if not self.storage:
