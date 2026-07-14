@@ -124,6 +124,13 @@ class RelayLogic:
             host = config.get("relay_sftp_host")
             if not host:
                 return None
+            # relay_sftp_host is a bare hostname for paramiko/getaddrinfo,
+            # not a URL - an "sftp://" (or any other "scheme://") prefix
+            # pasted in from an FTP client's connection string is an easy
+            # mistake that fails DNS resolution outright, so strip it
+            # defensively rather than let every user hit that once.
+            if "://" in host:
+                host = host.split("://", 1)[1]
             # Three ways to supply the secret, in priority order, none of
             # which require writing it directly into a config file that
             # could end up committed: an explicit config value (lowest
