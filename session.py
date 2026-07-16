@@ -125,6 +125,14 @@ class Session:
         # an app is allowed to surface to its UI, per the connect-channel
         # design), never read by any sync/reconciliation logic itself.
         self.peer_channel: dict[str, str] = {}
+        # Canonical addr -> identity_key registry. Knowledge, not
+        # registration: an entry records "this address belongs to this
+        # identity", a fact that stays true even after the peer's
+        # registration (members/peer_topic_sets/...) is torn down - so
+        # remove_peer deliberately leaves it alone. Written the instant
+        # any channel learns the fact (set_peer_identity_key), never
+        # re-derived from cached content on demand.
+        self.peer_identity_key: dict[str, str] = {}
         self.peer_sync_state: dict[str, dict[str, Any]] = {}
         self.active_topic_uuids: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
@@ -233,6 +241,29 @@ class Session:
         # address, since a bare address gives no identity_key to search for.
         tree = self.peer_perspectives.get(peer_addr)
         return self._find_identity_in_tree(tree) if tree else None
+
+    def set_peer_identity_key(self, peer_addr: str, identity_key: str) -> None:
+        # The single writer for the addr -> identity_key registry - every
+        # code path that learns an address's identity (connect-token
+        # snapshot, direct profile pull, relay discovery) funnels through
+        # here, so the fact is recorded once, immediately, decoupled from
+        # whether/when full content has been cached.
+        if not peer_addr or not identity_key:
+            return
+        if self.peer_identity_key.get(peer_addr) == identity_key:
+            return
+        self.peer_identity_key[peer_addr] = identity_key
+        self.trace_event(
+            "session.set_peer_identity_key",
+            peer_addr=peer_addr,
+            identity_key=identity_key,
+        )
+
+    def addresses_for_identity(self, identity_key: str) -> list[str]:
+        return sorted(
+            addr for addr, key in self.peer_identity_key.items()
+            if key == identity_key
+        )
 
     def apply_peer_identity_snapshot(self, peer_addr: str, identity: dict) -> None:
         # A connect token carries the sender's identity inline so it's
@@ -735,6 +766,13 @@ class Session:
     def apply_peer_subtree(self, peer_addr: str,
                            subtree: PRSPNode,
                            parent_uuid: str | None) -> None:
+        # Identity topics are always applied with the profile node as the
+        # subtree root (connect-token snapshot, direct profile pull, relay
+        # poll alike), so a root-only check is enough to make this the one
+        # choke point where every channel's identity discovery lands in
+        # the addr -> identity_key registry.
+        if self.is_identity_node(subtree) and subtree.data.get("identity_key"):
+            self.set_peer_identity_key(peer_addr, subtree.data["identity_key"])
         cached = self.peer_perspectives.get(peer_addr)
         if cached is None:
             self.peer_perspectives[peer_addr] = subtree
@@ -1494,6 +1532,30 @@ class Session:
             self.peer_perspectives.pop(peer_addr, None)
             self.peer_status.pop(peer_addr, None)
             self.peer_sync_state.pop(peer_addr, None)
+
+    def remove_peer(self, peer_addr: str) -> None:
+        # Full teardown of one peer's registration, e.g. when a reconnect
+        # supersedes their old address - _remove_peer_topic already clears
+        # peer_perspectives/peer_status/peer_sync_state/members once a
+        # peer's last topic is gone, so drop every topic to trigger that;
+        # only peer_channel is left for this to clear directly.
+        # peer_identity_key is deliberately NOT cleared: it's knowledge
+        # ("this address belongs to identity X"), not registration, and it
+        # stays true after teardown. Clearing it here would erase the very
+        # evidence relay's redundancy check needs to keep suppressing this
+        # address on later polls - the self-erasing-evidence flip-flop,
+        # one level up. Reconnect-replace (accept_connect_token) forgets
+        # superseded addresses explicitly instead.
+        for topic_uuid in sorted(self.peer_topic_sets.get(peer_addr) or ()):
+            self._remove_peer_topic(peer_addr, topic_uuid)
+        self.peer_topic_sets.pop(peer_addr, None)
+        self.peer_fetch_topic_sets.pop(peer_addr, None)
+        self.peer_topics.pop(peer_addr, None)
+        self.peer_perspectives.pop(peer_addr, None)
+        self.peer_status.pop(peer_addr, None)
+        self.peer_sync_state.pop(peer_addr, None)
+        self.peer_channel.pop(peer_addr, None)
+        self.members.discard(peer_addr)
 
     @staticmethod
     def _message_topic_uuids(message: dict) -> list[str]:

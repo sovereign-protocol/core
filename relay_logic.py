@@ -272,6 +272,40 @@ class RelayLogic:
         self._save_state()
         return SessionResult("ok", value=topic_uuids)
 
+    def mark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
+        # The issuer-side counterpart of mark_topics_desired: recording that
+        # we've offered these topics to someone via a relay-bearing connect
+        # token. This is the only signal available before an accepter shows
+        # up (a drop-box relay has no back-channel announcing acceptance),
+        # and it's what arms has_active_relationship() so the issuer starts
+        # publishing - otherwise the accepter could never graft a board the
+        # issuer never got around to publishing. Does not affect what/where
+        # publish_due_topics writes; only whether the loop runs at all.
+        if not isinstance(topic_uuids, list) or not topic_uuids:
+            return SessionResult("error", reason="no topic_uuids given")
+        shared = set(self._state.setdefault("shared", []))
+        shared.update(str(uuid) for uuid in topic_uuids)
+        self._state["shared"] = sorted(shared)
+        self._save_state()
+        return SessionResult("ok", value=topic_uuids)
+
+    def has_active_relationship(self) -> bool:
+        # The relay loop's gate: is there any reason to publish/poll/write
+        # presence at all? True once this session has issued a relay token
+        # (shared), accepted one (desired), or already has a relay peer
+        # registered - the concrete "an active connection exists" predicate.
+        # A fresh boot with none of these leaves the loop fully idle (no
+        # files written for no one). Requires storage: nothing to do without
+        # a place to read/write.
+        if not self.storage:
+            return False
+        if self._state.get("shared") or self._state.get("desired"):
+            return True
+        return any(
+            addr.startswith("relay:")
+            for addr in self.session.peer_topic_sets
+        )
+
     def write_presence(self) -> None:
         # A heartbeat, written every poll tick regardless of whether any
         # topic content changed - distinct from head.json's "updated_at"
@@ -343,6 +377,27 @@ class RelayLogic:
             self._save_state()
         return published
 
+    def _is_redundant_relay_peer(self, peer_addr: str) -> bool:
+        # True once peer_addr's identity is *currently* reachable through
+        # a live non-relay peer. Pure registry lookup - no content
+        # walking, so it's cheap enough to just re-run every poll. The
+        # registry entry for peer_addr only exists once its identity topic
+        # has been seen at least once (identity discovery can lag a poll
+        # behind), so a brand-new relay peer is never mistaken for
+        # redundant before there's evidence either way. The members check
+        # makes this self-correcting: if the direct peer is later removed,
+        # relay resumes on the next poll instead of staying suppressed
+        # forever.
+        identity_key = self.session.peer_identity_key.get(peer_addr)
+        if not identity_key:
+            return False
+        return any(
+            addr != peer_addr
+            and not addr.startswith("relay:")
+            and addr in self.session.members
+            for addr in self.session.addresses_for_identity(identity_key)
+        )
+
     def poll_and_apply(self) -> list[tuple[str, str]]:
         # Discovers topics from what's actually in the relay, not from
         # relay_topic_uuids() (this session's own local boards) - otherwise
@@ -354,6 +409,24 @@ class RelayLogic:
         for topic_uuid in self.storage.list_topics():
             for peer_id in self.storage.list_peers(topic_uuid):
                 if peer_id == self.identity:
+                    continue
+                peer_addr = f"relay:{peer_id}"
+                if self._is_redundant_relay_peer(peer_addr):
+                    # This identity is already reachable through a live,
+                    # preferred (non-relay) channel - the ongoing poll
+                    # loop runs independently of connect-time channel
+                    # selection, so without this it would keep
+                    # re-registering a second, relay-sourced view of a
+                    # peer we already have a better connection to (the
+                    # exact "two channels for one peer" state connect-time
+                    # selection exists to prevent). remove_peer clears any
+                    # content an earlier cycle registered before this
+                    # became detectable; the identity registry entry the
+                    # check reads survives it (knowledge, not
+                    # registration - see Session.remove_peer), so the
+                    # suppression holds on every later poll without any
+                    # bookkeeping here.
+                    self.session.remove_peer(peer_addr)
                     continue
                 head = self.storage.read_head(topic_uuid, peer_id)
                 if not head:
@@ -378,7 +451,6 @@ class RelayLogic:
                 if not payload:
                     continue
                 subtree = PRSPNode.from_dict(payload["subtree"])
-                peer_addr = f"relay:{peer_id}"
                 # Registering peer_topic_sets (not add_peer - see
                 # Session.note_relay_peer_topic) is what lets kanban_logic's
                 # auto-adopt recognize this cache as discussing the topic;
@@ -454,8 +526,9 @@ class RelayLogic:
             data.setdefault("published", {})
             data.setdefault("applied", {})
             data.setdefault("desired", [])
+            data.setdefault("shared", [])
             return data
-        return {"published": {}, "applied": {}, "desired": []}
+        return {"published": {}, "applied": {}, "desired": [], "shared": []}
 
     def _save_state(self) -> None:
         path = Path(self._state_path)

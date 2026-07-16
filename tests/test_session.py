@@ -796,6 +796,38 @@ class SessionTests(unittest.TestCase):
         self.assertIn("si-b", session.members)
         self.assertEqual(session.peer_topic_sets["si-b"], {"topic-2"})
 
+    def test_remove_peer_clears_only_that_peer(self):
+        session = Session("si-a")
+        session.add_peer("si-b", "topic-1")
+        session.add_peer("si-b", "topic-2")
+        session.add_peer("si-c", "topic-1")
+        bob_session = Session("si-b")
+        bob_session.set_identity("Bob")
+        session.apply_peer_identity_snapshot("si-b", bob_session.identity.to_dict())
+        session.note_peer_channel("si-b", "http")
+
+        session.remove_peer("si-b")
+
+        self.assertNotIn("si-b", session.members)
+        self.assertNotIn("si-b", session.peer_topic_sets)
+        self.assertNotIn("si-b", session.peer_fetch_topic_sets)
+        self.assertNotIn("si-b", session.peer_topics)
+        self.assertNotIn("si-b", session.peer_perspectives)
+        self.assertNotIn("si-b", session.peer_status)
+        self.assertNotIn("si-b", session.peer_sync_state)
+        self.assertNotIn("si-b", session.peer_channel)
+        # Unrelated peer untouched.
+        self.assertIn("si-c", session.members)
+        self.assertEqual(session.peer_topic_sets["si-c"], {"topic-1"})
+
+    def test_remove_peer_on_unknown_address_is_a_no_op(self):
+        session = Session("si-a")
+        session.add_peer("si-b", "topic-1")
+
+        session.remove_peer("si-nobody")
+
+        self.assertIn("si-b", session.members)
+
     def test_identity_is_lazily_created_and_stable(self):
         # No KanbanLogic/app involved at all - identity is a Session-owned
         # meta-topic, so any app (or none) gets it for free.
@@ -879,6 +911,69 @@ class SessionTests(unittest.TestCase):
         self.assertIsNotNone(found)
         self.assertEqual(found.data["display_name"], "Bob")
 
+    def test_set_peer_identity_key_records_and_overwrites(self):
+        session = Session("si-a")
+
+        session.set_peer_identity_key("relay:B", "key-bob")
+        self.assertEqual(session.peer_identity_key["relay:B"], "key-bob")
+
+        session.set_peer_identity_key("relay:B", "key-other")
+        self.assertEqual(session.peer_identity_key["relay:B"], "key-other")
+
+        # Blank inputs are ignored, never stored.
+        session.set_peer_identity_key("", "key-x")
+        session.set_peer_identity_key("addr-x", "")
+        self.assertNotIn("", session.peer_identity_key)
+        self.assertNotIn("addr-x", session.peer_identity_key)
+
+    def test_addresses_for_identity_returns_all_matches_sorted(self):
+        session = Session("si-a")
+        session.set_peer_identity_key("relay:B", "key-bob")
+        session.set_peer_identity_key("http://addr-b", "key-bob")
+        session.set_peer_identity_key("http://addr-c", "key-carol")
+
+        self.assertEqual(
+            session.addresses_for_identity("key-bob"),
+            ["http://addr-b", "relay:B"],
+        )
+        self.assertEqual(session.addresses_for_identity("key-nobody"), [])
+
+    def test_apply_peer_subtree_records_identity_key_for_profile_roots(self):
+        session = Session("si-a")
+        bob = PRSPNode({
+            "type": "shared_user_profile", "name": "public_profile",
+            "version": 1, "identity_key": "key-bob", "email": "",
+            "display_name": "Bob", "picture": "",
+        })
+        bob.refresh_hashes()
+
+        session.apply_peer_subtree("relay:B", bob, None)
+
+        self.assertEqual(session.peer_identity_key.get("relay:B"), "key-bob")
+
+    def test_apply_peer_subtree_ignores_non_identity_roots(self):
+        session = Session("si-a")
+        board = PRSPNode({"type": "kanban_board", "name": "Board"})
+        board.refresh_hashes()
+
+        session.apply_peer_subtree("http://addr-b", board, None)
+
+        self.assertEqual(session.peer_identity_key, {})
+
+    def test_remove_peer_keeps_the_identity_registry_entry(self):
+        # Knowledge, not registration: tearing down a peer's registration
+        # must not erase the fact that its address belongs to an identity -
+        # relay's redundancy check reads exactly this entry on every later
+        # poll to keep the address suppressed.
+        session = Session("si-a")
+        session.add_peer("relay:B", "topic-1")
+        session.set_peer_identity_key("relay:B", "key-bob")
+
+        session.remove_peer("relay:B")
+
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+        self.assertEqual(session.peer_identity_key.get("relay:B"), "key-bob")
+
     def test_peer_identity_scoped_to_one_address(self):
         session = Session("si-a")
         bob = PRSPNode({
@@ -903,6 +998,10 @@ class SessionTests(unittest.TestCase):
         cached = session.find_peer_identity(payload["data"]["identity_key"])
         self.assertIsNotNone(cached)
         self.assertEqual(cached.data["display_name"], "Bob")
+        self.assertEqual(
+            session.peer_identity_key.get("si-b"),
+            payload["data"]["identity_key"],
+        )
 
     def test_apply_peer_identity_snapshot_ignores_unrecognized_version(self):
         session = Session("si-a")
