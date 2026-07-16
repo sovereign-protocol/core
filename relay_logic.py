@@ -178,6 +178,10 @@ class RelayLogic:
         self._configured_state_file = config.get("relay_state_file")
         self._state_path = self._configured_state_file or default_relay_state_file(config, self.identity)
         self._state = self._load_state()
+        # Re-mark any previously-shared boards as active discussions, so a
+        # restart doesn't silently drop the issuer's auto-adopt for them
+        # (see _activate_shared_boards).
+        self._activate_shared_boards()
 
     @staticmethod
     def _build_storage(config: dict):
@@ -372,7 +376,27 @@ class RelayLogic:
         shared.update(str(uuid) for uuid in topic_uuids)
         self._state["shared"] = sorted(shared)
         self._save_state()
+        self._activate_shared_boards()
         return SessionResult("ok", value=topic_uuids)
+
+    def _activate_shared_boards(self) -> None:
+        # A board this session has shared via a relay token is one it is
+        # actively discussing - the relay analog of the /p2p/join that
+        # marks a topic active on the HTTP path (Session.handle_join).
+        # Without this the *issuer's own* board never enters
+        # active_topic_uuids, so kanban's auto-adopt (gated on
+        # _is_active_discussion_node) never runs for incoming relay changes
+        # to it - they surface as a diff with no Adopt button (auto-adopt
+        # is expected to handle it) yet nothing ever adopts. Caught live:
+        # A shared a board over relay, B edited a card, and A was stuck
+        # showing the change with no way to accept it. Idempotent; also
+        # called from __init__ so a restart re-activates shared boards
+        # (active_topic_uuids is persisted, but a board shared before this
+        # fix existed would not have been recorded active).
+        for topic in self._state.get("shared", []):
+            node = self.session.protocol.index.get(topic)
+            if node is not None and node.data.get("type") == "kanban_board":
+                self.session.start_discussion(topic)
 
     def has_active_relationship(self) -> bool:
         # The relay loop's gate: is there any reason to publish/poll/write
@@ -609,18 +633,34 @@ class RelayLogic:
             with path.open(encoding="utf-8") as f:
                 data = json.load(f)
             data.setdefault("published", {})
-            data.setdefault("applied", {})
             data.setdefault("desired", [])
             data.setdefault("shared", [])
+            # `applied` is deliberately NOT restored (see _save_state) - it
+            # always starts empty so a restart re-fetches and re-caches
+            # every peer's content.
+            data["applied"] = {}
             return data
         return {"published": {}, "applied": {}, "desired": [], "shared": []}
 
     def _save_state(self) -> None:
+        # `applied` is deliberately never persisted. It tracks "I've already
+        # applied peer hash X into peer_perspectives" - but peer_perspectives
+        # (the cache) is itself in-memory only, wiped on restart. Persisting
+        # `applied` while the cache it describes does not persist means a
+        # restart believes it's fully synced with a peer while holding an
+        # empty cache, so poll_and_apply's "hash unchanged since last
+        # applied" check skips the very re-fetch that would repopulate it -
+        # the peer silently vanishes until it happens to change something.
+        # Caught live: A restarted and lost sight of B entirely. `published`
+        # DOES persist (it tracks snapshots that stay on the server, which
+        # does persist); `desired`/`shared` persist (durable consent/intent).
+        # Same lesson as not persisting Session.peer_sync_state.
+        persisted = {k: v for k, v in self._state.items() if k != "applied"}
         path = Path(self._state_path)
         path.parent.mkdir(parents=True, exist_ok=True)
         tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid_mod.uuid4().hex}.tmp")
         with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(self._state, f, sort_keys=True, indent=2)
+            json.dump(persisted, f, sort_keys=True, indent=2)
             f.write("\n")
         os.replace(tmp_path, path)
 
