@@ -172,7 +172,11 @@ class RelayLogic:
         # cancels out clock skew between machines entirely, with no
         # explicit offset calculation needed - see peer_liveness().
         self._own_presence_mtime: float | None = None
-        self._state_path = config.get("relay_state_file") or default_relay_state_file(config, self.identity)
+        # An explicit pin (tests, or a user who set it) overrides the
+        # location-derived default - kept so adopt_storage_from_descriptor
+        # honors the pin instead of recomputing a data/ path.
+        self._configured_state_file = config.get("relay_state_file")
+        self._state_path = self._configured_state_file or default_relay_state_file(config, self.identity)
         self._state = self._load_state()
 
     @staticmethod
@@ -228,6 +232,74 @@ class RelayLogic:
             return Path(file_path).read_text(encoding="utf-8").strip()
         return None
 
+    @staticmethod
+    def _storage_from_descriptor(descriptor: dict):
+        # Mirror of _build_storage, but reading a token's channel
+        # descriptor instead of the flat local config - this is how a pure
+        # accepter builds storage pointed at the inviter's advertised
+        # location + credentials, with no relay config of its own.
+        if not isinstance(descriptor, dict):
+            return None
+        channel_type = descriptor.get("type")
+        if channel_type == "relay":
+            root = descriptor.get("root")
+            return LocalFolderRelayStorage(root) if root else None
+        if channel_type == "sftp":
+            host = descriptor.get("host")
+            if not host:
+                return None
+            if "://" in host:
+                host = host.split("://", 1)[1]
+            return SftpRelayStorage(
+                host=host,
+                port=int(descriptor.get("port", 22)),
+                username=descriptor.get("username"),
+                remote_root=descriptor.get("root", "/"),
+                password=descriptor.get("password"),
+            )
+        return None
+
+    def adopt_storage_from_descriptor(self, descriptor: dict) -> bool:
+        # Accepter entry point: build our single relay storage from a
+        # token's advertised location when we don't already have one, so a
+        # client with no relay server of its own can still ride an
+        # inviter's token into the inviter's space. Single-storage model -
+        # if we already host a relay, that one is kept (returns False).
+        if self.storage is not None:
+            return False
+        storage = self._storage_from_descriptor(descriptor)
+        if storage is None:
+            return False
+        self.storage = storage
+        # Re-key bookkeeping to the real location. The boot-time
+        # _state_path was fingerprinted from empty config (no storage);
+        # published/applied hashes are meaningless against a different
+        # server, so recompute the path from the adopted location and
+        # reload - same identity+location fingerprint guard that keeps one
+        # identity from inheriting stale bookkeeping across storages.
+        pseudo_config = self._config_from_storage(storage)
+        self._state_path = self._configured_state_file or default_relay_state_file(
+            pseudo_config, self.identity,
+        )
+        self._state = self._load_state()
+        return True
+
+    @staticmethod
+    def _config_from_storage(storage) -> dict:
+        # A minimal config shaped just enough for default_relay_state_file's
+        # fingerprint (_storage_fingerprint) to key off the adopted
+        # location - not a full config, only the fields the fingerprint
+        # reads.
+        if isinstance(storage, SftpRelayStorage):
+            return {
+                "relay_backend": "sftp",
+                "relay_sftp_host": storage.host,
+                "relay_sftp_port": storage.port,
+                "relay_sftp_username": storage.username,
+                "relay_sftp_root": storage.root,
+            }
+        return {"relay_backend": "local", "relay_root": str(storage.root)}
+
     def relay_topic_uuids(self) -> list[str]:
         # Includes our own identity node alongside owned boards: identity is
         # otherwise only ever delivered once, inline in a connect token at
@@ -243,12 +315,25 @@ class RelayLogic:
         if not self.storage:
             return None
         if isinstance(self.storage, SftpRelayStorage):
+            # Deliberately carries the SFTP username + password so an
+            # accepter with no relay config of its own can build storage
+            # straight from the token (adopt_storage_from_descriptor) and
+            # publish into this inviter's space - the whole point of a
+            # token over a shared config file. This reverses the earlier
+            # "descriptor never carries credentials" rule: safe only
+            # because the relay account is chroot-jailed to its root and
+            # the token is a bearer credential shared over a trusted
+            # channel (DESIGN_IDENTITY_AND_TRANSPORT.md §1.6). The private
+            # key path/passphrase are never included - we embed a
+            # password, never a key.
             return {
                 "type": "sftp",
                 "version": 1,
                 "host": self.storage.host,
                 "port": self.storage.port,
                 "root": self.storage.root,
+                "username": self.storage.username,
+                "password": self.storage.password,
                 "identity": self.identity,
             }
         return {

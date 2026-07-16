@@ -106,7 +106,7 @@ running:
 
 | Expectation | Reality today |
 |---|---|
-| Token names where each side should publish | Only carries *A's* root; B is expected to already be pre-configured to the same server — no protocol-level negotiation of the meeting point |
+| Token names where each side should publish | **[FIXED for the no-config accepter]** was: only carried *A's* root and B had to be pre-configured to the same server. Now the token also carries A's host/port/root **and scoped credentials**, and an accepter with no relay storage builds one from the token (§1.6). Still pre-config-dependent only if the accepter *already* hosts its own relay pointed elsewhere (documented limitation) |
 | Token has an expiration | No expiration field anywhere, on token or channel descriptor |
 | A polls "B's folder" specifically, once B accepts | `poll_and_apply` scans *every* topic from *every* peer_id on the shared root — but see the "active relationship" row below: the loop no longer runs at all until a relay relationship exists |
 | Publish/poll triggered by token exchange | **[FIXED]** was: both ran continuously from app boot, independent of any handshake. Now the `relay_poll_loop` is gated on `has_active_relationship()` — see below |
@@ -193,11 +193,15 @@ from the token, not pre-configured on the accepter — see §1.6.
 
 ### 1.6 Relay bootstrapping: meet in the inviter's space
 
-**[PROPOSED — target model, not built.]** This is the model the relay path
-is meant to reach; the current code does *not* do this yet (see the "Reality
-today" table in §1.4 — B's publish location comes entirely from B's own
-local config and never from the token, so today it only works because both
-sides were manually pre-pointed at the same server).
+**[PARTIALLY BUILT.]** The accepter-provisioning slice (a pure accepter
+builds its single storage from the token) plus the credential-in-token
+reversal are **[DONE]**; the full per-relationship *multi*-storage
+generalization is still **[PROPOSED]**. What's built: `RelayLogic.
+adopt_storage_from_descriptor` / `_storage_from_descriptor` build storage
+from a token descriptor when the accepter has none, wired into
+`accept_connect_token`'s relay branch; `channel_descriptor` now carries the
+SFTP username+password. So an accepter with zero relay config now rides the
+inviter's token straight into the inviter's space — no shared config file.
 
 **The model.** Every relay meeting happens in the **inviter's** relay space:
 
@@ -222,13 +226,26 @@ advertised root: accepting A's token spins up a storage pointed at A's
 host/root; accepting C's token adds another; plus your own root if you
 invite. A session can be publishing into several roots at once.
 
-**The credential decision — [SETTLED].** For B to *write* into A's SFTP
-space, B must authenticate to A's server. This **reverses** the current
-explicit decision that a channel descriptor never carries credentials
-(enforced today by `test_sftp_channel_descriptor_never_includes_credentials`,
-tests/test_relay_logic.py). The token will carry the SFTP credential, making
-it a **bearer credential**. This is made safe by *scoping*, not by hiding
-(you cannot hide a credential from the party whose software must use it):
+**Built so far — single storage, token-provisioned [DONE].** The first
+slice keeps *one* storage: a pure accepter with no storage builds it from
+the token (`adopt_storage_from_descriptor`, no-op if it already hosts a
+relay); bookkeeping is re-keyed to the adopted location via the existing
+identity+location fingerprint. **Known limitation by scope:** if the
+accepter already has its own storage but the token advertises a *different*
+root, the token's location is ignored (its own is used) — a silent mismatch
+that won't sync. Supported topology is "everyone shares one relay server";
+true multi-root storage (a session talking to several servers at once) is
+the deferred next slice.
+
+**The credential decision — [DONE].** For B to *write* into A's SFTP
+space, B must authenticate to A's server. This **reversed** the earlier
+decision that a channel descriptor never carries credentials — the old
+`test_sftp_channel_descriptor_never_includes_credentials` is replaced by
+`test_sftp_channel_descriptor_includes_credentials`, and `channel_descriptor`
+now embeds the SFTP username+password (never the private key/passphrase — a
+password is carried, never a key). The token is now a **bearer credential**,
+made safe by *scoping*, not by hiding (you cannot hide a credential from the
+party whose software must use it):
 
 - The credential is for a **dedicated SFTP account chroot-jailed to the
   `/relay` folder only** — no shell, no access to anything else on the
