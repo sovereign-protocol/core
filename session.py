@@ -5,7 +5,6 @@ Offered API:
   Session(address)
   start_discussion(topic_uuid)
   add_peer(peer_addr, topic_uuid)
-  handle_ping(message)
   handle_join(message)
   handle_announce(message)
   handle_leave(message)
@@ -118,7 +117,7 @@ class Session:
         self.peer_topics: dict[str, str] = {}
         self.peer_topic_sets: dict[str, set[str]] = {}
         self.peer_fetch_topic_sets: dict[str, set[str]] = {}
-        self.peer_perspectives: dict[str, PRSPNode | None] = {}
+        self.peer_perspectives: dict[str, PRSPNode] = {}
         self.peer_status: dict[str, dict[str, Any]] = {}
         # Which channel type last successfully delivered to/from a peer
         # address - purely informational (the only transport-shaped thing
@@ -519,51 +518,6 @@ class Session:
         return SessionResult("ok", effects=effects)
 
     # Incoming session messages
-
-    def handle_ping(self, message: dict) -> SessionResult:
-        from_addr = message.get("from_addr")
-        topic_uuid = message.get("topic_uuid")
-        topic_state_hash = message.get("topic_state_hash")
-        changed_uuid = message.get("changed_uuid")
-        if not from_addr:
-            return SessionResult("error", reason="missing from_addr")
-        if not topic_uuid:
-            return SessionResult("error", reason="missing topic_uuid")
-
-        local_topic_state_hash = self.node_state_hash(topic_uuid)
-        self.add_peer(from_addr, topic_uuid)
-        self.mark_peer_reachable(from_addr)
-        cached = self.peer_perspectives.get(from_addr)
-        cached_topic = self._find_in_tree(cached, topic_uuid) if cached else None
-        cached_state_hash = cached_topic.state_hash if cached_topic else None
-        pull_uuid = None
-        if not (message.get("health_check") and topic_state_hash is None):
-            if cached_topic is None:
-                pull_uuid = topic_uuid
-            elif cached_state_hash != topic_state_hash:
-                pull_uuid = changed_uuid or topic_uuid
-
-        effects = []
-        if pull_uuid:
-            effects.append(SessionEffect(
-                "pull_subtree",
-                from_addr,
-                {"node_uuid": pull_uuid, "topic_uuid": topic_uuid},
-            ))
-        self.trace_event(
-            "session.handle_ping",
-            from_addr=from_addr,
-            topic_uuid=topic_uuid,
-            topic_state_hash=topic_state_hash,
-            cached_state_hash=cached_state_hash,
-            changed_uuid=changed_uuid,
-            pull_uuid=pull_uuid,
-            effects=[effect.type for effect in effects],
-        )
-        return SessionResult("ok", value={
-            "topic_uuid": topic_uuid,
-            "topic_state_hash": local_topic_state_hash,
-        }, effects=effects)
 
     def handle_sync_status(self, message: dict) -> SessionResult:
         from_addr = message.get("from_addr")
@@ -1362,9 +1316,9 @@ class Session:
             "topic_uuids": sorted(self.active_topic_uuids),
             "peers": {
                 addr: {
-                    "content_hash": tree.content_hash if tree else None,
-                    "state_hash": tree.state_hash if tree else None,
-                    "root_uuid": tree.uuid if tree else None,
+                    "content_hash": tree.content_hash,
+                    "state_hash": tree.state_hash,
+                    "root_uuid": tree.uuid,
                     "topic_uuid": self.peer_topics.get(addr),
                     "topic_uuids": sorted(self.peer_topic_sets.get(addr) or []),
                     "status": self.peer_status.get(addr, self._new_peer_status()),

@@ -83,7 +83,7 @@ class SessionTests(unittest.TestCase):
             session.node_state_hash(topic.uuid),
         )
 
-    def test_local_change_outside_topic_does_not_ping_topic_peers(self):
+    def test_local_change_outside_topic_does_not_sync_topic_peers(self):
         session = Session("si-a")
         topic = session.create_child(
             session.protocol.root.uuid,
@@ -97,22 +97,6 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.effects, [])
-
-    def test_handle_ping_without_peer_cache_pulls_topic(self):
-        session = Session("si-a")
-
-        result = session.handle_ping({
-            "from_addr": "si-b",
-            "topic_uuid": "topic-1",
-            "topic_state_hash": "remote-hash",
-            "changed_uuid": "changed-1",
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.effects[0].type, "pull_subtree")
-        self.assertEqual(result.effects[0].target, "si-b")
-        self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
-        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "online")
 
     def test_peer_can_be_marked_offline_and_recovered(self):
         session = Session("si-a")
@@ -128,37 +112,6 @@ class SessionTests(unittest.TestCase):
 
         self.assertTrue(recovered)
         self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "online")
-
-    def test_handle_ping_with_peer_cache_pulls_changed_subtree(self):
-        session = Session("si-a")
-        topic = PRSPNode({"name": "topic"})
-        topic.uuid = "topic-1"
-        topic.refresh_hashes()
-        session.apply_peer_subtree("si-b", topic, None)
-
-        result = session.handle_ping({
-            "from_addr": "si-b",
-            "topic_uuid": "topic-1",
-            "topic_state_hash": "remote-hash",
-            "changed_uuid": "changed-1",
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.effects[0].payload["node_uuid"], "changed-1")
-
-    def test_handle_ping_without_cached_topic_pulls_topic_root(self):
-        session = Session("si-a")
-        session.apply_peer_subtree("si-b", PRSPNode({"name": "other"}), None)
-
-        result = session.handle_ping({
-            "from_addr": "si-b",
-            "topic_uuid": "topic-1",
-            "topic_state_hash": "remote-hash",
-            "changed_uuid": "changed-1",
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
 
     def test_handle_join_ignores_unrelated_members_without_topic_backing(self):
         # A join request that only names "si-c" via an unrelated/legacy
@@ -639,56 +592,6 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ok")
         self.assertNotIn(child.uuid, local.protocol.index)
-
-    def test_ping_compares_cached_topic_not_aggregate_peer_cache(self):
-        local = Session("si-a")
-        peer = Session("si-b")
-        first = peer.create_child(peer.protocol.root.uuid, {"name": "first"}, {}).value
-        second = peer.create_child(peer.protocol.root.uuid, {"name": "second"}, {}).value
-        local.add_peer("si-b", first.uuid)
-        local.add_peer("si-b", second.uuid)
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[first.uuid].to_dict()),
-            peer.protocol.root.uuid,
-        )
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[second.uuid].to_dict()),
-            peer.protocol.root.uuid,
-        )
-
-        result = local.handle_ping({
-            "from_addr": "si-b",
-            "topic_uuid": first.uuid,
-            "topic_state_hash": first.state_hash,
-            "changed_uuid": None,
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.effects, [])
-
-    def test_ping_ignores_changed_uuid_when_cached_topic_hash_matches(self):
-        local = Session("si-a")
-        peer = Session("si-b")
-        topic = peer.create_child(peer.protocol.root.uuid, {"name": "topic"}, {}).value
-        child = peer.create_child(topic.uuid, {"name": "child"}, {}).value
-        local.add_peer("si-b", topic.uuid)
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            peer.protocol.root.uuid,
-        )
-
-        result = local.handle_ping({
-            "from_addr": "si-b",
-            "topic_uuid": topic.uuid,
-            "topic_state_hash": peer.protocol.index[topic.uuid].state_hash,
-            "changed_uuid": child.uuid,
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.effects, [])
 
     def test_leave_returns_transport_effects_and_clears_session(self):
         session = Session("si-a")

@@ -15,7 +15,6 @@ Offered API:
   observe_topic(peer_addr, topic_uuid)
   invite_to_discuss(peer_addr, topic_uuid)
   leave_discussion()
-  p2p_ping(payload)
   p2p_join(payload)
   p2p_announce(payload)
   p2p_leave(payload)
@@ -26,7 +25,6 @@ Used API:
   protocol.PRSPNode only for checked wire decoding.
 
 HTTP contract:
-  POST /p2p/ping
   POST /p2p/sync_status
   POST /p2p/join
   POST /p2p/announce
@@ -122,8 +120,6 @@ class HttpTransportAdapter:
         try:
             if effect.type == "send_sync_status":
                 return self._send_sync_status(effect)
-            if effect.type == "send_ping":
-                return self._send_ping(effect)
             if effect.type == "pull_subtree":
                 return self._pull_subtree_effect(effect)
             if effect.type == "announce_peer":
@@ -162,8 +158,6 @@ class HttpTransportAdapter:
                 payload=effect.payload,
                 reason=str(exc),
             )
-            if effect.type == "send_ping" and effect.target:
-                self.session.mark_peer_unreachable(effect.target, str(exc))
             if effect.type == "send_sync_status" and effect.target:
                 self.session.record_sync_failure(effect.target, str(exc))
             if effect.type == "pull_subtree" and effect.target:
@@ -202,30 +196,6 @@ class HttpTransportAdapter:
         return TransportDelivery(True, effect.type, effect.target,
                                  response=response)
 
-    def _send_ping(self, effect: SessionEffect) -> TransportDelivery:
-        self.trace.event(
-            "transport.send_ping",
-            target=effect.target,
-            topic_uuid=effect.payload.get("topic_uuid"),
-            changed_uuid=effect.payload.get("changed_uuid"),
-            topic_state_hash=effect.payload.get("topic_state_hash"),
-            health_check=bool(effect.payload.get("health_check")),
-        )
-        response = self.http.post_json(
-            self._url(effect.target, "/p2p/ping"),
-            effect.payload,
-            timeout=10,
-        )
-        self.session.mark_peer_reachable(effect.target)
-        self.trace.event(
-            "transport.send_ping_ok",
-            target=effect.target,
-            topic_uuid=effect.payload.get("topic_uuid"),
-            response_status=response.get("status"),
-        )
-        return TransportDelivery(True, effect.type, effect.target,
-                                 response=response)
-
     def _pull_subtree_effect(self, effect: SessionEffect) -> TransportDelivery:
         node_uuid = effect.payload["node_uuid"]
         self.trace.event(
@@ -253,9 +223,9 @@ class HttpTransportAdapter:
                                  response=payload)
 
     def _announce_peer(self, effect: SessionEffect) -> TransportDelivery:
-        targets = effect.payload.get("new_addrs")
-        if targets is None:
-            targets = [effect.payload.get("new_addr")]
+        # Session.leave always emits plural new_addrs; "new_addr" below is
+        # only the per-recipient wire field, not an accepted input shape.
+        targets = effect.payload.get("new_addrs") or []
         responses = []
         for new_addr in targets:
             if not new_addr:
@@ -478,94 +448,7 @@ class HttpTransportAdapter:
         result = self.session.leave_topic(topic_uuid)
         return self.execute_effects(result.effects)
 
-    def check_peer_health(self, peer_addr: str, timeout: float = 2) -> TransportDelivery:
-        topic_uuids = self.session.fetch_topic_uuids(peer_addr)
-        self.trace.event(
-            "transport.health_ping",
-            peer_addr=peer_addr,
-            topic_uuids=topic_uuids,
-        )
-        if not topic_uuids:
-            changed = self.session.mark_peer_unreachable(peer_addr, "no shared topics")
-            return TransportDelivery(
-                False,
-                "health_ping",
-                peer_addr,
-                "no shared topics",
-                response={"status_changed": changed},
-            )
-        responses = []
-        try:
-            for topic_uuid in topic_uuids:
-                try:
-                    topic_state_hash = self.session.node_state_hash(topic_uuid)
-                    response = self.http.post_json(
-                        self._url(peer_addr, "/p2p/ping"),
-                        {
-                            "from_addr": self.session.address,
-                            "topic_uuid": topic_uuid,
-                            "topic_state_hash": topic_state_hash,
-                            "changed_uuid": None,
-                            "health_check": True,
-                        },
-                        timeout=timeout,
-                    )
-                    responses.append(response)
-                    remote_state_hash = response.get("topic_state_hash")
-                    if remote_state_hash is None:
-                        self.session.remove_peer_fetch_topic(peer_addr, topic_uuid)
-                        continue
-                    cached_state_hash = self.session.cached_peer_topic_state_hash(
-                        peer_addr,
-                        topic_uuid,
-                    )
-                    if cached_state_hash != remote_state_hash:
-                        subtree_payload = self.fetch_subtree(peer_addr, topic_uuid)
-                        self.session.apply_peer_subtree(
-                            peer_addr,
-                            self._decode_wire_subtree(subtree_payload["subtree"], peer_addr),
-                            subtree_payload.get("parent_uuid"),
-                        )
-                except Exception as exc:
-                    if self._is_not_found(exc):
-                        self.session.remove_peer_fetch_topic(peer_addr, topic_uuid)
-                    raise
-            changed = self.session.mark_peer_reachable(peer_addr)
-            self.trace.event(
-                "transport.health_ping_ok",
-                peer_addr=peer_addr,
-                topic_uuids=topic_uuids,
-                status_changed=changed,
-            )
-            return TransportDelivery(
-                True,
-                "health_ping",
-                peer_addr,
-                response={"responses": responses, "status_changed": changed},
-            )
-        except Exception as exc:
-            changed = self.session.mark_peer_unreachable(peer_addr, str(exc))
-            self.logger(f"[transport] health_ping failed for {peer_addr}: {exc}")
-            self.trace.event(
-                "transport.health_ping_failed",
-                peer_addr=peer_addr,
-                topic_uuids=topic_uuids,
-                reason=str(exc),
-                status_changed=changed,
-            )
-            return TransportDelivery(
-                False,
-                "health_ping",
-                peer_addr,
-                str(exc),
-                response={"status_changed": changed},
-            )
-
     # Incoming P2P endpoints
-
-    def p2p_ping(self, payload: dict) -> tuple[dict, int]:
-        self.trace.event("transport.p2p_ping", payload=payload)
-        return self._handle_session_result(self.session.handle_ping(payload))
 
     def p2p_sync_status(self, payload: dict) -> tuple[dict, int]:
         self.trace.event("transport.p2p_sync_status", payload=payload)
