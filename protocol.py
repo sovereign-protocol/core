@@ -60,6 +60,13 @@ def state_hash(node_content_hash: str, child_state_hashes: list[str]) -> str:
     })
 
 
+def collect_subtree_uuids(node: "PRSPNode") -> set[str]:
+    out = {node.uuid}
+    for child in node.children:
+        out.update(collect_subtree_uuids(child))
+    return out
+
+
 @dataclass
 class ProtocolResult:
     ok: bool
@@ -101,13 +108,8 @@ class PRSPNode:
         )
 
     def refresh_hashes(self) -> None:
-        new_content_hash = self.recompute_content_hash()
-        new_state_hash = state_hash(
-            new_content_hash,
-            sorted(child.state_hash for child in self.children),
-        )
-        self.content_hash = new_content_hash
-        self.state_hash = new_state_hash
+        self.content_hash = self.recompute_content_hash()
+        self.state_hash = self.recompute_state_hash()
 
     def refresh_hashes_deep(self) -> None:
         for child in self.children:
@@ -210,14 +212,14 @@ class ProtocolState:
         return ProtocolResult(True, True)
 
     def delete(self, node_uuid: str) -> ProtocolResult:
-        ok = self.delete_locked(node_uuid)
+        ok = self._delete_impl(node_uuid)
         return ProtocolResult(ok, ok, None if ok else "delete failed")
 
     def set_perspective_state(self, node_uuid: str, state: str) -> ProtocolResult:
-        ok = self.set_perspective_state_locked(node_uuid, state)
+        ok = self._set_perspective_state_impl(node_uuid, state)
         return ProtocolResult(ok, ok, None if ok else "set_perspective_state failed")
 
-    def set_perspective_state_locked(self, node_uuid: str, state: str) -> bool:
+    def _set_perspective_state_impl(self, node_uuid: str, state: str) -> bool:
         if state not in PERSPECTIVE_STATES:
             return False
         node = self.index.get(node_uuid)
@@ -239,12 +241,18 @@ class ProtocolState:
         return ProtocolResult(True, clone)
 
     def move(self, source_uuid: str, destination_uuid: str) -> ProtocolResult:
-        ok = self.move_locked(source_uuid, destination_uuid)
+        ok = self._move_impl(source_uuid, destination_uuid)
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
     def move_child(self, source_uuid: str, destination_uuid: str,
                    index: int | None = None) -> ProtocolResult:
-        ok = self.move_child_locked(source_uuid, destination_uuid, index)
+        # NOTE on `index`: sibling *position* is not part of any hash
+        # (content/state hashes sort their children), so it never syncs -
+        # it only affects this local list's order. An app that wants order
+        # to replicate must carry it in node data and sort on read, the way
+        # kanban's `data.order` + _place_in_order does. Passing `index`
+        # alone will silently look right locally and wrong on every peer.
+        ok = self._move_child_impl(source_uuid, destination_uuid, index)
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
     def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
@@ -252,7 +260,7 @@ class ProtocolState:
         if parent_uuid not in self.index:
             return ProtocolResult(False, reason="parent not found")
         adopted = PRSPNode.from_dict(tree.to_dict())
-        ok = self.adopt_subtree_locked(
+        ok = self._adopt_subtree_impl(
             adopted,
             parent_uuid,
             remove_descendant_duplicates=remove_descendant_duplicates,
@@ -270,7 +278,7 @@ class ProtocolState:
         root = self.index.get(root_uuid)
         if not root:
             return ProtocolResult(False, reason="root not found")
-        changed = self.remove_subtree_uuids_locked(root, set(uuids))
+        changed = self._remove_subtree_uuids_impl(root, set(uuids))
         return ProtocolResult(True, changed)
 
     # Topic / tree helpers
@@ -328,7 +336,7 @@ class ProtocolState:
         clone.refresh_hashes_deep()
         return clone
 
-    def delete_locked(self, node_uuid: str) -> bool:
+    def _delete_impl(self, node_uuid: str) -> bool:
         node = self.index.get(node_uuid)
         if not node or node.parent_uuid is None or node.deleted:
             return False
@@ -346,10 +354,10 @@ class ProtocolState:
         for child in node.children:
             self._mark_deleted_cascade(child)
 
-    def move_locked(self, source_uuid: str, destination_uuid: str) -> bool:
-        return self.move_child_locked(source_uuid, destination_uuid, None)
+    def _move_impl(self, source_uuid: str, destination_uuid: str) -> bool:
+        return self._move_child_impl(source_uuid, destination_uuid, None)
 
-    def move_child_locked(self, source_uuid: str, destination_uuid: str,
+    def _move_child_impl(self, source_uuid: str, destination_uuid: str,
                           index: int | None = None) -> bool:
         node = self.index.get(source_uuid)
         destination = self.index.get(destination_uuid)
@@ -377,17 +385,27 @@ class ProtocolState:
         self.cascade_hash(destination.uuid)
         return True
 
-    def adopt_subtree_locked(self, adopted: PRSPNode, parent_uuid: str,
+    def _adopt_subtree_impl(self, adopted: PRSPNode, parent_uuid: str,
                              remove_descendant_duplicates: bool = False) -> bool:
         parent = self.index.get(parent_uuid)
         if not parent:
+            return False
+        existing = self.index.get(adopted.uuid)
+        if existing and parent_uuid in self.collect_subtree_uuids(existing):
+            # The destination lives inside the subtree we'd be replacing, so
+            # detaching `existing` would take the destination with it and
+            # leave nothing to re-attach to - the node would vanish from the
+            # tree. Refuse before mutating anything rather than fail halfway
+            # through. No current caller can reach this (replace_subtree
+            # uses the node's own parent; accept_peer_node verifies the
+            # parent in the local index) - the guard makes that an invariant
+            # of the function instead of a property of its callers.
             return False
         touched_parent_uuids = {parent.uuid}
         adopted.parent_uuid = parent.uuid
         if remove_descendant_duplicates:
             duplicates = self.collect_subtree_uuids(adopted) - {adopted.uuid}
-            self.remove_subtree_uuids_locked(self.root, duplicates)
-        existing = self.index.get(adopted.uuid)
+            self._remove_subtree_uuids_impl(self.root, duplicates)
         if existing:
             old_parent = self.index.get(existing.parent_uuid)
             self.deindex_subtree(existing)
@@ -410,13 +428,9 @@ class ProtocolState:
             self.cascade_hash(touched_uuid)
         return True
 
-    def collect_subtree_uuids(self, node: PRSPNode) -> set[str]:
-        out = {node.uuid}
-        for child in node.children:
-            out.update(self.collect_subtree_uuids(child))
-        return out
+    collect_subtree_uuids = staticmethod(collect_subtree_uuids)
 
-    def remove_subtree_uuids_locked(self, root: PRSPNode, uuids: set[str]) -> bool:
+    def _remove_subtree_uuids_impl(self, root: PRSPNode, uuids: set[str]) -> bool:
         changed = False
         kept = []
         for child in root.children:
@@ -424,7 +438,7 @@ class ProtocolState:
                 self.deindex_subtree(child)
                 changed = True
                 continue
-            changed = self.remove_subtree_uuids_locked(child, uuids) or changed
+            changed = self._remove_subtree_uuids_impl(child, uuids) or changed
             kept.append(child)
         root.children = kept
         if changed:

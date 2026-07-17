@@ -41,7 +41,7 @@ import uuid as uuid_mod
 from dataclasses import dataclass, field
 from typing import Any, Callable
 
-from protocol import PRSPNode, ProtocolState, stable_hash
+from protocol import PRSPNode, ProtocolState, collect_subtree_uuids, stable_hash
 from trace_log import TraceLogger
 
 
@@ -339,7 +339,7 @@ class Session:
     def note_relay_peer_topic(self, peer_addr: str, topic_uuid: str) -> None:
         # Relay peers (peer_addr like "relay:<identity>") never go through
         # add_peer - that would also add them to self.members, which
-        # pending_sync_effects/_sync_effects iterate to decide who to push
+        # pending_sync_effects/sync_effects iterate to decide who to push
         # real HTTP effects to, and a relay identity isn't HTTP-reachable at
         # that address. But kanban_logic's auto-adopt gates candidates on
         # peer_topic_sets (_peer_discusses_node) to know a cached peer
@@ -440,18 +440,22 @@ class Session:
         return SessionResult("ok", value=result.value)
 
     def leave(self) -> SessionResult:
+        # Also tells each peer about the others, so the mesh survives our
+        # departure - otherwise identical to disconnect().
+        return self._leave_all(announce=True)
+
+    def disconnect(self) -> SessionResult:
+        return self._leave_all(announce=False)
+
+    def _leave_all(self, announce: bool) -> SessionResult:
         peers = sorted(self.members - {self.address})
-        peer_topics = {
-            peer: set(self.peer_topic_sets.get(peer) or [])
-            for peer in peers
-        }
         effects = []
-        for peer in peers:
-            topic_uuids = peer_topics.get(peer) or set()
-            if not topic_uuids:
-                continue
-            others = [other for other in peers if other != peer]
-            if others:
+        if announce:
+            for peer in peers:
+                topic_uuids = set(self.peer_topic_sets.get(peer) or [])
+                others = [other for other in peers if other != peer]
+                if not topic_uuids or not others:
+                    continue
                 effects.append(SessionEffect(
                     "announce_peer",
                     peer,
@@ -467,23 +471,15 @@ class Session:
                 peer,
                 {"from_addr": self.address},
             ))
-        self.members = {self.address}
-        self.peer_topics.clear()
-        self.peer_topic_sets.clear()
-        self.peer_fetch_topic_sets.clear()
-        self.peer_perspectives.clear()
-        self.peer_status.clear()
-        self.peer_sync_state.clear()
-        self.observed_topics.clear()
-        self.active_topic_uuids.clear()
+        self._clear_all_peer_state()
         return SessionResult("ok", effects=effects)
 
-    def disconnect(self) -> SessionResult:
-        peers = sorted(self.members - {self.address})
-        effects = [
-            SessionEffect("send_leave", peer, {"from_addr": self.address})
-            for peer in peers
-        ]
+    def _clear_all_peer_state(self) -> None:
+        # Bulk counterpart of remove_peer - clears every per-peer structure
+        # for *every* peer (including relay pseudo-addresses, which live in
+        # peer_topic_sets/peer_perspectives without ever being members).
+        # peer_identity_key is deliberately kept, for the same reason
+        # remove_peer keeps it: it's knowledge, not registration.
         self.members = {self.address}
         self.peer_topics.clear()
         self.peer_topic_sets.clear()
@@ -491,9 +487,9 @@ class Session:
         self.peer_perspectives.clear()
         self.peer_status.clear()
         self.peer_sync_state.clear()
+        self.peer_channel.clear()
         self.observed_topics.clear()
         self.active_topic_uuids.clear()
-        return SessionResult("ok", effects=effects)
 
     def leave_topic(self, topic_uuid: str) -> SessionResult:
         peers = sorted(
@@ -685,13 +681,7 @@ class Session:
                 self._remove_uuid_from_tree(tree, topic_uuid)
                 self._refresh_tree_hashes(tree)
             return SessionResult("ok")
-        self.members.discard(from_addr)
-        self.peer_topics.pop(from_addr, None)
-        self.peer_topic_sets.pop(from_addr, None)
-        self.peer_fetch_topic_sets.pop(from_addr, None)
-        self.peer_perspectives.pop(from_addr, None)
-        self.peer_status.pop(from_addr, None)
-        self.peer_sync_state.pop(from_addr, None)
+        self.remove_peer(from_addr)
         return SessionResult("ok")
 
     def mark_peer_reachable(self, peer_addr: str) -> bool:
@@ -741,7 +731,7 @@ class Session:
             self.prune_deleted_nodes()
             return
 
-        subtree_uuids = self._collect_subtree_uuids(subtree)
+        subtree_uuids = collect_subtree_uuids(subtree)
         target = self._find_in_tree(cached, subtree.uuid)
         if target is None:
             for uuid in subtree_uuids:
@@ -939,7 +929,7 @@ class Session:
             state_hash=child.state_hash,
         )
         return SessionResult("ok", value=self._snapshot_node(child),
-                             effects=self._sync_effects(parent_uuid))
+                             effects=self.sync_effects(parent_uuid))
 
     def modify(self, node_uuid: str, data: dict,
                weights: dict[str, float] | None = None) -> SessionResult:
@@ -1037,7 +1027,7 @@ class Session:
             return SessionResult("error", reason=result.reason)
         clone = result.value
         return SessionResult("ok", value=self._snapshot_node(clone),
-                             effects=self._sync_effects(destination_uuid))
+                             effects=self.sync_effects(destination_uuid))
 
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self._protocol.move(source_uuid, destination_uuid)
@@ -1090,7 +1080,7 @@ class Session:
             remove_descendant_duplicates=remove_descendant_duplicates,
         )
         return SessionResult("ok", value=self._snapshot_node(adopted),
-                             effects=self._sync_effects(adopted.uuid))
+                             effects=self.sync_effects(adopted.uuid))
 
     def replace_subtree(self, tree: PRSPNode) -> SessionResult:
         local = self._protocol.index.get(tree.uuid)
@@ -1116,7 +1106,7 @@ class Session:
             ok=True,
         )
         return SessionResult("ok", value=self._snapshot_node(replaced),
-                             effects=self._sync_effects(replaced.uuid))
+                             effects=self.sync_effects(replaced.uuid))
 
     def accept_peer_node(self, peer_addr: str, node_uuid: str,
                          adopt_absence: bool = False) -> SessionResult:
@@ -1342,7 +1332,7 @@ class Session:
         if not result.ok:
             return SessionResult("error", reason=result.reason)
         return SessionResult("ok", value=True,
-                             effects=self._sync_effects(changed_uuid))
+                             effects=self.sync_effects(changed_uuid))
 
     def trace_event(self, kind: str, **fields: Any) -> None:
         self.trace.event(kind, **fields)
@@ -1361,20 +1351,9 @@ class Session:
         }
 
     def pending_sync_effects(self, now: float | None = None) -> list[SessionEffect]:
-        now = time.time() if now is None else now
-        effects = []
-        for peer in sorted(self.members - {self.address}):
-            state = self.peer_sync_state.setdefault(peer, self._new_peer_sync_state())
-            retry_after = state.get("retry_after")
-            if retry_after is not None and float(retry_after) > now:
-                continue
-            summary = self.sync_summary(peer)
-            if not summary["topics"]:
-                continue
-            if summary["sync_hash"] == state.get("last_delivered_sync_hash"):
-                continue
-            effects.append(self._sync_status_effect(peer, summary))
-        return effects
+        # The periodic sweep: every peer we owe a sync, minus those still in
+        # a retry backoff.
+        return self.sync_effects(respect_retry=True, now=now)
 
     def record_sync_failure(self, peer_addr: str, reason: str | None = None) -> bool:
         changed = self.mark_peer_unreachable(peer_addr, reason)
@@ -1420,18 +1399,30 @@ class Session:
             return True
         return bool(node.deleted)
 
-    def _sync_effects(self, changed_uuid: str | None) -> list[SessionEffect]:
+    def sync_effects(self, changed_uuid: str | None = None,
+                     respect_retry: bool = False,
+                     now: float | None = None) -> list[SessionEffect]:
+        # The one sync-status builder. Two callers, two optional filters:
+        # a local change syncs only the peers on the affected topic
+        # (changed_uuid); the periodic sweep skips peers still backing off
+        # (respect_retry). Everything else - the summary, the
+        # already-delivered check, the effect shape - is common.
         effects = []
         changed_topics = set(self._topics_for_change(changed_uuid))
         if changed_uuid and not changed_topics:
             return []
+        now = time.time() if now is None else now
         for peer in sorted(self.members - {self.address}):
             if changed_topics and not (changed_topics & self.peer_topic_sets.get(peer, set())):
                 continue
+            state = self.peer_sync_state.setdefault(peer, self._new_peer_sync_state())
+            if respect_retry:
+                retry_after = state.get("retry_after")
+                if retry_after is not None and float(retry_after) > now:
+                    continue
             summary = self.sync_summary(peer)
             if not summary["topics"]:
                 continue
-            state = self.peer_sync_state.setdefault(peer, self._new_peer_sync_state())
             if summary["sync_hash"] == state.get("last_delivered_sync_hash"):
                 continue
             effects.append(self._sync_status_effect(peer, summary))
@@ -1482,17 +1473,16 @@ class Session:
             else:
                 self.peer_topics.pop(peer_addr, None)
         if not self.peer_topic_sets.get(peer_addr):
-            self.members.discard(peer_addr)
-            self.peer_perspectives.pop(peer_addr, None)
-            self.peer_status.pop(peer_addr, None)
-            self.peer_sync_state.pop(peer_addr, None)
+            # Last topic gone - nothing left to track this peer for.
+            self.remove_peer(peer_addr)
 
     def remove_peer(self, peer_addr: str) -> None:
-        # Full teardown of one peer's registration, e.g. when a reconnect
-        # supersedes their old address - _remove_peer_topic already clears
-        # peer_perspectives/peer_status/peer_sync_state/members once a
-        # peer's last topic is gone, so drop every topic to trigger that;
-        # only peer_channel is left for this to clear directly.
+        # The single per-peer teardown: every path that stops tracking a
+        # peer (reconnect superseding an old address, handle_leave, the
+        # last-topic case above) goes through here. They used to each pop
+        # their own subset, and the subsets had drifted apart - which is
+        # how stale peer_channel entries survived a leave.
+        #
         # peer_identity_key is deliberately NOT cleared: it's knowledge
         # ("this address belongs to identity X"), not registration, and it
         # stays true after teardown. Clearing it here would erase the very
@@ -1500,8 +1490,6 @@ class Session:
         # address on later polls - the self-erasing-evidence flip-flop,
         # one level up. Reconnect-replace (accept_connect_token) forgets
         # superseded addresses explicitly instead.
-        for topic_uuid in sorted(self.peer_topic_sets.get(peer_addr) or ()):
-            self._remove_peer_topic(peer_addr, topic_uuid)
         self.peer_topic_sets.pop(peer_addr, None)
         self.peer_fetch_topic_sets.pop(peer_addr, None)
         self.peer_topics.pop(peer_addr, None)
@@ -1648,13 +1636,6 @@ class Session:
                 if local_node and peer_node else None
             ),
         }
-
-    @staticmethod
-    def _collect_subtree_uuids(node: PRSPNode) -> set[str]:
-        out = {node.uuid}
-        for child in node.children:
-            out.update(Session._collect_subtree_uuids(child))
-        return out
 
     @staticmethod
     def _remove_uuid_from_tree(root: PRSPNode, uuid: str) -> bool:

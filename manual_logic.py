@@ -32,7 +32,7 @@ class ManualLogic:
             "root": self.session.protocol.root.to_dict(),
             "network": self.session.get_network_info(),
             "peers": {
-                addr: tree.to_dict() if tree else None
+                addr: tree.to_dict()
                 for addr, tree in sorted(self.session.peer_perspectives.items())
             },
             "observed_topics": {

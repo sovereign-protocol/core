@@ -35,6 +35,7 @@ HTTP contract:
 
 from __future__ import annotations
 
+import copy
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -275,13 +276,22 @@ class HttpTransportAdapter:
             for topic_uuid in topic_uuids:
                 tree_payload = self.fetch_subtree(peer_addr, topic_uuid)
                 tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
+                # The grafted tree and the cached peer copy must be distinct
+                # objects, or divergence checks between "our copy" and
+                # "their copy" would compare a node against itself. Copy
+                # before grafting: accept_topic_invitation re-parents `tree`
+                # into our own container, so a copy taken afterwards would
+                # hold our parent, not the peer's wire state. Decoding twice
+                # (the previous approach) also re-verified every hash for
+                # nothing.
+                cached_copy = copy.deepcopy(tree)
                 accepted = self.session.accept_topic_invitation(tree)
                 if accepted.status != "ok":
                     return {"status": "error", "reason": accepted.reason}
                 adopted.append(accepted.value)
                 self.session.apply_peer_subtree(
                     peer_addr,
-                    self._decode_wire_subtree(tree_payload["subtree"], peer_addr),
+                    cached_copy,
                     tree_payload.get("parent_uuid"),
                 )
 
@@ -330,7 +340,7 @@ class HttpTransportAdapter:
                     {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
                 ))
         for topic_uuid in topic_uuids:
-            self.execute_effects(self.session._sync_effects(topic_uuid))
+            self.execute_effects(self.session.sync_effects(topic_uuid))
         return {
             "status": "ok",
             "members": sorted(all_members),
@@ -453,36 +463,21 @@ class HttpTransportAdapter:
     def p2p_sync_status(self, payload: dict) -> tuple[dict, int]:
         self.trace.event("transport.p2p_sync_status", payload=payload)
         result = self.session.handle_sync_status(payload)
-        if result.status != "ok":
-            return {"status": "error", "reason": result.reason}, 409
-        deliveries = self.execute_effects(result.effects)
-        failed = [delivery for delivery in deliveries if not delivery.ok]
         from_addr = payload.get("from_addr")
         incoming_summary = payload.get("summary") or {}
-        response_status = "partial" if failed else "ok"
-        response = {
-            "status": response_status,
-            "my_summary": self.session.sync_summary(from_addr),
-            "delivered_sync_hash": incoming_summary.get("sync_hash"),
-        }
-        if failed:
-            response["delivery_errors"] = [
-                {
-                    "effect_type": item.effect_type,
-                    "target": item.target,
-                    "reason": item.reason,
-                }
-                for item in failed
-            ]
-        self.trace.event(
-            "transport.sync_status_result",
-            from_addr=from_addr,
-            status=response_status,
-            effect_count=len(result.effects),
-            failed_count=len(failed),
-            delivered_sync_hash=response["delivered_sync_hash"],
+        # my_summary is deliberately recomputed *after* the pulls above run,
+        # and replaces the one in result.value (computed before them).
+        return self._handle_session_result(
+            result,
+            # `summary` in result.value is just an echo of what the peer
+            # sent us - no caller reads it back, so it stays off the wire.
+            merge_value=False,
+            extra_fields={
+                "my_summary": self.session.sync_summary(from_addr),
+                "delivered_sync_hash": incoming_summary.get("sync_hash"),
+            },
+            partial_on_failure=True,
         )
-        return response, 200
 
     def p2p_join(self, payload: dict) -> tuple[dict, int]:
         self.trace.event("transport.p2p_join", payload=payload)
@@ -539,16 +534,27 @@ class HttpTransportAdapter:
         return str(error).strip().lower() == "not found"
 
     def _handle_session_result(
-            self, result: SessionResult) -> tuple[dict, int]:
+            self, result: SessionResult,
+            extra_fields: dict[str, Any] | None = None,
+            merge_value: bool = True,
+            partial_on_failure: bool = False) -> tuple[dict, int]:
+        # The one incoming-endpoint shaper: run the session's effects,
+        # collect any delivery failures, and shape the response. The three
+        # options exist only for /p2p/sync_status, which reports "partial"
+        # when some effect failed and answers with its own fields rather
+        # than the session result's value.
         if result.status != "ok":
             return {"status": "error", "reason": result.reason}, 409
         deliveries = self.execute_effects(result.effects)
         failed = [delivery for delivery in deliveries if not delivery.ok]
-        payload = {"status": "ok"}
-        if isinstance(result.value, dict):
-            payload.update(result.value)
-        elif result.value is not None:
-            payload["value"] = result.value
+        payload = {"status": "partial" if failed and partial_on_failure else "ok"}
+        if merge_value:
+            if isinstance(result.value, dict):
+                payload.update(result.value)
+            elif result.value is not None:
+                payload["value"] = result.value
+        if extra_fields:
+            payload.update(extra_fields)
         if failed:
             payload["delivery_errors"] = [
                 {
