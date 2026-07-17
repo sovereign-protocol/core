@@ -78,6 +78,7 @@ class LocalFolderRelayStorage:
         peer_dir = self._peer_dir(topic_uuid, peer_id)
         snapshots_dir = peer_dir / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
+        previous = self._read_json(peer_dir / "head.json") or {}
         self._write_json(snapshots_dir / f"{state_hash}.json", payload)
         head = {
             "peer": peer_id,
@@ -87,6 +88,14 @@ class LocalFolderRelayStorage:
             "snapshot": f"snapshots/{state_hash}.json",
         }
         self._write_json(peer_dir / "head.json", head)
+        # GC superseded snapshots (review R-4): keep the new one plus the
+        # immediately-previous head's, so a lagging peer mid-fetch of the
+        # prior hash still finds it; older ones would otherwise accumulate
+        # on the server forever.
+        keep = {f"{state_hash}.json", f"{previous.get('hash')}.json"}
+        for entry in snapshots_dir.iterdir():
+            if entry.is_file() and entry.name not in keep:
+                entry.unlink()
 
     def read_head(self, topic_uuid: str, peer_id: str) -> dict | None:
         return self._read_json(self._peer_dir(topic_uuid, peer_id) / "head.json")
@@ -172,6 +181,7 @@ class SftpRelayStorage:
                        payload: dict) -> None:
         peer_dir = self._peer_dir(topic_uuid, peer_id)
         snapshots_dir = posixpath.join(peer_dir, "snapshots")
+        previous = self._read_json(posixpath.join(peer_dir, "head.json")) or {}
         self._write_json(posixpath.join(snapshots_dir, f"{state_hash}.json"), payload)
         head = {
             "peer": peer_id,
@@ -181,6 +191,30 @@ class SftpRelayStorage:
             "snapshot": f"snapshots/{state_hash}.json",
         }
         self._write_json(posixpath.join(peer_dir, "head.json"), head)
+        self._gc_snapshots(
+            snapshots_dir,
+            keep={f"{state_hash}.json", f"{previous.get('hash')}.json"},
+        )
+
+    def _gc_snapshots(self, snapshots_dir: str, keep: set[str]) -> None:
+        # Drop superseded snapshots (review R-4), keeping the new head's
+        # and the immediately-previous one (a lagging peer may be mid-fetch
+        # of that hash). Without this every published revision stayed on the
+        # server forever.
+        def operation(sftp):
+            try:
+                attrs = sftp.listdir_attr(snapshots_dir)
+            except FileNotFoundError:
+                return
+            for entry in attrs:
+                if stat.S_ISDIR(entry.st_mode or 0) or entry.filename in keep:
+                    continue
+                try:
+                    sftp.remove(posixpath.join(snapshots_dir, entry.filename))
+                except FileNotFoundError:
+                    pass
+
+        self._with_retry(operation)
 
     def read_head(self, topic_uuid: str, peer_id: str) -> dict | None:
         return self._read_json(posixpath.join(self._peer_dir(topic_uuid, peer_id), "head.json"))

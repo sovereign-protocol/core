@@ -379,6 +379,21 @@ class RelayLogic:
         self._activate_shared_boards()
         return SessionResult("ok", value=topic_uuids)
 
+    def unmark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
+        # The unshare counterpart (review R-3): without this, `shared` only
+        # ever grew - unsharing a board never stopped relay publishing it,
+        # and has_active_relationship() stayed armed forever once anything
+        # had ever been shared.
+        if not isinstance(topic_uuids, list) or not topic_uuids:
+            return SessionResult("error", reason="no topic_uuids given")
+        remove = {str(uuid) for uuid in topic_uuids}
+        self._state["shared"] = [
+            topic for topic in self._state.get("shared", [])
+            if topic not in remove
+        ]
+        self._save_state()
+        return SessionResult("ok", value=sorted(remove))
+
     def _activate_shared_boards(self) -> None:
         # A board this session has shared via a relay token is one it is
         # actively discussing - the relay analog of the /p2p/join that
@@ -624,6 +639,7 @@ class RelayLogic:
         self._state["published"].pop(topic_uuid, None)
         self._state["applied"].pop(topic_uuid, None)
         self._state["desired"] = [t for t in self._state.get("desired", []) if t != topic_uuid]
+        self._state["shared"] = [t for t in self._state.get("shared", []) if t != topic_uuid]
         self._save_state()
         return SessionResult("ok", value=topic_uuid)
 
