@@ -60,6 +60,7 @@ import json
 import os
 import posixpath
 import stat
+import threading
 import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -96,6 +97,15 @@ class LocalFolderRelayStorage:
         for entry in snapshots_dir.iterdir():
             if entry.is_file() and entry.name not in keep:
                 entry.unlink()
+
+    def verify_access(self) -> None:
+        """Verify that the configured relay root is writable."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        probe = self.root / f".s-kanban-probe-{os.getpid()}-{uuid_mod.uuid4().hex}"
+        try:
+            probe.write_bytes(b"")
+        finally:
+            probe.unlink(missing_ok=True)
 
     def read_head(self, topic_uuid: str, peer_id: str) -> dict | None:
         return self._read_json(self._peer_dir(topic_uuid, peer_id) / "head.json")
@@ -176,6 +186,10 @@ class SftpRelayStorage:
         self.root = remote_root.rstrip("/") or "/"
         self._client = None
         self._sftp = None
+        # Paramiko's SFTP client/channel is not safe for concurrent use.
+        # Relay polling and diagnostic/API reads can run in different worker
+        # threads, so every operation on this shared connection is serialized.
+        self._operation_lock = threading.RLock()
 
     def write_snapshot(self, topic_uuid: str, peer_id: str, state_hash: str,
                        payload: dict) -> None:
@@ -211,6 +225,26 @@ class SftpRelayStorage:
                     continue
                 try:
                     sftp.remove(posixpath.join(snapshots_dir, entry.filename))
+                except FileNotFoundError:
+                    pass
+
+        self._with_retry(operation)
+
+    def verify_access(self) -> None:
+        """Authenticate and verify write access without leaving relay data."""
+        probe = posixpath.join(
+            self.root,
+            f".s-kanban-probe-{os.getpid()}-{uuid_mod.uuid4().hex}",
+        )
+
+        def operation(sftp):
+            self._mkdir_p(sftp, self.root)
+            try:
+                with sftp.open(probe, "wb") as f:
+                    f.write(b"")
+            finally:
+                try:
+                    sftp.remove(probe)
                 except FileNotFoundError:
                     pass
 
@@ -327,11 +361,15 @@ class SftpRelayStorage:
     def _with_retry(self, operation):
         import paramiko
 
-        try:
-            return operation(self._sftp_client())
-        except (OSError, paramiko.SSHException):
-            self._reset_connection()
-            return operation(self._sftp_client())
+        with self._operation_lock:
+            try:
+                return operation(self._sftp_client())
+            except paramiko.AuthenticationException:
+                self._reset_connection()
+                raise
+            except (OSError, paramiko.SSHException):
+                self._reset_connection()
+                return operation(self._sftp_client())
 
     def _write_json(self, path: str, data: dict) -> None:
         payload = (json.dumps(data, sort_keys=True, indent=2) + "\n").encode("utf-8")

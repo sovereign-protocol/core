@@ -100,6 +100,7 @@ Used API:
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import hashlib
 import json
@@ -274,6 +275,10 @@ class RelayLogic:
         storage = self._storage_from_descriptor(descriptor)
         if storage is None:
             return False
+        self._install_adopted_storage(storage)
+        return True
+
+    def _install_adopted_storage(self, storage) -> None:
         self.storage = storage
         # Re-key bookkeeping to the real location. The boot-time
         # _state_path was fingerprinted from empty config (no storage);
@@ -286,7 +291,31 @@ class RelayLogic:
             pseudo_config, self.identity,
         )
         self._state = self._load_state()
-        return True
+
+    def ensure_usable_storage(self, descriptor: dict) -> SessionResult:
+        """Probe relay access and atomically adopt token storage when needed."""
+        candidate = self.storage
+        should_adopt = candidate is None
+        if candidate is None:
+            candidate = self._storage_from_descriptor(descriptor)
+        if candidate is None:
+            return SessionResult("error", reason="relay descriptor is not usable")
+        try:
+            verify = getattr(candidate, "verify_access", None)
+            if verify:
+                verify()
+            else:
+                candidate.list_topics()
+        except Exception as exc:
+            return SessionResult(
+                "error",
+                reason=f"relay unavailable: {type(exc).__name__}: {exc}",
+            )
+        if should_adopt:
+            # A failed token must not leave unusable storage installed and
+            # prevent a later corrected token from being adopted.
+            self._install_adopted_storage(candidate)
+        return SessionResult("ok")
 
     @staticmethod
     def _config_from_storage(storage) -> dict:
@@ -694,7 +723,10 @@ def channel_descriptor(runtime, config: dict) -> dict | None:
 
 def build_routes(logic: RelayLogic, runtime, config: dict) -> list[Route]:
     async def api_relay_status(request: Request):
-        return JSONResponse(logic.status_payload())
+        # SFTP liveness checks are blocking and share the serialized storage
+        # connection with the relay poll worker. Never block the event loop.
+        payload = await asyncio.to_thread(logic.status_payload)
+        return JSONResponse(payload)
 
     async def api_relay_delete_topic(request: Request):
         data = await request.json()

@@ -98,6 +98,11 @@ that doesn't go away, and isn't expected to.
   always-on publish/poll — both sides still write to the shared root from
   boot, independent of any token; see §1.4.)
 
+- **[DONE] `"relay_only": true`** — a client-wide transport policy. It
+  omits HTTP from generated tokens, refuses HTTP channels in received tokens,
+  rejects direct `/p2p` traffic, disables direct join/invite/observe actions,
+  and drops restored HTTP peers while leaving the local browser UI running.
+
 ### 1.4 Relay protocol specifics
 
 Verified against the current implementation (not assumed) — several pieces
