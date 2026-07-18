@@ -37,8 +37,10 @@ Transport contract:
 from __future__ import annotations
 
 import time
+import threading
 import uuid as uuid_mod
 from dataclasses import dataclass, field
+from functools import wraps
 from typing import Any, Callable
 
 from protocol import PRSPNode, ProtocolState, collect_subtree_uuids, stable_hash
@@ -46,6 +48,15 @@ from trace_log import TraceLogger
 
 
 _LOCAL_REVISION_ORIGIN = object()
+
+
+def _session_locked(method):
+    """Serialize access to Session's mutable protocol and peer state."""
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self.lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 @dataclass(frozen=True)
@@ -64,58 +75,75 @@ class SessionResult:
 
 
 class ReadOnlyProtocolIndex:
-    def __init__(self, protocol: ProtocolState):
+    def __init__(self, protocol: ProtocolState, lock: threading.RLock):
         self._protocol = protocol
+        self._lock = lock
 
     def __contains__(self, node_uuid: str) -> bool:
-        return node_uuid in self._protocol.index
+        with self._lock:
+            return node_uuid in self._protocol.index
 
     def __iter__(self):
-        return iter(self._protocol.index)
+        with self._lock:
+            return iter(tuple(self._protocol.index))
 
     def __len__(self) -> int:
-        return len(self._protocol.index)
+        with self._lock:
+            return len(self._protocol.index)
 
     def get(self, node_uuid: str, default=None) -> PRSPNode | None:
-        node = self._protocol.index.get(node_uuid)
-        return Session._snapshot_node(node) if node else default
+        with self._lock:
+            node = self._protocol.index.get(node_uuid)
+            return Session._snapshot_node(node) if node else default
 
     def __getitem__(self, node_uuid: str) -> PRSPNode:
-        node = self._protocol.index[node_uuid]
-        return Session._snapshot_node(node)
+        with self._lock:
+            node = self._protocol.index[node_uuid]
+            return Session._snapshot_node(node)
 
     def keys(self):
-        return self._protocol.index.keys()
+        with self._lock:
+            return tuple(self._protocol.index)
 
     def values(self):
-        for node in self._protocol.index.values():
-            yield Session._snapshot_node(node)
+        with self._lock:
+            return tuple(
+                Session._snapshot_node(node)
+                for node in self._protocol.index.values()
+            )
 
     def items(self):
-        for node_uuid, node in self._protocol.index.items():
-            yield node_uuid, Session._snapshot_node(node)
+        with self._lock:
+            return tuple(
+                (node_uuid, Session._snapshot_node(node))
+                for node_uuid, node in self._protocol.index.items()
+            )
 
 
 class ReadOnlyProtocolView:
-    def __init__(self, protocol: ProtocolState):
+    def __init__(self, protocol: ProtocolState, lock: threading.RLock):
         self._protocol = protocol
-        self.index = ReadOnlyProtocolIndex(protocol)
+        self._lock = lock
+        self.index = ReadOnlyProtocolIndex(protocol, lock)
 
     @property
     def root(self) -> PRSPNode:
-        return Session._snapshot_node(self._protocol.root)
+        with self._lock:
+            return Session._snapshot_node(self._protocol.root)
 
     @property
     def author(self) -> str:
-        return self._protocol.author
+        with self._lock:
+            return self._protocol.author
 
 
 class Session:
     def __init__(self, address: str, trace: TraceLogger | None = None):
+        self.lock = threading.RLock()
         self.address = address
         self.trace = trace or TraceLogger.disabled()
         self._protocol = ProtocolState(author=address)
-        self.protocol = ReadOnlyProtocolView(self._protocol)
+        self.protocol = ReadOnlyProtocolView(self._protocol, self.lock)
         self.members: set[str] = {address}
         self.peer_topics: dict[str, str] = {}
         self.peer_topic_sets: dict[str, set[str]] = {}
@@ -164,6 +192,7 @@ class Session:
         return self.create_child(parent.uuid, {"type": node_type, "name": name}, {}).value
 
     @property
+    @_session_locked
     def identity(self) -> PRSPNode:
         # The shared_user_data folder only ever holds this session's own
         # identity node - no address match needed to find "mine" among
@@ -215,6 +244,7 @@ class Session:
             return self.get_node(node.uuid) or node
         return node
 
+    @_session_locked
     def set_identity(self, display_name: str, picture: str = "",
                      email: str | None = None) -> SessionResult:
         profile = self.identity
@@ -322,12 +352,14 @@ class Session:
 
     # Read-only protocol access / persistence
 
+    @_session_locked
     def load_protocol_root(self, root: PRSPNode) -> None:
         self._protocol.root = root
         self._protocol.index = {}
         self._protocol.index_subtree(root)
-        self.protocol = ReadOnlyProtocolView(self._protocol)
+        self.protocol = ReadOnlyProtocolView(self._protocol, self.lock)
 
+    @_session_locked
     def export_protocol_root(self) -> dict:
         return self._protocol.root.to_dict()
 
@@ -337,6 +369,7 @@ class Session:
     def has_node(self, node_uuid: str | None) -> bool:
         return bool(node_uuid and node_uuid in self._protocol.index)
 
+    @_session_locked
     def node_state_hash(self, node_uuid: str) -> str | None:
         node = self._protocol.index.get(node_uuid)
         return node.state_hash if node else None
@@ -348,12 +381,14 @@ class Session:
 
     # Discussion/session state
 
+    @_session_locked
     def start_discussion(self, topic_uuid: str) -> SessionResult:
         if topic_uuid not in self._protocol.index:
             return SessionResult("error", reason="topic not found")
         self.active_topic_uuids.add(topic_uuid)
         return SessionResult("ok", value=topic_uuid)
 
+    @_session_locked
     def note_relay_peer_topic(self, peer_addr: str, topic_uuid: str) -> None:
         # Relay peers (peer_addr like "relay:<identity>") never go through
         # add_peer - that would also add them to self.members, which
@@ -446,6 +481,7 @@ class Session:
             for topic_uuid in topic_uuids
         }
 
+    @_session_locked
     def accept_topic_invitation(self, tree: PRSPNode,
                                 parent_uuid: str | None = None) -> SessionResult:
         result = self._protocol.attach_topic(
@@ -628,6 +664,7 @@ class Session:
             revisions.update(cls.node_revision_map(child))
         return revisions
 
+    @_session_locked
     def record_peer_observations(self, peer_addr: str,
                                  revisions: dict[str, str]) -> bool:
         if not peer_addr or not isinstance(revisions, dict):
@@ -772,6 +809,7 @@ class Session:
 
     # Peer cache
 
+    @_session_locked
     def apply_peer_subtree(self, peer_addr: str,
                            subtree: PRSPNode,
                            parent_uuid: str | None) -> None:
@@ -985,6 +1023,7 @@ class Session:
 
     # App-facing protocol wrappers
 
+    @_session_locked
     def create_child(self, parent_uuid: str, data: dict,
                      weights: dict[str, float] | None = None) -> SessionResult:
         revision_origin = self._local_revision_origin(data)
@@ -1005,6 +1044,7 @@ class Session:
         return SessionResult("ok", value=self._snapshot_node(child),
                              effects=self.sync_effects(parent_uuid))
 
+    @_session_locked
     def modify(self, node_uuid: str, data: dict,
                weights: dict[str, float] | None = None,
                revision_origin_identity: str | None | object = _LOCAL_REVISION_ORIGIN) -> SessionResult:
@@ -1032,6 +1072,7 @@ class Session:
         )
         return self._operation_result(result, node_uuid)
 
+    @_session_locked
     def delete(self, node_uuid: str) -> SessionResult:
         node = self._protocol.index.get(node_uuid)
         parent_uuid = node.parent_uuid if node else None
@@ -1051,6 +1092,7 @@ class Session:
         )
         return self._operation_result(result, parent_uuid or node_uuid)
 
+    @_session_locked
     def set_perspective_state(self, node_uuid: str, state: str) -> SessionResult:
         node = self._protocol.index.get(node_uuid)
         old_state_hash = node.state_hash if node else None
@@ -1108,6 +1150,7 @@ class Session:
             return True
         return any(Session._subtree_has_pushed_back(child) for child in node.children)
 
+    @_session_locked
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self._protocol.copy(
             source_uuid, destination_uuid, self._local_revision_origin(),
@@ -1118,12 +1161,14 @@ class Session:
         return SessionResult("ok", value=self._snapshot_node(clone),
                              effects=self.sync_effects(destination_uuid))
 
+    @_session_locked
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
         result = self._protocol.move(
             source_uuid, destination_uuid, self._local_revision_origin(),
         )
         return self._operation_result(result, source_uuid)
 
+    @_session_locked
     def move_child(self, source_uuid: str, destination_uuid: str,
                    index: int | None = None) -> SessionResult:
         node = self._protocol.index.get(source_uuid)
@@ -1147,6 +1192,7 @@ class Session:
         )
         return self._operation_result(result, source_uuid)
 
+    @_session_locked
     def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
                       remove_descendant_duplicates: bool = False) -> SessionResult:
         result = self._protocol.adopt_subtree(
@@ -1176,6 +1222,7 @@ class Session:
         return SessionResult("ok", value=self._snapshot_node(adopted),
                              effects=self.sync_effects(adopted.uuid))
 
+    @_session_locked
     def replace_subtree(self, tree: PRSPNode) -> SessionResult:
         local = self._protocol.index.get(tree.uuid)
         old_state_hash = local.state_hash if local else None
@@ -1217,6 +1264,7 @@ class Session:
             return SessionResult("error", reason="local parent not found")
         return self.adopt_subtree(peer, parent_uuid, remove_descendant_duplicates=True)
 
+    @_session_locked
     def reconcile_peer_changes(
         self,
         peer_addr: str,
@@ -1343,10 +1391,12 @@ class Session:
                           topic_uuid=topic_uuid, changed=changed)
         return changed
 
+    @_session_locked
     def remove_subtree_uuids(self, root_uuid: str, uuids: set[str]) -> SessionResult:
         result = self._protocol.remove_subtree_uuids(root_uuid, uuids)
         return self._operation_result(result, root_uuid)
 
+    @_session_locked
     def prune_deleted_nodes(self) -> None:
         deleted_uuids = self._collect_deleted_uuids(self._protocol.root)
         if not deleted_uuids:
@@ -1378,15 +1428,28 @@ class Session:
             out.update(Session._collect_deleted_uuids(child))
         return out
 
+    @_session_locked
     def get_node(self, node_uuid: str) -> PRSPNode | None:
         node = self._protocol.index.get(node_uuid)
         return self._snapshot_node(node) if node else None
 
+    @_session_locked
     def get_subtree(self, node_uuid: str) -> dict | None:
         node = self._protocol.index.get(node_uuid)
         if not node:
             return None
         return {
+            "subtree": node.to_dict(),
+            "parent_uuid": node.parent_uuid,
+        }
+
+    @_session_locked
+    def snapshot_subtree_state(self, node_uuid: str) -> tuple[str, dict] | None:
+        """Return a hash and its exact matching wire snapshot atomically."""
+        node = self._protocol.index.get(node_uuid)
+        if not node:
+            return None
+        return node.state_hash, {
             "subtree": node.to_dict(),
             "parent_uuid": node.parent_uuid,
         }
@@ -1573,6 +1636,7 @@ class Session:
             # Last topic gone - nothing left to track this peer for.
             self.remove_peer(peer_addr)
 
+    @_session_locked
     def remove_peer(self, peer_addr: str) -> None:
         # The single per-peer teardown: every path that stops tracking a
         # peer (reconnect superseding an old address, handle_leave, the

@@ -112,6 +112,7 @@ import threading
 import time
 import uuid as uuid_mod
 from collections import deque
+from functools import wraps
 from pathlib import Path
 from typing import Any
 
@@ -170,6 +171,22 @@ TIMING_CALIBRATION_SECONDS = 300.0
 # when two RelayLogic objects temporarily refer to that file during startup.
 _STATE_SAVE_LOCKS: dict[str, threading.Lock] = {}
 _STATE_SAVE_LOCKS_GUARD = threading.Lock()
+
+
+def _relay_io_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._io_lock:
+            return method(self, *args, **kwargs)
+    return locked
+
+
+def _manager_locked(method):
+    @wraps(method)
+    def locked(self, *args, **kwargs):
+        with self._manager_lock:
+            return method(self, *args, **kwargs)
+    return locked
 
 
 class RelayTiming:
@@ -323,7 +340,8 @@ class RelayTiming:
 class RelayLogic:
     def __init__(self, session: Session, config: dict):
         self.session = session
-        self._session_lock = threading.RLock()
+        self._io_lock = threading.RLock()
+        self._session_lock = session.lock
         self.kanban = KanbanLogic(session, config)
         self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
         self.storage = self._build_storage(config)
@@ -378,6 +396,7 @@ class RelayLogic:
             interval = fallback
         return min(MAX_RELAY_POLL_SECONDS, max(MIN_RELAY_POLL_SECONDS, interval))
 
+    @_relay_io_locked
     def adopt_poll_interval_from_descriptor(self, descriptor: dict) -> float:
         self.poll_interval_seconds = self._normalize_poll_interval(
             descriptor.get("poll_interval_seconds"), self.poll_interval_seconds,
@@ -464,6 +483,7 @@ class RelayLogic:
             )
         return None
 
+    @_relay_io_locked
     def adopt_storage_from_descriptor(self, descriptor: dict) -> bool:
         # Accepter entry point: build our single relay storage from a
         # token's advertised location when we don't already have one, so a
@@ -502,6 +522,7 @@ class RelayLogic:
         )
         self._state = self._load_state()
 
+    @_relay_io_locked
     def ensure_usable_storage(self, descriptor: dict) -> SessionResult:
         """Probe relay access and atomically adopt token storage when needed."""
         candidate = self.storage
@@ -543,6 +564,7 @@ class RelayLogic:
             }
         return {"relay_backend": "local", "relay_root": str(storage.root)}
 
+    @_relay_io_locked
     def relay_topic_uuids(self) -> list[str]:
         # Includes our own identity node alongside owned boards: identity is
         # otherwise only ever delivered once, inline in a connect token at
@@ -557,9 +579,11 @@ class RelayLogic:
             board_uuids &= self._scoped_topic_uuids
         return sorted(board_uuids) + [self.session.identity.uuid]
 
+    @_relay_io_locked
     def set_scoped_topics(self, topic_uuids: set[str] | list[str]) -> None:
         self._scoped_topic_uuids = {str(topic) for topic in topic_uuids if topic}
 
+    @_relay_io_locked
     def channel_descriptor(self) -> dict | None:
         if not self.storage:
             return None
@@ -594,6 +618,7 @@ class RelayLogic:
             "poll_interval_seconds": self.poll_interval_seconds,
         }
 
+    @_relay_io_locked
     def mark_topics_desired(self, topic_uuids: list[str]) -> SessionResult:
         # Recording topic_uuids as "desired" is the consent step:
         # poll_and_apply below will only ever graft a topic into our own
@@ -608,6 +633,7 @@ class RelayLogic:
         self._save_state()
         return SessionResult("ok", value=topic_uuids)
 
+    @_relay_io_locked
     def unmark_topics_desired(self, topic_uuids: list[str]) -> SessionResult:
         if not isinstance(topic_uuids, list) or not topic_uuids:
             return SessionResult("error", reason="no topic_uuids given")
@@ -618,6 +644,7 @@ class RelayLogic:
         self._save_state()
         return SessionResult("ok", value=sorted(remove))
 
+    @_relay_io_locked
     def mark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
         # The issuer-side counterpart of mark_topics_desired: recording that
         # we've offered these topics to someone via a relay-bearing connect
@@ -636,6 +663,7 @@ class RelayLogic:
         self._activate_shared_boards()
         return SessionResult("ok", value=topic_uuids)
 
+    @_relay_io_locked
     def unmark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
         # The unshare counterpart (review R-3): without this, `shared` only
         # ever grew - unsharing a board never stopped relay publishing it,
@@ -670,6 +698,7 @@ class RelayLogic:
             if node is not None and node.data.get("type") == "kanban_board":
                 self.session.start_discussion(topic)
 
+    @_relay_io_locked
     def has_active_relationship(self) -> bool:
         # The relay loop's gate: is there any reason to publish/poll/write
         # presence at all? True once this session has issued a relay token
@@ -685,18 +714,23 @@ class RelayLogic:
         )
         if self._state.get("shared") or active_desired:
             return True
-        if self._scoped_topic_uuids is None:
-            return any(addr.startswith("relay:") for addr in self.session.peer_topic_sets)
-        relevant = (
-            self._scoped_topic_uuids
-            | set(self._state.get("shared", []))
-            | active_desired
-        )
-        return any(
-            addr.startswith("relay:") and bool(relevant & set(topics))
-            for addr, topics in self.session.peer_topic_sets.items()
-        )
+        with self._session_lock:
+            if self._scoped_topic_uuids is None:
+                return any(
+                    addr.startswith("relay:")
+                    for addr in self.session.peer_topic_sets
+                )
+            relevant = (
+                self._scoped_topic_uuids
+                | set(self._state.get("shared", []))
+                | active_desired
+            )
+            return any(
+                addr.startswith("relay:") and bool(relevant & set(topics))
+                for addr, topics in self.session.peer_topic_sets.items()
+            )
 
+    @_relay_io_locked
     def write_presence(self) -> None:
         # A heartbeat, written every poll tick regardless of whether any
         # topic content changed - distinct from head.json's "updated_at"
@@ -730,6 +764,7 @@ class RelayLogic:
         if mtime is not None:
             self._own_presence_mtime = mtime
 
+    @_relay_io_locked
     def calibrate_timing(self, samples: int = 1) -> dict:
         if not self.storage:
             return self.timing.status_payload()
@@ -749,19 +784,23 @@ class RelayLogic:
             )
         return self.timing.status_payload()
 
+    @_relay_io_locked
     def calibrate_timing_if_due(self) -> None:
         if self.timing.probe_due():
             self.calibrate_timing(1)
 
+    @_relay_io_locked
     def record_cycle_duration(self, duration_seconds: float) -> None:
         self.timing.observe_cycle(duration_seconds)
 
+    @_relay_io_locked
     def response_check_delay(self) -> float:
         return self.timing.response_check_delay(
             self.poll_interval_seconds,
             self._last_publish_server_time,
         )
 
+    @_relay_io_locked
     def known_peer_identities(self) -> list[str]:
         # Peers we've actually exchanged something with, per our own applied
         # bookkeeping - a reasonable "who should I even be checking
@@ -772,6 +811,7 @@ class RelayLogic:
             for peer_id in peers
         })
 
+    @_relay_io_locked
     def peer_liveness(self, peer_id: str) -> dict:
         if not self.storage or self._own_presence_mtime is None:
             return {"state": "unknown"}
@@ -794,6 +834,7 @@ class RelayLogic:
             "peer_poll_interval_seconds": peer_interval,
         }
 
+    @_relay_io_locked
     def publish_due_topics(self) -> list[str]:
         if not self.storage:
             return []
@@ -855,6 +896,7 @@ class RelayLogic:
             for addr in self.session.addresses_for_identity(identity_key)
         )
 
+    @_relay_io_locked
     def poll_and_apply(self) -> list[tuple[str, str]]:
         # Discovers topics from what's actually in the relay, not from
         # relay_topic_uuids() (this session's own local boards) - otherwise
@@ -900,6 +942,8 @@ class RelayLogic:
                         self.session.apply_peer_identity_snapshot(peer_addr, profile)
                 with self._session_lock:
                     redundant = self._is_redundant_relay_peer(peer_addr)
+                    if redundant:
+                        self.session.remove_peer(peer_addr)
                 if redundant:
                     # This identity is already reachable through a live,
                     # preferred (non-relay) channel - the ongoing poll
@@ -915,7 +959,6 @@ class RelayLogic:
                     # registration - see Session.remove_peer), so the
                     # suppression holds on every later poll without any
                     # bookkeeping here.
-                    self.session.remove_peer(peer_addr)
                     continue
                 head = self.storage.read_head(topic_uuid, peer_id)
                 if not head:
@@ -977,6 +1020,7 @@ class RelayLogic:
             self._save_state()
         return sorted(applied)
 
+    @_relay_io_locked
     def status_payload(self) -> dict:
         # Union of locally-owned boards (which we publish) and any topic
         # we've ever applied something from (which may not be one of our
@@ -1004,6 +1048,7 @@ class RelayLogic:
             },
         }
 
+    @_relay_io_locked
     def delete_topic(self, topic_uuid: str) -> SessionResult:
         # Purely a storage/bookkeeping cleanup - never touches whatever a
         # peer may have already grafted into their own local board list
@@ -1127,13 +1172,21 @@ class RelayManager:
         self.session = session
         self.config = config
         self.kanban = KanbanLogic(session, config)
-        self._session_lock = threading.RLock()
+        self._session_lock = session.lock
+        # Registry iteration/mutation has its own lock. Protocol snapshots
+        # use Session.lock; keeping the two distinct avoids an io->session vs
+        # session->io lock inversion when credentials are refreshed.
+        self._manager_lock = threading.RLock()
+        self._startup_configured = bool(
+            config.get("relay_root") or config.get("relay_sftp_host")
+        )
         self.connections: dict[str, RelayLogic] = {}
         # The implicit connection: built from the flat config (or a persisted
         # adopted-descriptor) exactly as before. Registered by fingerprint.
         self.primary = RelayLogic(session, config)
         self.primary._session_lock = self._session_lock
-        self.connections[_relay_fingerprint(self.primary.storage)] = self.primary
+        self._primary_fingerprint = _relay_fingerprint(self.primary.storage)
+        self.connections[self._primary_fingerprint] = self.primary
         self._bootstrap_registry()
         for target in self.list_targets():
             self.ensure_connection(self.target_descriptor(target["id"]))
@@ -1220,9 +1273,18 @@ class RelayManager:
         if target_id is None:
             target_id = str(uuid_mod.uuid4())
             record = self._record_from_descriptor(descriptor, "Configured relay")
-            record["configured"] = bool(
-                self.config.get("relay_root") or self.config.get("relay_sftp_host")
+            record["configured"] = self._startup_configured
+            registry[target_id] = record
+        elif self._startup_configured:
+            # The explicit startup config is authoritative. A persisted
+            # registry record may contain an old password/poll interval; if
+            # it overwrote `primary` below, changing the config would appear
+            # to have no effect after restart.
+            previous = registry[target_id]
+            record = self._record_from_descriptor(
+                descriptor, previous.get("name") or "Configured relay",
             )
+            record["configured"] = True
             registry[target_id] = record
         # Migrate durable relay intent to explicit assignments. New boards
         # remain unassigned, as required by the explicit-target model.
@@ -1234,6 +1296,7 @@ class RelayManager:
             if node and node.data.get("type") == "kanban_board":
                 mapping.setdefault(topic_uuid, target_id)
 
+    @_manager_locked
     def list_targets(self) -> list[dict]:
         assignments = self._board_target_map()
         result = []
@@ -1256,6 +1319,7 @@ class RelayManager:
             result.append(public)
         return result
 
+    @_manager_locked
     def target_descriptor(self, target_id: str) -> dict | None:
         record = self._target_registry().get(target_id)
         if not record:
@@ -1270,60 +1334,75 @@ class RelayManager:
         if storage is None:
             return None
         fingerprint = _relay_fingerprint(storage)
-        existing = self.connections.get(fingerprint)
-        if existing:
-            # Fingerprints intentionally exclude credentials. A corrected
-            # token for the same server/root must refresh the live storage
-            # object instead of retaining a stale password forever.
-            existing.storage = storage
-            existing.adopt_poll_interval_from_descriptor(descriptor or {})
-            return existing
-        record = self._record_from_descriptor(descriptor or {})
-        connection_config = {
-            "app_module": self.config.get("app_module"),
-            "relay_identity": self.config.get("relay_identity") or self.session.identity.uuid,
-            "relay_poll_interval_seconds": record.get("poll_interval_seconds", 3),
-        }
-        state_directory = self.config.get("relay_state_directory")
-        if state_directory:
-            safe_fingerprint = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
-            connection_config["relay_state_file"] = str(
-                Path(state_directory) / f"relay-{safe_fingerprint}.json"
-            )
-        if record.get("backend") == "sftp":
-            connection_config.update({
-                "relay_backend": "sftp",
-                "relay_sftp_host": record.get("host"),
-                "relay_sftp_port": record.get("port", 22),
-                "relay_sftp_username": record.get("username"),
-                "relay_sftp_root": record.get("root", "/"),
-                "relay_sftp_password": record.get("password"),
-            })
-        else:
-            connection_config.update({
-                "relay_backend": "local", "relay_root": record.get("root"),
-            })
-        connection = RelayLogic(self.session, connection_config)
-        connection._session_lock = self._session_lock
-        self.connections[fingerprint] = connection
-        return connection
+        with self._manager_lock:
+            existing = self.connections.get(fingerprint)
+            if existing:
+                # Never replace a startup-configured primary with its
+                # persisted descriptor: that would discard current secrets
+                # (including private-key authentication) in favour of stale
+                # registry data. Other accepted targets may refresh bearer
+                # credentials for the same location.
+                if not (
+                    existing is self.primary
+                    and self._startup_configured
+                    and fingerprint == self._primary_fingerprint
+                ):
+                    with existing._io_lock:
+                        previous_storage = existing.storage
+                        existing.storage = storage
+                        close_previous = getattr(previous_storage, "_reset_connection", None)
+                        if close_previous and previous_storage is not storage:
+                            close_previous()
+                existing.adopt_poll_interval_from_descriptor(descriptor or {})
+                return existing
+            record = self._record_from_descriptor(descriptor or {})
+            connection_config = {
+                "app_module": self.config.get("app_module"),
+                "relay_identity": self.config.get("relay_identity") or self.session.identity.uuid,
+                "relay_poll_interval_seconds": record.get("poll_interval_seconds", 3),
+            }
+            state_directory = self.config.get("relay_state_directory")
+            if state_directory:
+                safe_fingerprint = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+                connection_config["relay_state_file"] = str(
+                    Path(state_directory) / f"relay-{safe_fingerprint}.json"
+                )
+            if record.get("backend") == "sftp":
+                connection_config.update({
+                    "relay_backend": "sftp",
+                    "relay_sftp_host": record.get("host"),
+                    "relay_sftp_port": record.get("port", 22),
+                    "relay_sftp_username": record.get("username"),
+                    "relay_sftp_root": record.get("root", "/"),
+                    "relay_sftp_password": record.get("password"),
+                })
+            else:
+                connection_config.update({
+                    "relay_backend": "local", "relay_root": record.get("root"),
+                })
+            connection = RelayLogic(self.session, connection_config)
+            connection._session_lock = self._session_lock
+            self.connections[fingerprint] = connection
+            return connection
 
     def connection_for_target(self, target_id: str) -> RelayLogic | None:
         descriptor = self.target_descriptor(target_id)
         storage = RelayLogic._storage_from_descriptor(descriptor)
-        return self.connections.get(_relay_fingerprint(storage)) if storage else None
+        with self._manager_lock:
+            return self.connections.get(_relay_fingerprint(storage)) if storage else None
 
     def refresh_scopes(self) -> None:
-        topics_by_fingerprint: dict[str, set[str]] = {}
-        for board_uuid, target_id in self._board_target_map().items():
-            descriptor = self.target_descriptor(target_id)
-            storage = RelayLogic._storage_from_descriptor(descriptor)
-            if storage:
-                topics_by_fingerprint.setdefault(_relay_fingerprint(storage), set()).add(board_uuid)
-        for fingerprint, connection in self.connections.items():
-            if fingerprint == "unconfigured":
-                continue
-            connection.set_scoped_topics(topics_by_fingerprint.get(fingerprint, set()))
+        with self._manager_lock:
+            topics_by_fingerprint: dict[str, set[str]] = {}
+            for board_uuid, target_id in self._board_target_map().items():
+                descriptor = self.target_descriptor(target_id)
+                storage = RelayLogic._storage_from_descriptor(descriptor)
+                if storage:
+                    topics_by_fingerprint.setdefault(_relay_fingerprint(storage), set()).add(board_uuid)
+            for fingerprint, connection in self.connections.items():
+                if fingerprint == "unconfigured":
+                    continue
+                connection.set_scoped_topics(topics_by_fingerprint.get(fingerprint, set()))
 
     def create_target(self, values: dict, verify: bool = True) -> SessionResult:
         backend = values.get("backend", "sftp")
@@ -1356,14 +1435,16 @@ class RelayManager:
                 return SessionResult(
                     "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
                 )
-        target_id = str(uuid_mod.uuid4())
-        self._target_registry()[target_id] = self._record_from_descriptor(
-            descriptor, str(values.get("name") or "Relay target").strip(),
-        )
-        self.ensure_connection(self.target_descriptor(target_id))
-        self.refresh_scopes()
+        with self._manager_lock:
+            target_id = str(uuid_mod.uuid4())
+            self._target_registry()[target_id] = self._record_from_descriptor(
+                descriptor, str(values.get("name") or "Relay target").strip(),
+            )
+            self.ensure_connection(self.target_descriptor(target_id))
+            self.refresh_scopes()
         return SessionResult("ok", value=target_id)
 
+    @_manager_locked
     def register_descriptor(self, descriptor: dict) -> SessionResult:
         storage = RelayLogic._storage_from_descriptor(descriptor)
         if not storage:
@@ -1372,6 +1453,14 @@ class RelayManager:
         for target_id, record in self._target_registry().items():
             existing = RelayLogic._storage_from_descriptor(self._descriptor_from_record(record))
             if existing and _relay_fingerprint(existing) == fingerprint:
+                if (
+                    record.get("configured")
+                    and self._startup_configured
+                    and fingerprint == self._primary_fingerprint
+                ):
+                    # A token pointing at our configured location must not
+                    # replace locally-authoritative credentials or cadence.
+                    return SessionResult("ok", value=target_id)
                 replacement = self._record_from_descriptor(
                     descriptor, record.get("name") or None,
                 )
@@ -1388,6 +1477,10 @@ class RelayManager:
 
     def accept_descriptor(self, descriptor: dict, topic_uuids: list[str],
                           inviter_identity_uuid: str | None = None) -> SessionResult:
+        if not isinstance(topic_uuids, list) or not topic_uuids:
+            return SessionResult("error", reason="no topic_uuids given")
+        if not str(descriptor.get("identity") or "").strip():
+            return SessionResult("error", reason="relay descriptor missing identity")
         storage = RelayLogic._storage_from_descriptor(descriptor)
         if not storage:
             return SessionResult("error", reason="relay descriptor is not usable")
@@ -1405,33 +1498,54 @@ class RelayManager:
         connection = self.connection_for_target(target_id)
         if not connection:
             return SessionResult("error", reason="relay connection could not be created")
-        connection.adopt_poll_interval_from_descriptor(descriptor)
+        if not (connection is self.primary and self._startup_configured):
+            connection.adopt_poll_interval_from_descriptor(descriptor)
         desired = connection.mark_topics_desired(topic_uuids)
         if desired.status != "ok":
             return desired
         if inviter_identity_uuid:
-            identity_topics = set(connection._state.get("identity_topics", []))
-            identity_topics.add(inviter_identity_uuid)
-            connection._state["identity_topics"] = sorted(identity_topics)
-            connection._save_state()
-        mapping = self._board_target_map()
-        for topic_uuid in topic_uuids:
-            if topic_uuid not in {inviter_identity_uuid, self.session.identity.uuid}:
+            with connection._io_lock:
+                identity_topics = set(connection._state.get("identity_topics", []))
+                identity_topics.add(inviter_identity_uuid)
+                connection._state["identity_topics"] = sorted(identity_topics)
+                connection._save_state()
+        board_topics = [
+            topic_uuid for topic_uuid in topic_uuids
+            if topic_uuid not in {inviter_identity_uuid, self.session.identity.uuid}
+        ]
+        # A board can live on only one target. Clean durable intent from its
+        # previous connection before moving the mapping; otherwise an old
+        # accepted target keeps polling the board through its `desired` set.
+        with self._manager_lock:
+            mapping = self._board_target_map()
+            previous_connections = []
+            for topic_uuid in board_topics:
+                previous_id = mapping.get(topic_uuid)
+                if previous_id and previous_id != target_id:
+                    previous = self.connection_for_target(previous_id)
+                    if previous and previous is not connection:
+                        previous_connections.append((previous, topic_uuid))
+            for previous, topic_uuid in previous_connections:
+                previous.unmark_topics_shared([topic_uuid])
+                previous.unmark_topics_desired([topic_uuid])
+            for topic_uuid in board_topics:
                 mapping[topic_uuid] = target_id
-        self.refresh_scopes()
+            self.refresh_scopes()
         return SessionResult("ok", value=target_id)
 
+    @_manager_locked
     def assign_board_target(self, board_uuid: str, target_id: str | None) -> SessionResult:
-        board = self.session.protocol.index.get(board_uuid)
+        board = self.session.get_node(board_uuid)
         if not board or board.data.get("type") != "kanban_board":
             return SessionResult("error", reason="board not found")
         if target_id and target_id not in self._target_registry():
             return SessionResult("error", reason="relay target not found")
         mapping = self._board_target_map()
         previous_id = mapping.get(board_uuid)
+        next_connection = self.connection_for_target(target_id) if target_id else None
         if previous_id and previous_id != target_id:
             previous = self.connection_for_target(previous_id)
-            if previous:
+            if previous and previous is not next_connection:
                 previous.unmark_topics_shared([board_uuid])
                 previous.unmark_topics_desired([board_uuid])
         if target_id:
@@ -1440,11 +1554,32 @@ class RelayManager:
             mapping.pop(board_uuid, None)
         self.refresh_scopes()
         if target_id:
-            connection = self.connection_for_target(target_id)
-            if connection:
-                connection.mark_topics_shared([board_uuid])
+            if next_connection:
+                next_connection.mark_topics_shared([board_uuid])
         return SessionResult("ok", value=target_id or "")
 
+    @_manager_locked
+    def assign_boards_target(self, board_uuids: list[str],
+                             target_id: str | None) -> SessionResult:
+        normalized = list(dict.fromkeys(str(item) for item in board_uuids if item))
+        if not normalized:
+            return SessionResult("error", reason="choose at least one board")
+        if target_id and target_id not in self._target_registry():
+            return SessionResult("error", reason="relay target not found")
+        # Validate the complete request before changing any mapping or relay
+        # state. A bad board late in a multi-board token must not leave the
+        # earlier boards silently reassigned.
+        for board_uuid in normalized:
+            board = self.session.get_node(board_uuid)
+            if not board or board.data.get("type") != "kanban_board":
+                return SessionResult("error", reason=f"board not found: {board_uuid}")
+        for board_uuid in normalized:
+            result = self.assign_board_target(board_uuid, target_id)
+            if result.status != "ok":
+                return result
+        return SessionResult("ok", value=normalized)
+
+    @_manager_locked
     def target_for_board(self, board_uuid: str) -> str | None:
         return self._board_target_map().get(board_uuid)
 
@@ -1454,15 +1589,17 @@ class RelayManager:
         if not descriptor or not connection or not connection.storage:
             return SessionResult("error", reason="relay target not found")
         try:
-            checker = getattr(connection.storage, "verify_access", None)
-            checker() if checker else connection.storage.list_topics()
-            connection.calibrate_timing(5)
+            with connection._io_lock:
+                checker = getattr(connection.storage, "verify_access", None)
+                checker() if checker else connection.storage.list_topics()
+                connection.calibrate_timing(5)
         except Exception as exc:
             return SessionResult(
                 "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
             )
         return SessionResult("ok", value=target_id)
 
+    @_manager_locked
     def delete_target(self, target_id: str) -> SessionResult:
         registry = self._target_registry()
         record = registry.get(target_id)
@@ -1485,17 +1622,19 @@ class RelayManager:
             for item in registry.values()
         ) if fingerprint else False
         if connection and not remaining_same_connection:
-            connection._state["shared"] = []
-            connection._state["desired"] = []
-            connection._state["identity_topics"] = []
-            connection._save_state()
+            with connection._io_lock:
+                connection._state["shared"] = []
+                connection._state["desired"] = []
+                connection._state["identity_topics"] = []
+                connection._save_state()
             if connection is not self.primary:
                 self.connections.pop(fingerprint, None)
         self.refresh_scopes()
         return SessionResult("ok", value=target_id)
 
     def all_connections(self) -> list[RelayLogic]:
-        return list(self.connections.values())
+        with self._manager_lock:
+            return list(self.connections.values())
 
     def has_any_active_relationship(self) -> bool:
         return any(conn.has_active_relationship() for conn in self.all_connections())
