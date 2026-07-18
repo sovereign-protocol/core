@@ -87,6 +87,7 @@ class LocalFolderRelayStorage:
             "hash": state_hash,
             "updated_at": now_iso(),
             "snapshot": f"snapshots/{state_hash}.json",
+            "observed": payload.get("_relay_observed", {}),
         }
         self._write_json(peer_dir / "head.json", head)
         # GC superseded snapshots (review R-4): keep the new one plus the
@@ -203,6 +204,7 @@ class SftpRelayStorage:
             "hash": state_hash,
             "updated_at": now_iso(),
             "snapshot": f"snapshots/{state_hash}.json",
+            "observed": payload.get("_relay_observed", {}),
         }
         self._write_json(posixpath.join(peer_dir, "head.json"), head)
         self._gc_snapshots(

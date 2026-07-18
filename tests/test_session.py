@@ -83,6 +83,62 @@ class SessionTests(unittest.TestCase):
             session.node_state_hash(topic.uuid),
         )
 
+    def test_successful_sync_response_acknowledges_exact_node_revisions(self):
+        session = Session("si-a")
+        topic = session.create_child(
+            session.protocol.root.uuid, {"name": "topic"}, {},
+        ).value
+        child = session.create_child(topic.uuid, {"name": "card"}, {}).value
+        session.start_discussion(topic.uuid)
+        session.add_peer("si-b", topic.uuid)
+        summary = session.sync_summary("si-b")
+
+        result = session.handle_sync_response("si-b", {
+            "status": "ok",
+            "delivered_sync_hash": summary["sync_hash"],
+            "my_summary": {},
+        })
+
+        self.assertEqual(result.status, "ok")
+        topic = session.protocol.index[topic.uuid]
+        child = session.protocol.index[child.uuid]
+        self.assertTrue(session.peer_observed_node("si-b", topic))
+        self.assertTrue(session.peer_observed_node("si-b", child))
+
+    def test_partial_sync_response_does_not_acknowledge_nodes(self):
+        session = Session("si-a")
+        topic = session.create_child(
+            session.protocol.root.uuid, {"name": "topic"}, {},
+        ).value
+        session.start_discussion(topic.uuid)
+        session.add_peer("si-b", topic.uuid)
+        summary = session.sync_summary("si-b")
+
+        session.handle_sync_response("si-b", {
+            "status": "partial",
+            "delivered_sync_hash": summary["sync_hash"],
+            "my_summary": {},
+        })
+
+        self.assertFalse(session.peer_observed_node("si-b", topic))
+
+    def test_node_revision_changes_when_node_moves(self):
+        session = Session("si-a")
+        first = session.create_child(
+            session.protocol.root.uuid, {"name": "first"}, {},
+        ).value
+        second = session.create_child(
+            session.protocol.root.uuid, {"name": "second"}, {},
+        ).value
+        child = session.create_child(first.uuid, {"name": "card"}, {}).value
+        child = session.protocol.index[child.uuid]
+        before = session.node_revision(child)
+
+        session.move_child(child.uuid, second.uuid)
+
+        moved = session.protocol.index[child.uuid]
+        self.assertNotEqual(before, session.node_revision(moved))
+
     def test_local_change_outside_topic_does_not_sync_topic_peers(self):
         session = Session("si-a")
         topic = session.create_child(
@@ -1067,6 +1123,39 @@ class SessionTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(local.protocol.index[folder.uuid].data["text"], "new")
+
+    def test_shallow_peer_adoption_preserves_the_remote_revision_origin(self):
+        peer = Session("si-b")
+        peer_identity_key = peer.identity.data["identity_key"]
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        folder = peer.create_child(
+            topic.uuid, {"type": "folder", "text": "orig"}, {},
+        ).value
+        local = Session("si-a")
+        local.identity
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+
+        peer.modify(folder.uuid, {"type": "folder", "text": "new"}, {})
+        local.apply_peer_subtree(
+            "si-b",
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        local.reconcile_peer_changes(
+            "si-b", topic.uuid,
+            node_adopt_mode=lambda node: "shallow",
+        )
+
+        adopted = local.protocol.index[folder.uuid]
+        self.assertEqual(adopted.data["text"], "new")
+        self.assertEqual(
+            adopted.revision_origin_identity, peer_identity_key,
+        )
 
     def test_reconcile_peer_changes_filters_ineligible_new_nodes(self):
         # A brand-new peer node (never seen locally) is always classified

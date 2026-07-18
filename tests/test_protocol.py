@@ -69,6 +69,51 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertEqual(child.previous_hash, previous_hash_before)
 
+    def test_revision_origin_survives_roundtrip_and_only_real_node_edits_replace_it(self):
+        state = ProtocolState("si-a")
+        parent = state.create_child(
+            state.root.uuid, {"name": "parent"}, {}, "identity-a",
+        ).value
+        child = state.create_child(
+            parent.uuid, {"name": "child"}, {}, "identity-a",
+        ).value
+
+        state.modify(child.uuid, {"name": "changed"}, {}, "identity-c")
+
+        # The child's actual editor is C. The parent's hash changed only
+        # because of the descendant, so its own revision still belongs to A.
+        self.assertEqual(child.revision_origin_identity, "identity-c")
+        self.assertEqual(parent.revision_origin_identity, "identity-a")
+        restored = PRSPNode.from_dict(child.to_dict())
+        self.assertEqual(restored.revision_origin_identity, "identity-c")
+
+        # A no-op must not relabel C's revision as B's.
+        state.modify(child.uuid, {"name": "changed"}, {}, "identity-b")
+        self.assertEqual(child.revision_origin_identity, "identity-c")
+
+    def test_delete_and_copy_record_the_client_that_performed_the_operation(self):
+        state = ProtocolState("si-a")
+        parent = state.create_child(
+            state.root.uuid, {"name": "parent"}, {}, "identity-a",
+        ).value
+        child = state.create_child(
+            parent.uuid, {"name": "child"}, {}, "identity-a",
+        ).value
+
+        clone = state.copy(
+            parent.uuid, state.root.uuid, "identity-b",
+        ).value
+        self.assertTrue(all(
+            node.revision_origin_identity == "identity-b"
+            for node in (clone, *clone.children)
+        ))
+
+        state.delete(parent.uuid, "identity-c")
+        self.assertTrue(all(
+            node.revision_origin_identity == "identity-c"
+            for node in (parent, child)
+        ))
+
     def test_same_parent_move_keeps_previous_parent_uuid(self):
         state = ProtocolState("si-a")
         first = state.create_child(state.root.uuid, {"name": "first"}, {}).value

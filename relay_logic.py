@@ -156,6 +156,8 @@ def default_relay_state_file(config: dict, identity: str) -> str:
 
 
 PRESENCE_LIVENESS_MARGIN = 2.0
+MIN_RELAY_POLL_SECONDS = 1.0
+MAX_RELAY_POLL_SECONDS = 300.0
 
 
 class RelayLogic:
@@ -164,7 +166,19 @@ class RelayLogic:
         self.kanban = KanbanLogic(session, config)
         self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
         self.storage = self._build_storage(config)
-        self.poll_interval_seconds = float(config.get("relay_poll_interval_seconds", 3))
+        adopted_descriptor = None
+        if self.storage is None:
+            adopted_descriptor = self.session.app_metadata.get(
+                "relay_adopted_storage_descriptor",
+            )
+            self.storage = self._storage_from_descriptor(adopted_descriptor)
+        self.poll_interval_seconds = self._normalize_poll_interval(
+            config.get(
+                "relay_poll_interval_seconds",
+                (adopted_descriptor or {}).get("poll_interval_seconds", 3),
+            ),
+            3.0,
+        )
         # Set on every write_presence() call to the storage backend's own
         # server-side mtime for our own just-written heartbeat - this is
         # "what does the server consider *now*", used as the reference
@@ -177,12 +191,29 @@ class RelayLogic:
         # location-derived default - kept so adopt_storage_from_descriptor
         # honors the pin instead of recomputing a data/ path.
         self._configured_state_file = config.get("relay_state_file")
-        self._state_path = self._configured_state_file or default_relay_state_file(config, self.identity)
+        state_config = self._config_from_storage(self.storage) if self.storage else config
+        self._state_path = self._configured_state_file or default_relay_state_file(
+            state_config, self.identity,
+        )
         self._state = self._load_state()
         # Re-mark any previously-shared boards as active discussions, so a
         # restart doesn't silently drop the issuer's auto-adopt for them
         # (see _activate_shared_boards).
         self._activate_shared_boards()
+
+    @staticmethod
+    def _normalize_poll_interval(value: Any, fallback: float) -> float:
+        try:
+            interval = float(value)
+        except (TypeError, ValueError):
+            interval = fallback
+        return min(MAX_RELAY_POLL_SECONDS, max(MIN_RELAY_POLL_SECONDS, interval))
+
+    def adopt_poll_interval_from_descriptor(self, descriptor: dict) -> float:
+        self.poll_interval_seconds = self._normalize_poll_interval(
+            descriptor.get("poll_interval_seconds"), self.poll_interval_seconds,
+        )
+        return self.poll_interval_seconds
 
     @staticmethod
     def _build_storage(config: dict):
@@ -275,11 +306,17 @@ class RelayLogic:
         storage = self._storage_from_descriptor(descriptor)
         if storage is None:
             return False
-        self._install_adopted_storage(storage)
+        self._install_adopted_storage(storage, descriptor)
         return True
 
-    def _install_adopted_storage(self, storage) -> None:
+    def _install_adopted_storage(self, storage, descriptor: dict | None = None) -> None:
         self.storage = storage
+        if descriptor:
+            # A token-provisioned accepter has no local relay config to load
+            # on its next start. Keep the accepted descriptor with the
+            # already-persisted session metadata so storage, credentials,
+            # and the host's poll interval survive restart.
+            self.session.app_metadata["relay_adopted_storage_descriptor"] = dict(descriptor)
         # Re-key bookkeeping to the real location. The boot-time
         # _state_path was fingerprinted from empty config (no storage);
         # published/applied hashes are meaningless against a different
@@ -314,7 +351,7 @@ class RelayLogic:
         if should_adopt:
             # A failed token must not leave unusable storage installed and
             # prevent a later corrected token from being adopted.
-            self._install_adopted_storage(candidate)
+            self._install_adopted_storage(candidate, descriptor)
         return SessionResult("ok")
 
     @staticmethod
@@ -368,12 +405,14 @@ class RelayLogic:
                 "username": self.storage.username,
                 "password": self.storage.password,
                 "identity": self.identity,
+                "poll_interval_seconds": self.poll_interval_seconds,
             }
         return {
             "type": "relay",
             "version": 1,
             "root": str(self.storage.root),
             "identity": self.identity,
+            "poll_interval_seconds": self.poll_interval_seconds,
         }
 
     def mark_topics_desired(self, topic_uuids: list[str]) -> SessionResult:
@@ -518,13 +557,21 @@ class RelayLogic:
             current_hash = self.session.node_state_hash(topic_uuid)
             if current_hash is None:
                 continue
-            if self._state["published"].get(topic_uuid) == current_hash:
+            observed = self._state.get("observed", {}).get(topic_uuid, {})
+            observed_digest = hashlib.sha256(
+                json.dumps(observed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+            ).hexdigest()[:20]
+            if (self._state["published"].get(topic_uuid) == current_hash
+                    and self._state["published_observations"].get(topic_uuid)
+                    == observed_digest):
                 continue
             payload = self.session.get_subtree(topic_uuid)
             if payload is None:
                 continue
+            payload["_relay_observed"] = observed
             self.storage.write_snapshot(topic_uuid, self.identity, current_hash, payload)
             self._state["published"][topic_uuid] = current_hash
+            self._state["published_observations"][topic_uuid] = observed_digest
             published.append(topic_uuid)
         if published:
             self._save_state()
@@ -558,7 +605,7 @@ class RelayLogic:
         # this way, which defeats the point of a standalone relay path.
         if not self.storage:
             return []
-        applied = []
+        applied: set[tuple[str, str]] = set()
         for topic_uuid in self.storage.list_topics():
             for peer_id in self.storage.list_peers(topic_uuid):
                 if peer_id == self.identity:
@@ -584,6 +631,9 @@ class RelayLogic:
                 head = self.storage.read_head(topic_uuid, peer_id)
                 if not head:
                     continue
+                observed_for_me = (head.get("observed") or {}).get(self.identity, {})
+                if self.session.record_peer_observations(peer_addr, observed_for_me):
+                    applied.add((topic_uuid, peer_id))
                 state_hash = head.get("hash")
                 if not state_hash:
                     continue
@@ -625,11 +675,14 @@ class RelayLogic:
                     self.session.apply_peer_subtree(
                         peer_addr, subtree, payload.get("parent_uuid"),
                     )
+                self._state["observed"].setdefault(topic_uuid, {})[peer_id] = (
+                    self.session.node_revision_map(subtree)
+                )
                 self._state["applied"].setdefault(topic_uuid, {})[peer_id] = state_hash
-                applied.append((topic_uuid, peer_id))
+                applied.add((topic_uuid, peer_id))
         if applied:
             self._save_state()
-        return applied
+        return sorted(applied)
 
     def status_payload(self) -> dict:
         # Union of locally-owned boards (which we publish) and any topic
@@ -666,6 +719,8 @@ class RelayLogic:
             return SessionResult("error", reason="relay not configured")
         self.storage.delete_topic(topic_uuid)
         self._state["published"].pop(topic_uuid, None)
+        self._state["published_observations"].pop(topic_uuid, None)
+        self._state["observed"].pop(topic_uuid, None)
         self._state["applied"].pop(topic_uuid, None)
         self._state["desired"] = [t for t in self._state.get("desired", []) if t != topic_uuid]
         self._state["shared"] = [t for t in self._state.get("shared", []) if t != topic_uuid]
@@ -678,6 +733,8 @@ class RelayLogic:
             with path.open(encoding="utf-8") as f:
                 data = json.load(f)
             data.setdefault("published", {})
+            data.setdefault("published_observations", {})
+            data.setdefault("observed", {})
             data.setdefault("desired", [])
             data.setdefault("shared", [])
             # `applied` is deliberately NOT restored (see _save_state) - it
@@ -685,7 +742,10 @@ class RelayLogic:
             # every peer's content.
             data["applied"] = {}
             return data
-        return {"published": {}, "applied": {}, "desired": [], "shared": []}
+        return {
+            "published": {}, "published_observations": {}, "observed": {},
+            "applied": {}, "desired": [], "shared": [],
+        }
 
     def _save_state(self) -> None:
         # `applied` is deliberately never persisted. It tracks "I've already

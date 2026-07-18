@@ -45,6 +45,9 @@ from protocol import PRSPNode, ProtocolState, collect_subtree_uuids, stable_hash
 from trace_log import TraceLogger
 
 
+_LOCAL_REVISION_ORIGIN = object()
+
+
 @dataclass(frozen=True)
 class SessionEffect:
     type: str
@@ -133,6 +136,10 @@ class Session:
         # re-derived from cached content on demand.
         self.peer_identity_key: dict[str, str] = {}
         self.peer_sync_state: dict[str, dict[str, Any]] = {}
+        # Exact local node revisions each peer has confirmed fetching.
+        # Ephemeral for direct HTTP; relay acknowledgements are rebuilt from
+        # durable relay heads after restart.
+        self.peer_observed_node_revisions: dict[str, dict[str, str]] = {}
         self.active_topic_uuids: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
         # Read-only observation: addresses/topics we poll for their cached
@@ -263,6 +270,17 @@ class Session:
             addr for addr, key in self.peer_identity_key.items()
             if key == identity_key
         )
+
+    def _local_revision_origin(self, data: dict | None = None) -> str | None:
+        # Do not use the identity property here: identity creation itself
+        # goes through create_child and would recurse. Search only what
+        # already exists, with the new profile's key as bootstrap fallback.
+        profile = self._find_identity_in_tree(self._protocol.root)
+        if profile and profile.data.get("identity_key"):
+            return profile.data["identity_key"]
+        if (data or {}).get("type") == "shared_user_profile":
+            return (data or {}).get("identity_key")
+        return None
 
     def apply_peer_identity_snapshot(self, peer_addr: str, identity: dict) -> None:
         # A connect token carries the sender's identity inline so it's
@@ -563,10 +581,20 @@ class Session:
         self.mark_peer_reachable(peer_addr)
         my_summary = self.sync_summary(peer_addr)
         state = self.peer_sync_state.setdefault(peer_addr, self._new_peer_sync_state())
-        if response.get("delivered_sync_hash") == my_summary["sync_hash"]:
+        delivered = (
+            response.get("status") == "ok"
+            and response.get("delivered_sync_hash") == my_summary["sync_hash"]
+        )
+        if delivered:
             state["last_delivered_sync_hash"] = my_summary["sync_hash"]
             state["retry_after"] = None
             state["retry_delay"] = 1.0
+            for topic_uuid, state_hash in my_summary["topics"].items():
+                topic = self._protocol.index.get(topic_uuid)
+                if topic and topic.state_hash == state_hash:
+                    self.record_peer_observations(
+                        peer_addr, self.node_revision_map(topic),
+                    )
 
         peer_summary = response.get("my_summary") or {}
         if peer_summary.get("sync_hash"):
@@ -577,11 +605,48 @@ class Session:
             peer_addr=peer_addr,
             delivered_sync_hash=response.get("delivered_sync_hash"),
             current_sync_hash=my_summary["sync_hash"],
-            delivered=response.get("delivered_sync_hash") == my_summary["sync_hash"],
+            delivered=delivered,
             peer_sync_hash=peer_summary.get("sync_hash"),
             effects=[effect.type for effect in effects],
         )
         return SessionResult("ok", effects=effects)
+
+    @staticmethod
+    def node_revision(node: PRSPNode) -> str:
+        # state_hash excludes structural position; parent_uuid makes moves
+        # independently acknowledgeable too. Origin distinguishes identical
+        # content independently authored by two clients.
+        return (
+            f"{node.state_hash}@{node.parent_uuid or ''}"
+            f"@{node.revision_origin_identity or ''}"
+        )
+
+    @classmethod
+    def node_revision_map(cls, root: PRSPNode) -> dict[str, str]:
+        revisions = {root.uuid: cls.node_revision(root)}
+        for child in root.children:
+            revisions.update(cls.node_revision_map(child))
+        return revisions
+
+    def record_peer_observations(self, peer_addr: str,
+                                 revisions: dict[str, str]) -> bool:
+        if not peer_addr or not isinstance(revisions, dict):
+            return False
+        known = self.peer_observed_node_revisions.setdefault(peer_addr, {})
+        changed = False
+        for node_uuid, revision in revisions.items():
+            if not node_uuid or not isinstance(revision, str):
+                continue
+            if known.get(node_uuid) != revision:
+                known[node_uuid] = revision
+                changed = True
+        return changed
+
+    def peer_observed_node(self, peer_addr: str, node: PRSPNode) -> bool:
+        return (
+            self.peer_observed_node_revisions.get(peer_addr, {}).get(node.uuid)
+            == self.node_revision(node)
+        )
 
     def handle_join(self, message: dict) -> SessionResult:
         from_addr = message.get("from_addr")
@@ -898,12 +963,17 @@ class Session:
         other_uuids = sorted((set(local_by_uuid) | set(peer_by_uuid)) - {compare_uuid})
         events = []
         for uuid in [compare_uuid, *other_uuids]:
-            events.append(self._analyze_transition_node(
+            local = local_by_uuid.get(uuid)
+            event = self._analyze_transition_node(
                 peer_addr,
-                local_by_uuid.get(uuid),
+                local,
                 peer_by_uuid.get(uuid),
                 is_topic_root=(uuid == compare_uuid),
-            ))
+            )
+            event["peer_observed_local_revision"] = bool(
+                local and self.peer_observed_node(peer_addr, local)
+            )
+            events.append(event)
         return events
 
     @staticmethod
@@ -917,7 +987,10 @@ class Session:
 
     def create_child(self, parent_uuid: str, data: dict,
                      weights: dict[str, float] | None = None) -> SessionResult:
-        result = self._protocol.create_child(parent_uuid, data, weights)
+        revision_origin = self._local_revision_origin(data)
+        result = self._protocol.create_child(
+            parent_uuid, data, weights, revision_origin,
+        )
         if not result.ok:
             return SessionResult("error", reason=result.reason)
         child = result.value
@@ -927,21 +1000,33 @@ class Session:
             node_uuid=child.uuid,
             node_type=child.data.get("type"),
             state_hash=child.state_hash,
+            revision_origin_identity=child.revision_origin_identity,
         )
         return SessionResult("ok", value=self._snapshot_node(child),
                              effects=self.sync_effects(parent_uuid))
 
     def modify(self, node_uuid: str, data: dict,
-               weights: dict[str, float] | None = None) -> SessionResult:
+               weights: dict[str, float] | None = None,
+               revision_origin_identity: str | None | object = _LOCAL_REVISION_ORIGIN) -> SessionResult:
         before = self._protocol.index.get(node_uuid)
         old_state_hash = before.state_hash if before else None
-        result = self._protocol.modify(node_uuid, data, weights)
+        origin = (
+            self._local_revision_origin(data)
+            if revision_origin_identity is _LOCAL_REVISION_ORIGIN
+            else revision_origin_identity
+        )
+        result = self._protocol.modify(
+            node_uuid, data, weights, origin,
+        )
         after = self._protocol.index.get(node_uuid)
         self.trace_event(
             "protocol.modify",
             node_uuid=node_uuid,
             old_state_hash=old_state_hash,
             state_hash=after.state_hash if after else None,
+            revision_origin_identity=(
+                after.revision_origin_identity if after else None
+            ),
             ok=result.ok,
             reason=result.reason,
         )
@@ -951,7 +1036,9 @@ class Session:
         node = self._protocol.index.get(node_uuid)
         parent_uuid = node.parent_uuid if node else None
         old_state_hash = node.state_hash if node else None
-        result = self._protocol.delete(node_uuid)
+        result = self._protocol.delete(
+            node_uuid, self._local_revision_origin(),
+        )
         if result.ok:
             self.prune_deleted_nodes()
         self.trace_event(
@@ -1022,7 +1109,9 @@ class Session:
         return any(Session._subtree_has_pushed_back(child) for child in node.children)
 
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
-        result = self._protocol.copy(source_uuid, destination_uuid)
+        result = self._protocol.copy(
+            source_uuid, destination_uuid, self._local_revision_origin(),
+        )
         if not result.ok:
             return SessionResult("error", reason=result.reason)
         clone = result.value
@@ -1030,7 +1119,9 @@ class Session:
                              effects=self.sync_effects(destination_uuid))
 
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
-        result = self._protocol.move(source_uuid, destination_uuid)
+        result = self._protocol.move(
+            source_uuid, destination_uuid, self._local_revision_origin(),
+        )
         return self._operation_result(result, source_uuid)
 
     def move_child(self, source_uuid: str, destination_uuid: str,
@@ -1038,7 +1129,10 @@ class Session:
         node = self._protocol.index.get(source_uuid)
         old_parent_uuid = node.parent_uuid if node else None
         old_state_hash = node.state_hash if node else None
-        result = self._protocol.move_child(source_uuid, destination_uuid, index)
+        result = self._protocol.move_child(
+            source_uuid, destination_uuid, index,
+            self._local_revision_origin(),
+        )
         moved = self._protocol.index.get(source_uuid)
         self.trace_event(
             "protocol.move_child",
@@ -1238,7 +1332,10 @@ class Session:
                 # Update the node's own fields only - never cascade into its
                 # children, so an allowed shallow change can't smuggle in a
                 # filtered-out descendant change underneath it.
-                result = self.modify(event["node_uuid"], peer_node.data, peer_node.weights)
+                result = self.modify(
+                    event["node_uuid"], peer_node.data, peer_node.weights,
+                    revision_origin_identity=peer_node.revision_origin_identity,
+                )
             else:
                 result = self.accept_peer_node(peer_addr, event["node_uuid"])
             changed = changed or result.status == "ok"
@@ -1625,12 +1722,33 @@ class Session:
                           local_node: PRSPNode | None,
                           peer_node: PRSPNode | None) -> dict:
         node = local_node or peer_node
+        local_origin = (
+            local_node.revision_origin_identity if local_node else None
+        )
+        peer_origin = peer_node.revision_origin_identity if peer_node else None
+        if event_type in (
+            "peer_made_changes", "local_missing_node", "divergence",
+        ):
+            origin = peer_origin
+        elif event_type in ("local_made_changes", "peer_missing_node"):
+            origin = local_origin
+        else:
+            origin = peer_origin or local_origin
         return {
             "type": event_type,
             "peer_addr": peer_addr,
             "node_uuid": node.uuid if node else None,
             "local_state_hash": local_node.state_hash if local_node else None,
             "peer_state_hash": peer_node.state_hash if peer_node else None,
+            "local_revision": (
+                Session.node_revision(local_node) if local_node else None
+            ),
+            "peer_revision": (
+                Session.node_revision(peer_node) if peer_node else None
+            ),
+            "origin_identity": origin,
+            "local_revision_origin_identity": local_origin,
+            "peer_revision_origin_identity": peer_origin,
             "keep_mine_active": (
                 Session.keep_mine_active(local_node, peer_node)
                 if local_node and peer_node else None

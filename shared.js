@@ -77,12 +77,31 @@ function transitionSymbol(type) {
       local_made_changes: "≈", // almost-equal sign
       peer_missing_node: "−", // minus sign
       divergence: "!",
+      in_transition: ".",
     }[type] || "*"
   );
 }
 
 function dedupe(items) {
   return [...new Set(items)];
+}
+
+function transitionActorLabel(info) {
+  const sourceType = info.original_type || info.type;
+  const originDescribesIncomingRevision = [
+    "peer_made_changes",
+    "local_missing_node",
+    "divergence",
+  ].includes(sourceType);
+  if (
+    originDescribesIncomingRevision &&
+    info.origin_identity &&
+    typeof userForParticipant === "function"
+  ) {
+    const user = userForParticipant(info.origin_identity);
+    if (user && user.name && user.name !== "?") return user.name;
+  }
+  return peerLabel(info.peer_addr);
 }
 
 function groupedTransitionLabel(events) {
@@ -92,6 +111,7 @@ function groupedTransitionLabel(events) {
     "local_missing_node",
     "local_made_changes",
     "peer_missing_node",
+    "in_transition",
   ];
   const labels = {
     divergence: "Diverged from",
@@ -99,11 +119,14 @@ function groupedTransitionLabel(events) {
     local_missing_node: "Only in",
     local_made_changes: "My changes not in",
     peer_missing_node: "Missing in",
+    in_transition: "Waiting for",
   };
   return order
     .filter((type) => events.some((event) => event.type === type))
     .map((type) => {
-      const peers = events.filter((event) => event.type === type).map((event) => peerLabel(event.peer_addr));
+      const peers = events
+        .filter((event) => event.type === type)
+        .map((event) => transitionActorLabel(event));
       return `${labels[type]} ${dedupe(peers).join(", ")}`;
     })
     .join("; ");
@@ -112,7 +135,7 @@ function groupedTransitionLabel(events) {
 function transitionLabel(info) {
   const events = (info.events || [info]).filter((event) => event.type !== "in_agreement");
   if (events.length > 1) return groupedTransitionLabel(events);
-  const peer = peerLabel(info.peer_addr);
+  const peer = transitionActorLabel(info);
   const labels = {
     in_agreement: "In agreement",
     peer_made_changes: `Changes from ${peer}`,
@@ -120,6 +143,7 @@ function transitionLabel(info) {
     local_missing_node: `Only in ${peer}`,
     peer_missing_node: `Missing in ${peer}`,
     divergence: `Diverged from ${peer}`,
+    in_transition: `Waiting for ${peer} to process this change`,
   };
   return labels[info.type] || "Difference";
 }
