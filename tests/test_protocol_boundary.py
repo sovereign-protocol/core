@@ -33,7 +33,7 @@ class ProtocolBoundaryTests(unittest.TestCase):
             root / "manual_logic.py",
         ]
         forbidden = [
-            r"\.(?:children|parent_uuid|content_hash|state_hash|previous_state_hash|state_ancestor_hashes|data|weights)\s*=",
+            r"\.(?:children|parent_uuid|content_hash|state_hash|base_hash|base_parent_uuid|data|weights)\s*=",
             r"\.(?:data|weights)\s*\[",
             r"\.children\.append\s*\(",
             r"\.children\.(?:clear|extend|insert|pop|remove)\s*\(",

@@ -31,7 +31,6 @@ from datetime import datetime, timezone
 from typing import Any
 
 
-PERSPECTIVE_STATES = ("none", "kept_mine", "pushed_back")
 _REVISION_ORIGIN_UNSET = object()
 
 
@@ -44,20 +43,30 @@ def stable_hash(payload: dict) -> str:
     return hashlib.sha256(encoded.encode()).hexdigest()[:20]
 
 
-def content_hash(data: dict, weights: dict, deleted: bool,
-                 child_content_hashes: list[str]) -> str:
+# content_hash is the node's OWN identity: its data/weights/deleted only, with
+# no descendants and no uuid. It answers "is this node's own version
+# different?" and drives revisions, divergence, adoption and rollback. The uuid
+# is deliberately excluded - it is the CRDT primary key, matched outside the
+# hash, which is what lets two clients' edits to "the same node" be comparable.
+def content_hash(data: dict, weights: dict, deleted: bool) -> str:
     return stable_hash({
         "data": data,
         "weights": weights,
         "deleted": deleted,
-        "children": child_content_hashes,
     })
 
 
-def state_hash(node_content_hash: str, child_state_hashes: list[str]) -> str:
+# state_hash is the recursive subtree fingerprint: this node's content_hash plus
+# each child's (uuid, state_hash). It answers "did anything under here change /
+# do two subtrees match exactly?" and drives polling, relay publication and
+# transfer validation. Child uuids are folded in (not just their content) so
+# that swapping a child for an identical-content node with a different uuid
+# still changes the parent - a structural change must be visible to validation.
+# Pairs are sorted, so sibling order stays out of the hash (order is not synced).
+def state_hash(node_content_hash: str, child_uuid_state_hashes: list[list[str]]) -> str:
     return stable_hash({
         "content_hash": node_content_hash,
-        "children": child_state_hashes,
+        "children": child_uuid_state_hashes,
     })
 
 
@@ -91,26 +100,26 @@ class PRSPNode:
         self.content_hash = ""
         self.state_hash = ""
         self.refresh_hashes()
-        self.previous_hash = self.state_hash
-        self.previous_parent_uuid = self.parent_uuid
-        self.perspective_state = "none"
+        # base_hash is a snapshot of this node's own content_hash at the start
+        # of the current originator's wave. It stays fixed while the same
+        # originator successively edits this node, and advances only when
+        # another origin starts a new wave (see _begin_revision). It tracks
+        # content_hash, not state_hash, so a descendant change never disturbs
+        # an ancestor's wave.
+        self.base_hash = self.content_hash
+        self.base_parent_uuid = self.parent_uuid
         # Protocol metadata, deliberately excluded from content/state hashes.
-        # It identifies the client that made this exact revision, even when
-        # another peer merely forwards or adopts it.
+        # It identifies the client that started this revision wave, even
+        # when another peer merely forwards or adopts its latest state.
         self.revision_origin_identity = revision_origin_identity
 
     def recompute_content_hash(self) -> str:
-        return content_hash(
-            self.data,
-            self.weights,
-            self.deleted,
-            sorted(child.content_hash for child in self.children),
-        )
+        return content_hash(self.data, self.weights, self.deleted)
 
     def recompute_state_hash(self) -> str:
         return state_hash(
             self.content_hash,
-            sorted(child.state_hash for child in self.children),
+            sorted([child.uuid, child.state_hash] for child in self.children),
         )
 
     def refresh_hashes(self) -> None:
@@ -125,12 +134,6 @@ class PRSPNode:
     def live_children(self) -> list["PRSPNode"]:
         return [child for child in self.children if not child.deleted]
 
-    def is_kept_mine(self) -> bool:
-        return self.perspective_state == "kept_mine"
-
-    def is_pushed_back(self) -> bool:
-        return self.perspective_state == "pushed_back"
-
     def to_dict(self) -> dict:
         return {
             "uuid": self.uuid,
@@ -138,9 +141,8 @@ class PRSPNode:
             "updated_at": self.updated_at,
             "content_hash": self.content_hash,
             "state_hash": self.state_hash,
-            "previous_hash": self.previous_hash,
-            "previous_parent_uuid": self.previous_parent_uuid,
-            "perspective_state": self.perspective_state,
+            "base_hash": self.base_hash,
+            "base_parent_uuid": self.base_parent_uuid,
             "revision_origin_identity": self.revision_origin_identity,
             "weights": copy.deepcopy(self.weights),
             "data": copy.deepcopy(self.data),
@@ -157,10 +159,8 @@ class PRSPNode:
         node.updated_at = payload["updated_at"]
         node.content_hash = payload["content_hash"]
         node.state_hash = payload["state_hash"]
-        node.previous_hash = payload.get("previous_hash", payload["state_hash"])
-        node.previous_parent_uuid = payload.get("previous_parent_uuid", payload.get("parent_uuid"))
-        perspective_state = payload.get("perspective_state", "none")
-        node.perspective_state = perspective_state if perspective_state in PERSPECTIVE_STATES else "none"
+        node.base_hash = payload.get("base_hash", payload["content_hash"])
+        node.base_parent_uuid = payload.get("base_parent_uuid", payload.get("parent_uuid"))
         node.revision_origin_identity = payload.get("revision_origin_identity")
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.data = copy.deepcopy(payload["data"])
@@ -219,11 +219,7 @@ class ProtocolState:
         node.weights = new_weights
         if changed:
             node.updated_at = now_iso()
-            if revision_origin_identity is not _REVISION_ORIGIN_UNSET:
-                node.revision_origin_identity = revision_origin_identity
-        # cascade_hash records previous_hash - and only when the state_hash
-        # actually changed, so a no-op modify cannot destroy the one-slot
-        # history a lagging peer still needs for classification.
+            self._begin_revision(node, revision_origin_identity)
         self.cascade_hash(node_uuid)
         return ProtocolResult(True, True)
 
@@ -231,20 +227,6 @@ class ProtocolState:
                revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
         ok = self._delete_impl(node_uuid, revision_origin_identity)
         return ProtocolResult(ok, ok, None if ok else "delete failed")
-
-    def set_perspective_state(self, node_uuid: str, state: str) -> ProtocolResult:
-        ok = self._set_perspective_state_impl(node_uuid, state)
-        return ProtocolResult(ok, ok, None if ok else "set_perspective_state failed")
-
-    def _set_perspective_state_impl(self, node_uuid: str, state: str) -> bool:
-        if state not in PERSPECTIVE_STATES:
-            return False
-        node = self.index.get(node_uuid)
-        if not node:
-            return False
-        node.perspective_state = state
-        node.updated_at = now_iso()
-        return True
 
     def copy(self, source_uuid: str, destination_uuid: str,
              revision_origin_identity: str | None = None) -> ProtocolResult:
@@ -339,17 +321,31 @@ class ProtocolState:
         self.index.pop(node.uuid, None)
 
     def cascade_hash(self, node_uuid: str | None) -> None:
+        # Recompute hashes from node_uuid up to the root. A descendant change
+        # only moves ancestors' subtree (state) hash - their own content_hash
+        # is unchanged - and it never touches any base_hash: base advances
+        # solely via _begin_revision on the directly edited node. This is why
+        # a card edit no longer manufactures a revision of its column/board.
         current_uuid = node_uuid
         while current_uuid:
             node = self.index.get(current_uuid)
             if not node:
                 break
-            old_state_hash = node.state_hash
             node.refresh_hashes()
-            if node.state_hash != old_state_hash:
-                node.previous_hash = old_state_hash
-                node.perspective_state = "none"
             current_uuid = node.parent_uuid
+
+    @staticmethod
+    def _begin_revision(node: PRSPNode,
+                        revision_origin_identity: str | None | object) -> None:
+        if revision_origin_identity is _REVISION_ORIGIN_UNSET:
+            return
+        if node.revision_origin_identity != revision_origin_identity:
+            # Snapshot the node's own content at the wave start. Callers run
+            # this before the edit's hashes are recomputed, so content_hash
+            # here is still the pre-edit value.
+            node.base_hash = node.content_hash
+            node.base_parent_uuid = node.parent_uuid
+        node.revision_origin_identity = revision_origin_identity
 
     def clone_subtree(self, node: PRSPNode, parent_uuid: str | None,
                       revision_origin_identity: str | None = None) -> PRSPNode:
@@ -379,12 +375,9 @@ class ProtocolState:
     def _mark_deleted_cascade(self, node: PRSPNode,
                               revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> None:
         if not node.deleted:
-            node.previous_hash = node.state_hash
+            self._begin_revision(node, revision_origin_identity)
             node.deleted = True
-            node.perspective_state = "none"
             node.updated_at = now_iso()
-            if revision_origin_identity is not _REVISION_ORIGIN_UNSET:
-                node.revision_origin_identity = revision_origin_identity
         for child in node.children:
             self._mark_deleted_cascade(child, revision_origin_identity)
 
@@ -409,14 +402,10 @@ class ProtocolState:
         old_parent.children = [
             child for child in old_parent.children if child.uuid != node.uuid
         ]
-        # A same-parent call is a reorder, not a move: leave the one-slot
-        # move history (and any keep_mine) alone so a lagging peer can still
-        # attribute the last real move.
+        # A same-parent call is a reorder, not a move: leave the compound
+        # move base alone.
         if node.parent_uuid != destination.uuid:
-            node.previous_parent_uuid = node.parent_uuid
-            node.perspective_state = "none"
-            if revision_origin_identity is not _REVISION_ORIGIN_UNSET:
-                node.revision_origin_identity = revision_origin_identity
+            self._begin_revision(node, revision_origin_identity)
         node.parent_uuid = destination.uuid
         node.updated_at = now_iso()
         insert_at = len(destination.children) if index is None else max(0, min(index, len(destination.children)))

@@ -33,20 +33,39 @@ class ProtocolTests(unittest.TestCase):
     def test_new_node_starts_settled(self):
         node = PRSPNode({"name": "node"})
 
-        self.assertEqual(node.previous_hash, node.state_hash)
-        self.assertEqual(node.previous_parent_uuid, node.parent_uuid)
+        # base_hash snapshots the node's OWN content (content_hash), not the
+        # recursive subtree (state_hash).
+        self.assertEqual(node.base_hash, node.content_hash)
+        self.assertEqual(node.base_parent_uuid, node.parent_uuid)
 
-    def test_modify_tracks_previous_hash(self):
+    def test_same_origin_modifications_keep_compound_base_hash(self):
         state = ProtocolState("si-a")
-        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
-        old_hash = child.state_hash
+        child = state.create_child(
+            state.root.uuid, {"name": "child"}, {}, "identity-a",
+        ).value
+        old_hash = child.content_hash
 
-        state.modify(child.uuid, {"name": "renamed"}, {})
+        state.modify(child.uuid, {"name": "first"}, {}, "identity-a")
+        first_hash = child.state_hash
+        state.modify(child.uuid, {"name": "second"}, {}, "identity-a")
 
-        self.assertEqual(child.previous_hash, old_hash)
-        self.assertNotEqual(child.state_hash, old_hash)
+        self.assertEqual(child.base_hash, old_hash)
+        self.assertNotEqual(child.state_hash, first_hash)
 
-    def test_move_child_tracks_previous_parent_uuid(self):
+    def test_different_origin_starts_new_revision_wave(self):
+        state = ProtocolState("si-a")
+        child = state.create_child(
+            state.root.uuid, {"name": "child"}, {}, "identity-a",
+        ).value
+        state.modify(child.uuid, {"name": "first"}, {}, "identity-a")
+        previous_actual = child.content_hash
+
+        state.modify(child.uuid, {"name": "second"}, {}, "identity-b")
+
+        self.assertEqual(child.base_hash, previous_actual)
+        self.assertEqual(child.revision_origin_identity, "identity-b")
+
+    def test_move_child_tracks_base_parent_uuid(self):
         state = ProtocolState("si-a")
         first = state.create_child(state.root.uuid, {"name": "first"}, {}).value
         second = state.create_child(state.root.uuid, {"name": "second"}, {}).value
@@ -54,20 +73,79 @@ class ProtocolTests(unittest.TestCase):
 
         state.move_child(child.uuid, second.uuid)
 
-        self.assertEqual(child.previous_parent_uuid, first.uuid)
+        self.assertEqual(child.base_parent_uuid, first.uuid)
         self.assertEqual(child.parent_uuid, second.uuid)
 
-    def test_noop_modify_keeps_previous_hash(self):
+    def test_noop_modify_keeps_base_hash(self):
         state = ProtocolState("si-a")
         child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
         state.modify(child.uuid, {"name": "renamed"}, {})
-        previous_hash_before = child.previous_hash
+        base_hash_before = child.base_hash
 
         # Writing identical data (e.g. saving a card without editing it)
-        # must not consume the one-slot history a lagging peer relies on.
+        # must not change the compound revision base.
         state.modify(child.uuid, {"name": "renamed"}, {})
 
-        self.assertEqual(child.previous_hash, previous_hash_before)
+        self.assertEqual(child.base_hash, base_hash_before)
+
+    def test_descendant_change_does_not_revision_ancestor(self):
+        # The core of the node_hash/subtree_hash split: editing a child moves
+        # the parent's subtree (state) hash but never its own content hash or
+        # its revision base - so a card edit can't manufacture a column/board
+        # revision or false divergence.
+        state = ProtocolState("si-a")
+        parent = state.create_child(
+            state.root.uuid, {"name": "parent"}, {}, "identity-a",
+        ).value
+        child = state.create_child(
+            parent.uuid, {"name": "child"}, {}, "identity-a",
+        ).value
+        content_before = parent.content_hash
+        state_before = parent.state_hash
+        base_before = parent.base_hash
+
+        state.modify(child.uuid, {"name": "edited"}, {}, "identity-b")
+
+        self.assertEqual(parent.content_hash, content_before)
+        self.assertNotEqual(parent.state_hash, state_before)
+        self.assertEqual(parent.base_hash, base_before)
+
+    def test_container_base_survives_descendant_edit(self):
+        # Regression for the finding-#2 container-rollback bug: renaming a
+        # container sets its wave base; a later descendant edit must NOT slide
+        # that base (which previously broke rolling back the rename).
+        state = ProtocolState("si-a")
+        column = state.create_child(
+            state.root.uuid, {"name": "col"}, {}, "identity-a",
+        ).value
+        card = state.create_child(
+            column.uuid, {"name": "card"}, {}, "identity-a",
+        ).value
+        state.modify(column.uuid, {"name": "col-renamed"}, {}, "identity-b")
+        base_after_rename = column.base_hash
+
+        state.modify(card.uuid, {"name": "card-edited"}, {}, "identity-a")
+
+        self.assertEqual(column.base_hash, base_after_rename)
+
+    def test_subtree_hash_includes_child_identity(self):
+        # subtree_hash folds in child uuids, so swapping a child for an
+        # identical-content node with a different uuid still changes the
+        # parent - required for transfer validation to catch a structural swap.
+        parent = PRSPNode({"name": "parent"})
+        child_a = PRSPNode({"name": "same"}, parent_uuid=parent.uuid)
+        parent.children = [child_a]
+        parent.refresh_hashes()
+        hash_with_a = parent.state_hash
+
+        child_b = PRSPNode({"name": "same"}, parent_uuid=parent.uuid)
+        self.assertNotEqual(child_a.uuid, child_b.uuid)
+        self.assertEqual(child_a.content_hash, child_b.content_hash)
+        self.assertEqual(child_a.state_hash, child_b.state_hash)
+        parent.children = [child_b]
+        parent.refresh_hashes()
+
+        self.assertNotEqual(parent.state_hash, hash_with_a)
 
     def test_revision_origin_survives_roundtrip_and_only_real_node_edits_replace_it(self):
         state = ProtocolState("si-a")
@@ -114,7 +192,7 @@ class ProtocolTests(unittest.TestCase):
             for node in (parent, child)
         ))
 
-    def test_same_parent_move_keeps_previous_parent_uuid(self):
+    def test_same_parent_move_keeps_base_parent_uuid(self):
         state = ProtocolState("si-a")
         first = state.create_child(state.root.uuid, {"name": "first"}, {}).value
         second = state.create_child(state.root.uuid, {"name": "second"}, {}).value
@@ -126,119 +204,8 @@ class ProtocolTests(unittest.TestCase):
         # within-column drag) must not consume the real move history.
         state.move_child(child.uuid, second.uuid, 0)
 
-        self.assertEqual(child.previous_parent_uuid, first.uuid)
+        self.assertEqual(child.base_parent_uuid, first.uuid)
         self.assertEqual(child.parent_uuid, second.uuid)
-
-    def test_keep_mine_sets_kept_mine_markers_without_touching_true_history(self):
-        state = ProtocolState("si-a")
-        parent = state.create_child(state.root.uuid, {"name": "parent"}, {}).value
-        child = state.create_child(parent.uuid, {"name": "child"}, {}).value
-        state.modify(child.uuid, {"name": "renamed"}, {})
-        state_hash_before = child.state_hash
-        content_hash_before = child.content_hash
-        previous_hash_before = child.previous_hash
-        previous_parent_uuid_before = child.previous_parent_uuid
-
-        result = state.set_perspective_state(child.uuid, "kept_mine")
-
-        self.assertTrue(result.ok)
-        self.assertTrue(child.is_kept_mine())
-        self.assertEqual(child.perspective_state, "kept_mine")
-        # True edit history must stay untouched - it's still needed to
-        # classify correctly against peers who know nothing about this
-        # keep_mine.
-        self.assertEqual(child.previous_hash, previous_hash_before)
-        self.assertEqual(child.previous_parent_uuid, previous_parent_uuid_before)
-        self.assertEqual(child.state_hash, state_hash_before)
-        self.assertEqual(child.content_hash, content_hash_before)
-
-    def test_set_perspective_state_can_be_cleared_directly(self):
-        state = ProtocolState("si-a")
-        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
-        state.modify(child.uuid, {"name": "renamed"}, {})
-
-        self.assertTrue(state.set_perspective_state(child.uuid, "kept_mine").ok)
-        self.assertTrue(child.is_kept_mine())
-
-        self.assertTrue(state.set_perspective_state(child.uuid, "none").ok)
-        self.assertFalse(child.is_kept_mine())
-        self.assertEqual(child.perspective_state, "none")
-
-    def test_set_perspective_state_jumps_directly_between_states(self):
-        # The UI offers a menu, not a cycle - pushed_back must be reachable
-        # (and clearable) without passing through kept_mine first.
-        state = ProtocolState("si-a")
-        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
-
-        self.assertTrue(state.set_perspective_state(child.uuid, "pushed_back").ok)
-        self.assertTrue(child.is_pushed_back())
-        self.assertFalse(child.is_kept_mine())
-
-        self.assertTrue(state.set_perspective_state(child.uuid, "none").ok)
-        self.assertFalse(child.is_pushed_back())
-
-    def test_set_perspective_state_rejects_invalid_state(self):
-        state = ProtocolState("si-a")
-        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
-
-        result = state.set_perspective_state(child.uuid, "maybe")
-
-        self.assertFalse(result.ok)
-        self.assertEqual(child.perspective_state, "none")
-
-    def test_keep_mine_is_cleared_by_a_later_cascaded_change(self):
-        state = ProtocolState("si-a")
-        parent = state.create_child(state.root.uuid, {"name": "parent"}, {}).value
-        child = state.create_child(parent.uuid, {"name": "child"}, {}).value
-
-        self.assertTrue(state.set_perspective_state(parent.uuid, "kept_mine").ok)
-        self.assertTrue(parent.is_kept_mine())
-
-        # A change to a descendant cascades parent's state_hash upward -
-        # the parent's keep_mine should no longer apply to this new state,
-        # with no explicit clearing needed anywhere but cascade_hash.
-        state.modify(child.uuid, {"name": "child changed"}, {})
-
-        self.assertFalse(parent.is_kept_mine())
-
-    def test_pushed_back_is_also_cleared_by_a_later_cascaded_change(self):
-        # pushed_back is exempt from the *session-level* staleness check
-        # (Session.keep_mine_active), not from local mutation clearing it -
-        # a real edit to my own node always wins.
-        state = ProtocolState("si-a")
-        parent = state.create_child(state.root.uuid, {"name": "parent"}, {}).value
-        child = state.create_child(parent.uuid, {"name": "child"}, {}).value
-
-        self.assertTrue(state.set_perspective_state(parent.uuid, "pushed_back").ok)
-        self.assertTrue(parent.is_pushed_back())
-
-        state.modify(child.uuid, {"name": "child changed"}, {})
-
-        self.assertEqual(parent.perspective_state, "none")
-
-    def test_keep_mine_is_cleared_by_a_later_move(self):
-        state = ProtocolState("si-a")
-        first = state.create_child(state.root.uuid, {"name": "first"}, {}).value
-        second = state.create_child(state.root.uuid, {"name": "second"}, {}).value
-        child = state.create_child(first.uuid, {"name": "child"}, {}).value
-
-        self.assertTrue(state.set_perspective_state(child.uuid, "kept_mine").ok)
-        self.assertTrue(child.is_kept_mine())
-
-        state.move_child(child.uuid, second.uuid)
-
-        self.assertFalse(child.is_kept_mine())
-
-    def test_keep_mine_is_cleared_by_a_later_delete(self):
-        state = ProtocolState("si-a")
-        child = state.create_child(state.root.uuid, {"name": "child"}, {}).value
-
-        self.assertTrue(state.set_perspective_state(child.uuid, "kept_mine").ok)
-        self.assertTrue(child.is_kept_mine())
-
-        state.delete(child.uuid)
-
-        self.assertFalse(child.is_kept_mine())
 
     def test_delete_cascades_flag_and_keeps_descendants_indexed(self):
         state = ProtocolState("si-a")

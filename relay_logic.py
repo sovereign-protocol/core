@@ -16,17 +16,9 @@ Functionality:
       relay_sftp_port (default 22), relay_sftp_username, relay_sftp_root
       (remote path, default "/"), and either relay_sftp_password or
       relay_sftp_private_key_path (+ optional
-      relay_sftp_private_key_passphrase). The password/passphrase never
-      need to live in the config file itself - each is resolved in
-      priority order: the config key directly (only for local, throwaway
-      testing), then an env var (SKANBAN_SFTP_PASSWORD /
-      SKANBAN_SFTP_PRIVATE_KEY_PASSPHRASE), then a "<key>_file" config
-      entry pointing at a file holding just the secret (works even when
-      the server wasn't launched from the same shell an env var was set
-      in). Credentials never appear in a channel_descriptor() payload
-      either way - that only ever advertises host/port/root/identity (see
-      relay_storage.py's module docstring for the plaintext-content/
-      trust-on-first-use tradeoffs of this MVP pass).
+      relay_sftp_private_key_passphrase). UI-created SFTP targets persist
+      their password in the local session envelope; environment-variable
+      and password-file lookup are intentionally not used.
 
   This is deliberately not built on Session.add_peer/pending_sync_effects/
   HttpTransportAdapter - those assume every registered member is directly
@@ -431,30 +423,14 @@ class RelayLogic:
                 port=int(config.get("relay_sftp_port", 22)),
                 username=config.get("relay_sftp_username"),
                 remote_root=config.get("relay_sftp_root", "/"),
-                password=RelayLogic._secret(
-                    config, "relay_sftp_password", "SKANBAN_SFTP_PASSWORD",
-                ),
+                password=config.get("relay_sftp_password") or None,
                 private_key_path=config.get("relay_sftp_private_key_path"),
-                private_key_passphrase=RelayLogic._secret(
-                    config, "relay_sftp_private_key_passphrase",
-                    "SKANBAN_SFTP_PRIVATE_KEY_PASSPHRASE",
+                private_key_passphrase=(
+                    config.get("relay_sftp_private_key_passphrase") or None
                 ),
             )
         root = config.get("relay_root")
         return LocalFolderRelayStorage(root) if root else None
-
-    @staticmethod
-    def _secret(config: dict, config_key: str, env_var: str) -> str | None:
-        value = config.get(config_key)
-        if value:
-            return value
-        value = os.environ.get(env_var)
-        if value:
-            return value
-        file_path = config.get(f"{config_key}_file")
-        if file_path:
-            return Path(file_path).read_text(encoding="utf-8").strip()
-        return None
 
     @staticmethod
     def _storage_from_descriptor(descriptor: dict):
@@ -1177,9 +1153,6 @@ class RelayManager:
         # use Session.lock; keeping the two distinct avoids an io->session vs
         # session->io lock inversion when credentials are refreshed.
         self._manager_lock = threading.RLock()
-        self._startup_configured = bool(
-            config.get("relay_root") or config.get("relay_sftp_host")
-        )
         self.connections: dict[str, RelayLogic] = {}
         # The implicit connection: built from the flat config (or a persisted
         # adopted-descriptor) exactly as before. Registered by fingerprint.
@@ -1254,13 +1227,22 @@ class RelayManager:
         }
 
     def _bootstrap_registry(self) -> None:
+        registry = self._target_registry()
+        # Older versions marked the target imported from JSON as protected.
+        # Targets are now owned by the persisted registry, including migrated
+        # ones, so every target can be edited and deleted in the UI.
+        for record in registry.values():
+            record.pop("configured", None)
+        migration_key = "relay_startup_target_migrated"
+        if self.session.app_metadata.get(migration_key):
+            return
+        self.session.app_metadata[migration_key] = True
         if not self.primary.storage:
             return
         descriptor = self.primary.channel_descriptor()
         if not descriptor:
             return
         fingerprint = _relay_fingerprint(self.primary.storage)
-        registry = self._target_registry()
         target_id = next(
             (
                 item_id for item_id, record in registry.items()
@@ -1272,20 +1254,9 @@ class RelayManager:
         )
         if target_id is None:
             target_id = str(uuid_mod.uuid4())
-            record = self._record_from_descriptor(descriptor, "Configured relay")
-            record["configured"] = self._startup_configured
-            registry[target_id] = record
-        elif self._startup_configured:
-            # The explicit startup config is authoritative. A persisted
-            # registry record may contain an old password/poll interval; if
-            # it overwrote `primary` below, changing the config would appear
-            # to have no effect after restart.
-            previous = registry[target_id]
-            record = self._record_from_descriptor(
-                descriptor, previous.get("name") or "Configured relay",
+            registry[target_id] = self._record_from_descriptor(
+                descriptor, "Imported relay",
             )
-            record["configured"] = True
-            registry[target_id] = record
         # Migrate durable relay intent to explicit assignments. New boards
         # remain unassigned, as required by the explicit-target model.
         mapping = self._board_target_map()
@@ -1337,22 +1308,12 @@ class RelayManager:
         with self._manager_lock:
             existing = self.connections.get(fingerprint)
             if existing:
-                # Never replace a startup-configured primary with its
-                # persisted descriptor: that would discard current secrets
-                # (including private-key authentication) in favour of stale
-                # registry data. Other accepted targets may refresh bearer
-                # credentials for the same location.
-                if not (
-                    existing is self.primary
-                    and self._startup_configured
-                    and fingerprint == self._primary_fingerprint
-                ):
-                    with existing._io_lock:
-                        previous_storage = existing.storage
-                        existing.storage = storage
-                        close_previous = getattr(previous_storage, "_reset_connection", None)
-                        if close_previous and previous_storage is not storage:
-                            close_previous()
+                with existing._io_lock:
+                    previous_storage = existing.storage
+                    existing.storage = storage
+                    close_previous = getattr(previous_storage, "_reset_connection", None)
+                    if close_previous and previous_storage is not storage:
+                        close_previous()
                 existing.adopt_poll_interval_from_descriptor(descriptor or {})
                 return existing
             record = self._record_from_descriptor(descriptor or {})
@@ -1404,7 +1365,9 @@ class RelayManager:
                     continue
                 connection.set_scoped_topics(topics_by_fingerprint.get(fingerprint, set()))
 
-    def create_target(self, values: dict, verify: bool = True) -> SessionResult:
+    def _descriptor_from_target_values(
+        self, values: dict, password_fallback: str = "",
+    ) -> SessionResult:
         backend = values.get("backend", "sftp")
         try:
             port = int(values.get("port") or 22)
@@ -1419,7 +1382,7 @@ class RelayManager:
             "port": port,
             "username": str(values.get("username") or "").strip(),
             "root": str(values.get("root") or ("/" if backend == "sftp" else "")).strip(),
-            "password": values.get("password") or "",
+            "password": values.get("password") or password_fallback,
             "poll_interval_seconds": values.get("poll_interval_seconds", 3),
         }
         if backend == "sftp" and (not descriptor["host"] or not descriptor["username"]):
@@ -1427,20 +1390,119 @@ class RelayManager:
         storage = RelayLogic._storage_from_descriptor(descriptor)
         if not storage:
             return SessionResult("error", reason="relay target is not usable")
+        return SessionResult("ok", value=(descriptor, storage))
+
+    @staticmethod
+    def _verify_target_storage(storage) -> SessionResult:
+        try:
+            checker = getattr(storage, "verify_access", None)
+            checker() if checker else storage.list_topics()
+        except Exception as exc:
+            return SessionResult(
+                "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
+            )
+        return SessionResult("ok")
+
+    def create_target(self, values: dict, verify: bool = True) -> SessionResult:
+        prepared = self._descriptor_from_target_values(values)
+        if prepared.status != "ok":
+            return prepared
+        descriptor, storage = prepared.value
         if verify:
-            try:
-                checker = getattr(storage, "verify_access", None)
-                checker() if checker else storage.list_topics()
-            except Exception as exc:
-                return SessionResult(
-                    "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
-                )
+            verified = self._verify_target_storage(storage)
+            if verified.status != "ok":
+                return verified
         with self._manager_lock:
             target_id = str(uuid_mod.uuid4())
             self._target_registry()[target_id] = self._record_from_descriptor(
                 descriptor, str(values.get("name") or "Relay target").strip(),
             )
             self.ensure_connection(self.target_descriptor(target_id))
+            self.refresh_scopes()
+        return SessionResult("ok", value=target_id)
+
+    def update_target(self, target_id: str, values: dict,
+                      verify: bool = True) -> SessionResult:
+        with self._manager_lock:
+            previous_record = self._target_registry().get(target_id)
+            if not previous_record:
+                return SessionResult("error", reason="relay target not found")
+            previous_record = dict(previous_record)
+        prepared = self._descriptor_from_target_values(
+            values, str(previous_record.get("password") or ""),
+        )
+        if prepared.status != "ok":
+            return prepared
+        descriptor, storage = prepared.value
+        if verify:
+            verified = self._verify_target_storage(storage)
+            if verified.status != "ok":
+                return verified
+
+        with self._manager_lock:
+            registry = self._target_registry()
+            current_record = registry.get(target_id)
+            if not current_record:
+                return SessionResult("error", reason="relay target not found")
+            old_descriptor = self._descriptor_from_record(current_record)
+            old_storage = RelayLogic._storage_from_descriptor(old_descriptor)
+            old_fingerprint = _relay_fingerprint(old_storage) if old_storage else None
+            old_connection = (
+                self.connections.get(old_fingerprint) if old_fingerprint else None
+            )
+            assigned_boards = {
+                board_uuid for board_uuid, assigned in self._board_target_map().items()
+                if assigned == target_id
+            }
+            old_intent = {"shared": set(), "desired": set(), "identity_topics": set()}
+            if old_connection:
+                with old_connection._io_lock:
+                    for key in old_intent:
+                        old_intent[key] = set(old_connection._state.get(key, []))
+
+            registry[target_id] = self._record_from_descriptor(
+                descriptor,
+                str(values.get("name") or current_record.get("name") or "Relay target").strip(),
+            )
+            new_connection = self.ensure_connection(self.target_descriptor(target_id))
+            if not new_connection:
+                registry[target_id] = current_record
+                return SessionResult("error", reason="relay connection could not be created")
+
+            new_fingerprint = _relay_fingerprint(new_connection.storage)
+            if old_connection and old_connection is not new_connection:
+                other_old_reference = any(
+                    item_id != target_id
+                    and _relay_fingerprint(RelayLogic._storage_from_descriptor(
+                        self._descriptor_from_record(item)
+                    )) == old_fingerprint
+                    for item_id, item in registry.items()
+                )
+                if other_old_reference:
+                    shared = old_intent["shared"] & assigned_boards
+                    desired = old_intent["desired"] & assigned_boards
+                    identity_topics = old_intent["identity_topics"]
+                    if shared:
+                        old_connection.unmark_topics_shared(sorted(shared))
+                    if desired:
+                        old_connection.unmark_topics_desired(sorted(desired))
+                else:
+                    shared = old_intent["shared"]
+                    desired = old_intent["desired"]
+                    identity_topics = old_intent["identity_topics"]
+                if shared:
+                    new_connection.mark_topics_shared(sorted(shared))
+                if desired:
+                    new_connection.mark_topics_desired(sorted(desired))
+                if identity_topics:
+                    with new_connection._io_lock:
+                        merged = set(new_connection._state.get("identity_topics", []))
+                        merged.update(identity_topics)
+                        new_connection._state["identity_topics"] = sorted(merged)
+                        new_connection._save_state()
+                if not other_old_reference:
+                    self._retire_connection(old_fingerprint, old_connection)
+            self.connections[new_fingerprint] = new_connection
             self.refresh_scopes()
         return SessionResult("ok", value=target_id)
 
@@ -1453,21 +1515,10 @@ class RelayManager:
         for target_id, record in self._target_registry().items():
             existing = RelayLogic._storage_from_descriptor(self._descriptor_from_record(record))
             if existing and _relay_fingerprint(existing) == fingerprint:
-                if (
-                    record.get("configured")
-                    and self._startup_configured
-                    and fingerprint == self._primary_fingerprint
-                ):
-                    # A token pointing at our configured location must not
-                    # replace locally-authoritative credentials or cadence.
-                    return SessionResult("ok", value=target_id)
-                replacement = self._record_from_descriptor(
-                    descriptor, record.get("name") or None,
-                )
-                if record.get("configured"):
-                    replacement["configured"] = True
-                self._target_registry()[target_id] = replacement
-                self.ensure_connection(descriptor)
+                # A token identifies a location; it must not silently edit
+                # this client's saved password or polling preference. Those
+                # are changed only through the target editor.
+                self.ensure_connection(self.target_descriptor(target_id))
                 return SessionResult("ok", value=target_id)
         target_id = str(uuid_mod.uuid4())
         self._target_registry()[target_id] = self._record_from_descriptor(descriptor)
@@ -1498,8 +1549,6 @@ class RelayManager:
         connection = self.connection_for_target(target_id)
         if not connection:
             return SessionResult("error", reason="relay connection could not be created")
-        if not (connection is self.primary and self._startup_configured):
-            connection.adopt_poll_interval_from_descriptor(descriptor)
         desired = connection.mark_topics_desired(topic_uuids)
         if desired.status != "ok":
             return desired
@@ -1599,14 +1648,31 @@ class RelayManager:
             )
         return SessionResult("ok", value=target_id)
 
+    def _retire_connection(self, fingerprint: str | None,
+                           connection: RelayLogic) -> None:
+        with connection._io_lock:
+            connection._state["shared"] = []
+            connection._state["desired"] = []
+            connection._state["identity_topics"] = []
+            connection._save_state()
+            storage = connection.storage
+            close_storage = getattr(storage, "_reset_connection", None)
+            if close_storage:
+                close_storage()
+            connection.storage = None
+            connection._scoped_topic_uuids = set()
+        if fingerprint:
+            self.connections.pop(fingerprint, None)
+        if connection is self.primary:
+            self._primary_fingerprint = "unconfigured"
+            self.connections.setdefault("unconfigured", connection)
+
     @_manager_locked
     def delete_target(self, target_id: str) -> SessionResult:
         registry = self._target_registry()
         record = registry.get(target_id)
         if not record:
             return SessionResult("error", reason="relay target not found")
-        if record.get("configured"):
-            return SessionResult("error", reason="startup-configured targets cannot be deleted here")
         descriptor = self.target_descriptor(target_id)
         storage = RelayLogic._storage_from_descriptor(descriptor)
         fingerprint = _relay_fingerprint(storage) if storage else None
@@ -1622,13 +1688,7 @@ class RelayManager:
             for item in registry.values()
         ) if fingerprint else False
         if connection and not remaining_same_connection:
-            with connection._io_lock:
-                connection._state["shared"] = []
-                connection._state["desired"] = []
-                connection._state["identity_topics"] = []
-                connection._save_state()
-            if connection is not self.primary:
-                self.connections.pop(fingerprint, None)
+            self._retire_connection(fingerprint, connection)
         self.refresh_scopes()
         return SessionResult("ok", value=target_id)
 
@@ -1711,7 +1771,10 @@ def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
         if request.method == "GET":
             return JSONResponse({"targets": logic.list_targets()})
         data = await request.json()
-        result = await asyncio.to_thread(logic.create_target, data, True)
+        target_id = str(data.get("target_id") or "").strip()
+        operation = logic.update_target if target_id else logic.create_target
+        args = (target_id, data, True) if target_id else (data, True)
+        result = await asyncio.to_thread(operation, *args)
         if result.status != "ok":
             return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
         runtime.notify_change("relay-target")

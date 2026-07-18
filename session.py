@@ -23,7 +23,6 @@ Offered API:
     supply only their own eligibility policy via the two callables - the
     walk itself, and the keep-mine/pushed-back guards, are app-agnostic.
   protocol operation wrappers: create_child, modify, delete, copy, move,
-    set_perspective_state
 
 Used API:
   protocol.ProtocolState and protocol.PRSPNode only.
@@ -316,7 +315,7 @@ class Session:
         # A connect token carries the sender's identity inline so it's
         # visible immediately, without waiting on whichever channel(s) end
         # up actually usable to fetch it - deliberately unconditional
-        # (never goes through reconcile_peer_changes/keep_mine/pushed_back):
+        # (never goes through collaborative revision reconciliation):
         # an identity assertion isn't collaborative content with divergence
         # to resolve, it's just "the latest thing this peer said about
         # themselves." Degrades gracefully (no-op) on anything it doesn't
@@ -649,11 +648,13 @@ class Session:
 
     @staticmethod
     def node_revision(node: PRSPNode) -> str:
-        # state_hash excludes structural position; parent_uuid makes moves
-        # independently acknowledgeable too. Origin distinguishes identical
-        # content independently authored by two clients.
+        # content_hash is this node's OWN version (no descendants), so a
+        # descendant change never re-revisions an ancestor - observation stays
+        # aligned with classification (both key on content_hash). parent_uuid
+        # makes moves independently acknowledgeable; origin distinguishes
+        # identical content independently authored by two clients.
         return (
-            f"{node.state_hash}@{node.parent_uuid or ''}"
+            f"{node.content_hash}@{node.parent_uuid or ''}"
             f"@{node.revision_origin_identity or ''}"
         )
 
@@ -912,10 +913,10 @@ class Session:
         target.updated_at = subtree.updated_at
         target.content_hash = subtree.content_hash
         target.state_hash = subtree.state_hash
-        target.previous_hash = subtree.previous_hash
-        target.previous_parent_uuid = subtree.previous_parent_uuid
+        target.base_hash = subtree.base_hash
+        target.base_parent_uuid = subtree.base_parent_uuid
         target.deleted = subtree.deleted
-        target.perspective_state = subtree.perspective_state
+        target.revision_origin_identity = subtree.revision_origin_identity
         target.weights = subtree.weights
         target.data = subtree.data
         target.children = subtree.children
@@ -994,7 +995,7 @@ class Session:
         # Nodes are matched by uuid across the whole subtree, not by
         # structural position, so a node that moved to a different parent
         # on one side is still compared against its own counterpart (and
-        # its move is attributable via previous_parent_uuid) instead of
+        # its move is attributable via base_parent_uuid) instead of
         # showing up as an unrelated local_missing/peer_missing pair.
         local_by_uuid = self._flatten_by_uuid(local_node) if local_node else {}
         peer_by_uuid = self._flatten_by_uuid(peer_node) if peer_node else {}
@@ -1011,7 +1012,7 @@ class Session:
             event["peer_observed_local_revision"] = bool(
                 local and self.peer_observed_node(peer_addr, local)
             )
-            events.append(event)
+            events.append(self._stage_transition_event(event))
         return events
 
     @staticmethod
@@ -1091,64 +1092,6 @@ class Session:
             reason=result.reason,
         )
         return self._operation_result(result, parent_uuid or node_uuid)
-
-    @_session_locked
-    def set_perspective_state(self, node_uuid: str, state: str) -> SessionResult:
-        node = self._protocol.index.get(node_uuid)
-        old_state_hash = node.state_hash if node else None
-        result = self._protocol.set_perspective_state(node_uuid, state)
-        self.trace_event(
-            "protocol.set_perspective_state",
-            node_uuid=node_uuid,
-            state=state,
-            old_state_hash=old_state_hash,
-            ok=result.ok,
-            reason=result.reason,
-        )
-        return self._operation_result(result, node_uuid)
-
-    @staticmethod
-    def keep_mine_active(local_node: PRSPNode, peer_node: PRSPNode) -> bool:
-        # `pushed_back` is a standing decision - exempt from staleness so it
-        # survives further peer churn on purpose (see BACKLOG.md item 10).
-        if local_node.perspective_state == "pushed_back":
-            return True
-        if local_node.perspective_state != "kept_mine":
-            return False
-        # `kept_mine` is only ever a decision about *content* - if a move
-        # has appeared since (in either direction), the merged transition
-        # type can stay a clean "peer_made_changes" even though keep_mine
-        # never considered the move at all, so it must not mask it. See the
-        # worked example in BACKLOG.md item 10 for why this can't be folded
-        # into a single "does the hash chain still connect" check.
-        if Session._classify_move(local_node, peer_node) != "in_agreement":
-            return False
-        if Session._classify_content(local_node, peer_node) == "divergence":
-            return False
-        return True
-
-    @staticmethod
-    def peer_pushed_back(peer_node: PRSPNode | None) -> bool:
-        return bool(peer_node and peer_node.perspective_state == "pushed_back")
-
-    @staticmethod
-    def _subtree_has_kept_mine(node: PRSPNode) -> bool:
-        # A wholesale subtree replace may only run when nothing under it has
-        # a local perspective decision - a wholesale replace would silently
-        # overwrite a node the user explicitly decided to keep.
-        if node.perspective_state != "none":
-            return True
-        return any(Session._subtree_has_kept_mine(child) for child in node.children)
-
-    @staticmethod
-    def _subtree_has_pushed_back(node: PRSPNode) -> bool:
-        # Same guard, but over the *incoming peer* subtree: a wholesale
-        # replace bypasses the per-node peer_pushed_back check entirely, so
-        # a peer's pushed_back node anywhere in what would be replaced must
-        # block it the same way a local keep-mine decision already does.
-        if node.perspective_state == "pushed_back":
-            return True
-        return any(Session._subtree_has_pushed_back(child) for child in node.children)
 
     @_session_locked
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
@@ -1264,6 +1207,38 @@ class Session:
             return SessionResult("error", reason="local parent not found")
         return self.adopt_subtree(peer, parent_uuid, remove_descendant_duplicates=True)
 
+    def validate_rollback_target(self, peer_addr: str,
+                                 node_uuid: str,
+                                 rollback_absence: bool = False) -> SessionResult:
+        local = self._protocol.index.get(node_uuid)
+        peer = self.get_cached_peer_subtree(peer_addr, node_uuid)
+        if not local:
+            return SessionResult("error", reason="rollback version not found")
+        local_identity = self._local_revision_origin()
+        if not local_identity or local.revision_origin_identity != local_identity:
+            return SessionResult("error", reason="local version is not mine to roll back")
+        if rollback_absence and not peer:
+            return SessionResult("ok", value=None)
+        if not peer:
+            return SessionResult("error", reason="rollback version not found")
+        if peer.revision_origin_identity != local_identity:
+            return SessionResult("error", reason="target is another client's revision")
+        if peer.base_hash != local.base_hash:
+            return SessionResult("error", reason="target is not from the same revision wave")
+        return SessionResult("ok", value=peer)
+
+    def rollback_peer_node(self, peer_addr: str,
+                           node_uuid: str,
+                           rollback_absence: bool = False) -> SessionResult:
+        target = self.validate_rollback_target(
+            peer_addr, node_uuid, rollback_absence,
+        )
+        if target.status != "ok":
+            return target
+        if rollback_absence:
+            return self.delete(node_uuid)
+        return self.accept_peer_node(peer_addr, node_uuid)
+
     @_session_locked
     def reconcile_peer_changes(
         self,
@@ -1275,8 +1250,7 @@ class Session:
     ) -> bool:
         # Generic "adopt incoming changes" walk - every app on this protocol
         # wants the same thing (adopt whatever a peer changed for one topic,
-        # respecting local keep-mine/pushed-back decisions); the only thing
-        # that's ever genuinely app-specific is which individual nodes are
+        # the only thing that's ever genuinely app-specific is which individual nodes are
         # eligible to auto-adopt (node_is_eligible) and whether a given node
         # should be merged field-only or grafted as a whole subtree
         # (node_adopt_mode - "shallow" vs "full", default "full").
@@ -1325,9 +1299,8 @@ class Session:
         # there) - a descendant node can still independently have a real
         # peer_made_changes/local_missing_node event that the per-node
         # loop's own guards already know how to evaluate safely.
-        if (top_event and top_event["type"] == "peer_made_changes" and allow_wholesale_replace
-                and not self._subtree_has_kept_mine(local_topic)
-                and not self._subtree_has_pushed_back(peer_topic)):
+        if (top_event and top_event["type"] == "peer_made_changes"
+                and allow_wholesale_replace):
             self.trace_event(
                 "session.reconcile_replace_subtree",
                 peer_addr=peer_addr,
@@ -1349,24 +1322,7 @@ class Session:
             reference_node = local_node or peer_node
             if not reference_node:
                 continue
-            if local_node and self.keep_mine_active(local_node, peer_node):
-                continue
-            if peer_node and self.peer_pushed_back(peer_node):
-                continue
             if not node_is_eligible(reference_node, event["type"]):
-                continue
-            if (event["type"] == "peer_made_changes"
-                    and ((local_node and self._subtree_has_kept_mine(local_node))
-                         or (peer_node and self._subtree_has_pushed_back(peer_node)))):
-                # A full subtree adopt of an *existing* local node would
-                # silently overwrite a kept-mine decision (or ignore a
-                # peer's own pushed-back one) on a descendant several
-                # levels down - the node-level keep_mine_active/
-                # peer_pushed_back guards above only ever check this node's
-                # own perspective_state, not its children's. A brand-new
-                # node (local_missing_node) has no local content to protect
-                # so isn't subject to this - only an update to something
-                # that already exists locally can clobber something.
                 continue
             self.trace_event(
                 "session.reconcile_node",
@@ -1733,29 +1689,64 @@ class Session:
         # peer's local tree (see attach_topic) - that's an artifact of how
         # topics are shared, not a move either peer made, so only content is
         # comparable at that level.
+        local_identity = self._local_revision_origin()
+        peer_identity = self.peer_identity_key.get(peer_addr)
         if is_topic_root:
-            event_type = self._classify_content(local_node, peer_node)
+            event_type = self._classify_content(
+                local_node, peer_node, local_identity, peer_identity,
+            )
         else:
-            event_type = self._classify_node(local_node, peer_node)
+            event_type = self._classify_node(
+                local_node, peer_node, local_identity, peer_identity,
+            )
         return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
     @staticmethod
-    def _classify_content(local_node: PRSPNode, peer_node: PRSPNode) -> str:
-        if local_node.state_hash == peer_node.state_hash:
+    def _classify_content(local_node: PRSPNode, peer_node: PRSPNode,
+                          local_identity: str | None = None,
+                          peer_identity: str | None = None) -> str:
+        if local_node.content_hash == peer_node.content_hash:
             return "in_agreement"
-        if peer_node.state_hash == local_node.previous_hash:
+        if peer_node.content_hash == local_node.base_hash:
             return "local_made_changes"
-        if local_node.state_hash == peer_node.previous_hash:
+        if local_node.content_hash == peer_node.base_hash:
             return "peer_made_changes"
+        if (local_node.base_hash == peer_node.base_hash
+                and local_node.revision_origin_identity
+                == peer_node.revision_origin_identity):
+            origin = local_node.revision_origin_identity
+            # An unset origin must not classify by identity: `None == None`
+            # would otherwise pick a definite side instead of falling through
+            # to the recency tiebreak / divergence.
+            if origin and origin == local_identity:
+                return "local_made_changes"
+            if origin and origin == peer_identity:
+                return "peer_made_changes"
+            if local_node.updated_at > peer_node.updated_at:
+                return "local_made_changes"
+            if peer_node.updated_at > local_node.updated_at:
+                return "peer_made_changes"
         return "divergence"
 
     @staticmethod
-    def _classify_move(local_node: PRSPNode, peer_node: PRSPNode) -> str:
+    def _classify_move(local_node: PRSPNode, peer_node: PRSPNode,
+                       local_identity: str | None = None,
+                       peer_identity: str | None = None) -> str:
         if local_node.parent_uuid == peer_node.parent_uuid:
             return "in_agreement"
-        peer_moved_from_local = local_node.parent_uuid == peer_node.previous_parent_uuid
-        local_moved_from_peer = peer_node.parent_uuid == local_node.previous_parent_uuid
+        peer_moved_from_local = local_node.parent_uuid == peer_node.base_parent_uuid
+        local_moved_from_peer = peer_node.parent_uuid == local_node.base_parent_uuid
         if peer_moved_from_local and local_moved_from_peer:
+            if (local_node.base_parent_uuid == peer_node.base_parent_uuid
+                    and local_node.revision_origin_identity
+                    == peer_node.revision_origin_identity):
+                origin = local_node.revision_origin_identity
+                # See _classify_content: an unset origin must not match a
+                # None identity and short-circuit the recency tiebreak.
+                if origin and origin == local_identity:
+                    return "local_made_changes"
+                if origin and origin == peer_identity:
+                    return "peer_made_changes"
             if peer_node.updated_at > local_node.updated_at:
                 return "peer_made_changes"
             if local_node.updated_at > peer_node.updated_at:
@@ -1768,9 +1759,15 @@ class Session:
         return "divergence"
 
     @staticmethod
-    def _classify_node(local_node: PRSPNode, peer_node: PRSPNode) -> str:
-        content = Session._classify_content(local_node, peer_node)
-        move = Session._classify_move(local_node, peer_node)
+    def _classify_node(local_node: PRSPNode, peer_node: PRSPNode,
+                       local_identity: str | None = None,
+                       peer_identity: str | None = None) -> str:
+        content = Session._classify_content(
+            local_node, peer_node, local_identity, peer_identity,
+        )
+        move = Session._classify_move(
+            local_node, peer_node, local_identity, peer_identity,
+        )
         if content == "divergence" or move == "divergence":
             return "divergence"
         if content == move:
@@ -1804,6 +1801,8 @@ class Session:
             "node_uuid": node.uuid if node else None,
             "local_state_hash": local_node.state_hash if local_node else None,
             "peer_state_hash": peer_node.state_hash if peer_node else None,
+            "local_base_hash": local_node.base_hash if local_node else None,
+            "peer_base_hash": peer_node.base_hash if peer_node else None,
             "local_revision": (
                 Session.node_revision(local_node) if local_node else None
             ),
@@ -1813,11 +1812,26 @@ class Session:
             "origin_identity": origin,
             "local_revision_origin_identity": local_origin,
             "peer_revision_origin_identity": peer_origin,
-            "keep_mine_active": (
-                Session.keep_mine_active(local_node, peer_node)
-                if local_node and peer_node else None
-            ),
         }
+
+    @staticmethod
+    def _stage_transition_event(event: dict) -> dict:
+        event_type = event["type"]
+        observed = event.get("peer_observed_local_revision") is True
+        local_origin = event.get("local_revision_origin_identity")
+        peer_origin = event.get("peer_revision_origin_identity")
+        competing_origins = bool(
+            local_origin and peer_origin and local_origin != peer_origin
+        )
+        if event_type == "divergence" and not competing_origins and not observed:
+            return {**event, "type": "in_transition", "original_type": event_type}
+        if event_type in ("local_made_changes", "peer_missing_node"):
+            return {
+                **event,
+                "type": "divergence" if observed else "in_transition",
+                "original_type": event_type,
+            }
+        return event
 
     @staticmethod
     def _remove_uuid_from_tree(root: PRSPNode, uuid: str) -> bool:

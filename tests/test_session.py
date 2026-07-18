@@ -361,6 +361,10 @@ class SessionTests(unittest.TestCase):
     def test_analyze_peer_transition_detects_divergence(self):
         local = Session("si-a")
         peer = Session("si-b")
+        local_identity = local.identity.data["identity_key"]
+        peer_identity = peer.identity.data["identity_key"]
+        local.set_peer_identity_key("si-b", peer_identity)
+        peer.set_peer_identity_key("si-a", local_identity)
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
         peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
         local.apply_peer_subtree(
@@ -410,13 +414,10 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-b", child.uuid)
 
-        self.assertEqual(events[0]["type"], "peer_missing_node")
+        self.assertEqual(events[0]["type"], "in_transition")
+        self.assertEqual(events[0]["original_type"], "peer_missing_node")
 
-    def test_analyze_peer_transition_multiple_unsynced_edits_read_as_divergence(self):
-        # One-slot history trade-off (see BACKLOG): after two peer edits with
-        # no adoption in between, the peer's previous_hash no longer bridges
-        # to our state, so the honest verdict is divergence rather than
-        # "peer is just behind".
+    def test_analyze_peer_transition_compounds_multiple_unsynced_edits(self):
         local = Session("si-a")
         peer = Session("si-c")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
@@ -437,76 +438,18 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-c", topic.uuid)
 
-        self.assertEqual(events[0]["type"], "divergence")
-
-    def test_keep_mine_does_not_corrupt_classification_for_unrelated_peers(self):
-        # A edits and keeps its own value against some
-        # divergent peer). A separate, unrelated peer C who never touched
-        # the node and is simply behind must still classify correctly - the
-        # keep_mine must not overwrite the true previous_hash history that
-        # C's comparison depends on.
-        a = Session("si-a")
-        c = Session("si-c")
-        topic = a.create_child(a.protocol.root.uuid, {"name": "topic"}, {}).value
-        c.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
-
-        a.modify(topic.uuid, {"name": "a-edit"}, {})
-        a.set_perspective_state(topic.uuid, "kept_mine")
-
-        c.apply_peer_subtree(
-            "si-a",
-            PRSPNode.from_dict(a.protocol.index[topic.uuid].to_dict()),
-            c.protocol.root.uuid,
-        )
-
-        events = c.analyze_peer_transitions("si-a", topic.uuid)
-
         self.assertEqual(events[0]["type"], "peer_made_changes")
 
     @staticmethod
-    def _node(state_hash, previous_hash, parent_uuid, previous_parent_uuid,
-              perspective_state="none"):
+    def _node(state_hash, base_hash, parent_uuid, base_parent_uuid,
+              origin=None):
         node = PRSPNode({"name": "x"})
         node.state_hash = state_hash
-        node.previous_hash = previous_hash
+        node.base_hash = base_hash
         node.parent_uuid = parent_uuid
-        node.previous_parent_uuid = previous_parent_uuid
-        node.perspective_state = perspective_state
+        node.base_parent_uuid = base_parent_uuid
+        node.revision_origin_identity = origin
         return node
-
-    def test_keep_mine_active_stays_true_for_a_clean_untouched_keep_mine(self):
-        local_node = self._node("h0", "h0", "p", "p", perspective_state="kept_mine")
-        peer_node = self._node("h1", "h0", "p", "p")
-
-        self.assertTrue(Session.keep_mine_active(local_node, peer_node))
-
-    def test_keep_mine_active_goes_false_after_a_second_peer_content_edit(self):
-        # peer's previous_hash no longer reaches back to what local kept_mine
-        # against - the one-slot history can't reconstruct a clean chain, so
-        # classification degrades to divergence and the stale keep_mine must
-        # not keep masking it.
-        local_node = self._node("h0", "h0", "p", "p", perspective_state="kept_mine")
-        peer_node = self._node("h2", "h1", "p", "p")
-
-        self.assertFalse(Session.keep_mine_active(local_node, peer_node))
-
-    def test_keep_mine_active_goes_false_when_a_move_appears(self):
-        # Content is still a clean single step (peer_made_changes on its
-        # own), and so is the move on its own - _classify_node would merge
-        # these into a clean "peer_made_changes", never "divergence". A
-        # content-only keep_mine must still not mask a move it never
-        # considered - this is the case a single chain-connectivity check
-        # can't catch on its own (see BACKLOG.md item 10).
-        local_node = self._node("h0", "h0", "p1", "p1", perspective_state="kept_mine")
-        peer_node = self._node("h1", "h0", "p2", "p1")
-
-        self.assertFalse(Session.keep_mine_active(local_node, peer_node))
-
-    def test_keep_mine_active_ignores_state_when_state_is_none(self):
-        local_node = self._node("h0", "h0", "p", "p", perspective_state="none")
-        peer_node = self._node("h1", "h0", "p", "p")
-
-        self.assertFalse(Session.keep_mine_active(local_node, peer_node))
 
     def test_opposing_moves_are_divergence(self):
         local_node = self._node("h0", "h0", "doing", "todo")
@@ -525,58 +468,45 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(Session._classify_move(local_node, peer_node), "peer_made_changes")
 
-    def test_pushed_back_stays_active_across_a_second_peer_content_edit(self):
-        local_node = self._node("h0", "h0", "p", "p", perspective_state="pushed_back")
-        peer_node = self._node("h2", "h1", "p", "p")
-
-        self.assertTrue(Session.keep_mine_active(local_node, peer_node))
-
-    def test_pushed_back_stays_active_when_a_move_appears(self):
-        local_node = self._node("h0", "h0", "p1", "p1", perspective_state="pushed_back")
-        peer_node = self._node("h1", "h0", "p2", "p1")
-
-        self.assertTrue(Session.keep_mine_active(local_node, peer_node))
-
-    def test_peer_pushed_back_reads_the_peers_own_state(self):
-        pushed_back_peer = self._node("h1", "h0", "p", "p", perspective_state="pushed_back")
-        kept_mine_peer = self._node("h1", "h0", "p", "p", perspective_state="kept_mine")
-
-        self.assertTrue(Session.peer_pushed_back(pushed_back_peer))
-        self.assertFalse(Session.peer_pushed_back(kept_mine_peer))
-        self.assertFalse(Session.peer_pushed_back(None))
-
-    def test_transition_event_carries_keep_mine_active_end_to_end(self):
-        # Proves the field is actually threaded through
-        # analyze_peer_transitions, not just correct in isolation.
-        local = Session("si-a")
-        peer = Session("si-b")
-        topic = peer.create_child(peer.protocol.root.uuid, {"name": "topic"}, {}).value
-        child = peer.create_child(topic.uuid, {"name": "child"}, {}).value
-        local.accept_topic_invitation(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict())
-        )
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            local.protocol.root.uuid,
-        )
-        local_child_uuid = child.uuid
-        local.set_perspective_state(local_child_uuid, "kept_mine")
-
-        peer.modify(child.uuid, {"name": "peer changed"}, {})
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            local.protocol.root.uuid,
-        )
-
-        events = {
-            event["node_uuid"]: event
-            for event in local.analyze_peer_transitions("si-b", topic.uuid)
+    def test_transition_staging_waits_for_peer_observation(self):
+        event = {
+            "type": "local_made_changes",
+            "node_uuid": "n1",
+            "peer_observed_local_revision": False,
         }
 
-        self.assertEqual(events[local_child_uuid]["type"], "peer_made_changes")
-        self.assertTrue(events[local_child_uuid]["keep_mine_active"])
+        waiting = Session._stage_transition_event(event)
+        confirmed = Session._stage_transition_event({
+            **event, "peer_observed_local_revision": True,
+        })
+
+        self.assertEqual(waiting["type"], "in_transition")
+        self.assertEqual(confirmed["type"], "divergence")
+
+    def test_competing_origins_confirm_divergence_immediately(self):
+        event = {
+            "type": "divergence",
+            "node_uuid": "n1",
+            "local_revision_origin_identity": "identity-a",
+            "peer_revision_origin_identity": "identity-b",
+            "peer_observed_local_revision": False,
+        }
+
+        self.assertEqual(
+            Session._stage_transition_event(event)["type"], "divergence",
+        )
+
+    def test_peer_change_is_actionable_without_debounce(self):
+        event = {
+            "type": "peer_made_changes",
+            "node_uuid": "n1",
+            "peer_observed_local_revision": False,
+        }
+
+        self.assertEqual(
+            Session._stage_transition_event(event)["type"], "peer_made_changes",
+        )
+
 
     def test_apply_peer_subtree_update_propagates_deleted_flag_and_history(self):
         local = Session("si-a")
@@ -604,7 +534,7 @@ class SessionTests(unittest.TestCase):
         cached_child = local._find_in_tree(local.peer_perspectives["si-b"], child.uuid)
         peer_child = peer.protocol.index[child.uuid]
         self.assertTrue(cached_child.deleted)
-        self.assertEqual(cached_child.previous_hash, peer_child.previous_hash)
+        self.assertEqual(cached_child.base_hash, peer_child.base_hash)
         # If the merge left a stale deleted flag, the cache's recomputed
         # topic hash would never match what the peer reports, causing an
         # endless re-pull loop.
@@ -1035,6 +965,57 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertNotIn(child.uuid, local.protocol.index)
 
+    def test_rollback_restores_my_exact_revision_still_held_by_peer(self):
+        local = Session("si-a")
+        local_identity = local.identity.data["identity_key"]
+        topic = local.create_child(
+            local.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        child = local.create_child(
+            topic.uuid, {"type": "note_item", "text": "original"}, {},
+        ).value
+        peer_copy = PRSPNode.from_dict(
+            local.protocol.index[topic.uuid].to_dict(),
+        )
+        local.apply_peer_subtree("si-b", peer_copy, local.protocol.root.uuid)
+        peer_child = local.get_cached_peer_subtree("si-b", child.uuid)
+
+        local.modify(child.uuid, {"type": "note_item", "text": "first"}, {})
+        local.modify(child.uuid, {"type": "note_item", "text": "second"}, {})
+        changed = local.protocol.index[child.uuid]
+        self.assertEqual(changed.revision_origin_identity, local_identity)
+        self.assertEqual(changed.base_hash, peer_child.base_hash)
+
+        result = local.rollback_peer_node("si-b", child.uuid)
+
+        self.assertEqual(result.status, "ok")
+        rolled_back = local.protocol.index[child.uuid]
+        self.assertEqual(rolled_back.data["text"], "original")
+        self.assertEqual(rolled_back.state_hash, peer_child.state_hash)
+        self.assertEqual(rolled_back.base_hash, peer_child.base_hash)
+        self.assertEqual(rolled_back.revision_origin_identity, local_identity)
+
+    def test_rollback_rejects_another_origins_revision(self):
+        peer = Session("si-b")
+        peer.identity
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        local = Session("si-a")
+        local.identity
+        local.adopt_subtree(
+            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        local.apply_peer_subtree(
+            "si-b", PRSPNode.from_dict(topic.to_dict()), local.protocol.root.uuid,
+        )
+
+        result = local.rollback_peer_node("si-b", topic.uuid)
+
+        self.assertEqual(result.status, "error")
+        self.assertIn("not mine", result.reason)
+
     def test_reconcile_peer_changes_no_cached_subtree_is_a_no_op(self):
         session = Session("si-a")
         self.assertFalse(session.reconcile_peer_changes("si-b", "no-such-topic"))
@@ -1211,9 +1192,7 @@ class SessionTests(unittest.TestCase):
 
         # A single peer-side operation keeps the topic root's own hash chain
         # a clean one-hop "peer_made_changes" from local's frozen baseline
-        # (state_hash/previous_hash only encode one hop back - two separate
-        # peer operations before syncing would classify as "divergence"
-        # instead, same as a real concurrent-edit case would).
+        # The peer's successive edits remain one compound revision wave.
         peer.modify(child.uuid, {"type": "note_item", "text": "new"}, {})
         local.apply_peer_subtree(
             "si-b",
@@ -1225,36 +1204,6 @@ class SessionTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(local.protocol.index[child.uuid].data["text"], "new")
-
-    def test_reconcile_peer_changes_wholesale_replace_blocked_by_local_kept_mine(self):
-        peer = Session("si-b")
-        topic = peer.create_child(
-            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
-        ).value
-        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "orig"}, {}).value
-        local = Session("si-a")
-        local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            local.protocol.root.uuid,
-        )
-        local.set_perspective_state(child.uuid, "kept_mine")
-
-        peer.modify(child.uuid, {"type": "note_item", "text": "new"}, {})
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            local.protocol.root.uuid,
-        )
-
-        # allow_wholesale_replace=True, but a kept_mine node anywhere in the
-        # local subtree must block the shortcut entirely - the kept_mine
-        # child's content must survive regardless of what the per-node loop
-        # then does with the rest of the subtree.
-        local.reconcile_peer_changes(
-            "si-b", topic.uuid, allow_wholesale_replace=True,
-        )
-
-        self.assertEqual(local.protocol.index[child.uuid].data["text"], "orig")
 
 if __name__ == "__main__":
     unittest.main()
