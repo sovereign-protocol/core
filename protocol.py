@@ -263,6 +263,39 @@ class ProtocolState:
         )
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
+    def adopt_own_fields(self, node_uuid: str, source: PRSPNode) -> ProtocolResult:
+        # Shallow adopt: make an existing node's OWN revision identical to
+        # `source` (data, weights, deleted, base and origin) while leaving its
+        # children untouched. Children are independent revision decisions - a
+        # container adopt must not smuggle in a filtered-out card change, and a
+        # container deletion propagates only this node's own `deleted` flag,
+        # so each child's deletion is still adopted through its own per-node
+        # event (a card the recipient keeps under a not_owner policy survives).
+        node = self.index.get(node_uuid)
+        if not node:
+            return ProtocolResult(False, reason="node not found")
+        # A node's own parent is part of its own identity (base_parent_uuid
+        # tracks it), so adopt the node's own move too - just not its
+        # children. _move_child_impl updates both parents' child lists and
+        # cascades; it no-ops on an invalid destination (cycle / root).
+        if (source.parent_uuid and source.parent_uuid != node.parent_uuid
+                and source.parent_uuid in self.index):
+            self._move_child_impl(
+                node_uuid, source.parent_uuid, None,
+                source.revision_origin_identity,
+            )
+        node.data = copy.deepcopy(source.data)
+        node.weights = copy.deepcopy(source.weights)
+        node.deleted = source.deleted
+        node.revision_origin_identity = source.revision_origin_identity
+        node.updated_at = now_iso()
+        self.cascade_hash(node_uuid)
+        # Adoption copies the complete remote revision, including its base -
+        # set it after cascade so recomputing content_hash doesn't reset it.
+        node.base_hash = source.base_hash
+        node.base_parent_uuid = source.base_parent_uuid
+        return ProtocolResult(True, node)
+
     def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
                       remove_descendant_duplicates: bool = False) -> ProtocolResult:
         if parent_uuid not in self.index:

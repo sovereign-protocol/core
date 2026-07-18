@@ -1,8 +1,6 @@
 # Design: node_hash / subtree_hash split
 
-**Status: core implemented (2026-07-19), suite green.** The fix for finding #2
-is done — Phases 1–2 below plus regression tests. Phases 3–4 were reassessed
-during implementation and **deferred as optional** (see "Implementation notes").
+**Status: fully implemented (2026-07-19), suite green (374).** All phases done.
 This is a **breaking protocol change** — see "Hard cutover" below. All peers
 must upgrade together; there is no cross-version interop.
 
@@ -21,13 +19,19 @@ must upgrade together; there is no cross-version interop.
 - The reconcile fast-paths (skip-if-equal, wholesale-replace) stay on
   `state_hash` (D2). Wholesale-replace is already dead on the live path
   (kanban passes `allow_wholesale_replace=False`), so it was left untouched.
-- **Phases 3–4 deferred.** On inspection the container "workarounds" are *not*
-  redundant: `adopt_mode` returning `"shallow"` for non-cards, plus the
-  `accept_peer_node`/`rollback_peer_node` container special-casing, are the
-  *working* shallow-adoption implementation (auto and manual). Relocating that
-  into a session-level shallow-by-default is a uniformity refactor, not
-  dead-code removal, and it touches the adopt path — deferred rather than
-  bundled with the fix. D3 is effectively already satisfied by `adopt_mode`.
+- **Phases 3–4 done (D3).** Shallow-adopt is now centralized in
+  `ProtocolState.adopt_own_fields` + `Session.accept_peer_node`: adopting an
+  *existing* node updates only its own fields (data/weights/deleted, origin and
+  base), adopts the node's own **move** (re-parenting it via the move logic,
+  since `base_parent_uuid` is part of its own identity), and leaves its
+  children untouched; only a brand-new node grafts a whole subtree. The event
+  type (`peer_made_changes` vs `local_missing_node`) picks between them, so the
+  `node_adopt_mode` callable and kanban's `adopt_mode` / container
+  special-casing are gone. Two behaviors fell out of doing it properly:
+  container **deletion now propagates** (as a shallow `deleted` flag, children
+  handled by their own eligibility-checked events — a kept card survives), and
+  shallow adopt now **preserves the remote revision's base** (adopt_subtree
+  already did; the old container path did not).
 
 _Written 2026-07-19. Follows [DESIGN_REVISIONS_AND_REACTIONS.md] (compound
 revisions, staging, reactions), whose semantics this aligns the hash model to._
@@ -141,12 +145,13 @@ fingerprints, relay head/snapshot dedup.
 2. **session.py classification + observation.** ✅ DONE. `_classify_content`
    and `node_revision` route to `content_hash` (D1); reconcile fast-paths stay
    on `state_hash`; the dead wholesale-replace path was left as-is (D2).
-3. **reconcile + adopt semantics (D3).** ⏸ DEFERRED — already satisfied by
-   kanban's `adopt_mode` ("shallow" for non-cards). Centralizing shallow-by-
-   default into session is optional cleanup, not required for the fix.
-4. **kanban_logic cleanup.** ⏸ DEFERRED — the container special-casing is the
-   working shallow-adopt implementation, not redundant (no dead suppression
-   code exists to remove).
+3. **reconcile + adopt semantics (D3).** ✅ DONE. `ProtocolState.adopt_own_fields`
+   + shallow-by-default `Session.accept_peer_node` (own fields + own move,
+   children kept; full graft only for a new node). `node_adopt_mode` removed
+   from `reconcile_peer_changes`.
+4. **kanban_logic cleanup.** ✅ DONE. Dropped `adopt_mode` and the
+   `accept_peer_node`/`rollback_peer_node` container special-casing (now thin
+   delegates to session).
 5. **tests + docs.** ✅ DONE. Base assertions moved from `state_hash` to
    `content_hash`; two kanban tests updated (a card creation now leaves the
    board `in_agreement`); added `test_descendant_change_does_not_revision_

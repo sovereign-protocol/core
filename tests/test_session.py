@@ -1070,15 +1070,12 @@ class SessionTests(unittest.TestCase):
         self.assertFalse(changed)
         self.assertEqual(local.protocol.index[child.uuid].data["text"], "original")
 
-    def test_reconcile_peer_changes_shallow_mode_uses_field_only_modify(self):
-        # node_adopt_mode="shallow" must route through modify (own fields
-        # only) rather than accept_peer_node (whole-subtree graft) - proven
-        # by asserting the field updates via a single clean peer-side
-        # change (state_hash chains only compare cleanly one hop at a time;
-        # the deeper "doesn't smuggle a simultaneously-added child" property
-        # this exists for is already covered end-to-end by the kanban-level
-        # auto-adopt tests in test_kanban_new_logic.py, which exercise it
-        # through the real incremental sync path).
+    def test_reconcile_adopts_an_existing_nodes_own_fields_only(self):
+        # Adopting an existing node updates its own fields only (never grafts
+        # its whole subtree) - now the default in accept_peer_node, so no
+        # adopt-mode hint is passed. The deeper "doesn't smuggle a
+        # simultaneously-added child" property is covered end-to-end by the
+        # kanban auto-adopt tests in test_kanban_new_logic.py.
         peer = Session("si-b")
         topic = peer.create_child(
             peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
@@ -1097,10 +1094,7 @@ class SessionTests(unittest.TestCase):
             local.protocol.root.uuid,
         )
 
-        changed = local.reconcile_peer_changes(
-            "si-b", topic.uuid,
-            node_adopt_mode=lambda node: "shallow" if node.data.get("type") == "folder" else "full",
-        )
+        changed = local.reconcile_peer_changes("si-b", topic.uuid)
 
         self.assertTrue(changed)
         self.assertEqual(local.protocol.index[folder.uuid].data["text"], "new")
@@ -1127,10 +1121,7 @@ class SessionTests(unittest.TestCase):
             PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
-        local.reconcile_peer_changes(
-            "si-b", topic.uuid,
-            node_adopt_mode=lambda node: "shallow",
-        )
+        local.reconcile_peer_changes("si-b", topic.uuid)
 
         adopted = local.protocol.index[folder.uuid]
         self.assertEqual(adopted.data["text"], "new")
@@ -1161,19 +1152,14 @@ class SessionTests(unittest.TestCase):
             local.protocol.root.uuid,
         )
 
-        # Topic's own event is also "peer_made_changes" here (its hash
-        # cascaded from gaining the leaf, even though its own fields didn't
-        # change), so node_adopt_mode must stay "shallow" - otherwise a
-        # full adopt of the topic root would drag the filtered leaf back in
-        # as a side effect, same as a real app's eligibility closure must
-        # do for its own container types. (Not asserting on `changed`
-        # itself: the topic root's shallow modify still reports "ok" even
-        # though its data is identical - the property under test is that
-        # the filtered leaf never appears locally, regardless.)
+        # With the node_hash/subtree_hash split the topic root's own event is
+        # "in_agreement" (its own fields didn't change; only its subtree hash
+        # cascaded from gaining the leaf), and adoption of any existing node is
+        # shallow by default - so neither can drag the filtered leaf in. The
+        # leaf itself is local_missing_node and blocked by node_is_eligible.
         local.reconcile_peer_changes(
             "si-b", topic.uuid,
             node_is_eligible=lambda node, event_type: node.data.get("type") != "leaf",
-            node_adopt_mode=lambda node: "shallow",
         )
 
         self.assertNotIn(leaf.uuid, local.protocol.index)

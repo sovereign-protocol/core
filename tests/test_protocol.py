@@ -147,6 +147,49 @@ class ProtocolTests(unittest.TestCase):
 
         self.assertNotEqual(parent.state_hash, hash_with_a)
 
+    def test_adopt_own_fields_keeps_children_and_copies_revision(self):
+        # Shallow adopt: update a container's own fields (and origin/base)
+        # without disturbing its local children - a container adopt must not
+        # smuggle away a card the recipient is keeping.
+        state = ProtocolState("si-a")
+        column = state.create_child(
+            state.root.uuid, {"name": "col"}, {}, "identity-a",
+        ).value
+        card = state.create_child(
+            column.uuid, {"name": "card"}, {}, "identity-a",
+        ).value
+        source = PRSPNode({"name": "col-renamed"}, revision_origin_identity="identity-b")
+        source.refresh_hashes()
+
+        state.adopt_own_fields(column.uuid, source)
+
+        self.assertEqual(column.data["name"], "col-renamed")
+        self.assertIn(card, column.children)
+        self.assertIn(card.uuid, state.index)
+        self.assertEqual(column.revision_origin_identity, "identity-b")
+        self.assertEqual(column.base_hash, source.base_hash)
+
+    def test_adopt_own_fields_propagates_deletion_without_cascading(self):
+        # A container deletion propagates only the container's own `deleted`
+        # flag; children are left for their own per-node (eligibility-checked)
+        # deletion events, so a kept card survives under a not_owner policy.
+        state = ProtocolState("si-a")
+        column = state.create_child(
+            state.root.uuid, {"name": "col"}, {}, "identity-a",
+        ).value
+        card = state.create_child(
+            column.uuid, {"name": "card"}, {}, "identity-a",
+        ).value
+        source = PRSPNode({"name": "col"}, revision_origin_identity="identity-b")
+        source.deleted = True
+        source.refresh_hashes()
+
+        state.adopt_own_fields(column.uuid, source)
+
+        self.assertTrue(column.deleted)
+        self.assertFalse(card.deleted)
+        self.assertIn(card.uuid, state.index)
+
     def test_revision_origin_survives_roundtrip_and_only_real_node_edits_replace_it(self):
         state = ProtocolState("si-a")
         parent = state.create_child(

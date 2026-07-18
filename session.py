@@ -16,12 +16,12 @@ Offered API:
   peer_discusses_node(peer_addr, node_uuid)
   accept_peer_node(peer_addr, node_uuid, adopt_absence=False)
   reconcile_peer_changes(peer_addr, topic_uuid, node_is_eligible=None,
-    node_adopt_mode=None, allow_wholesale_replace=False)
+    allow_wholesale_replace=False)
     Generic peer-content reconciliation (the "adopt incoming changes"
-    mechanism): walks a peer's transitions for one topic and adopts
-    whatever isn't blocked by a local keep-mine/pushed-back decision. Apps
-    supply only their own eligibility policy via the two callables - the
-    walk itself, and the keep-mine/pushed-back guards, are app-agnostic.
+    mechanism): walks a peer's transitions for one topic and adopts each
+    eligible change. Apps supply only their own eligibility policy via
+    node_is_eligible; the walk itself is app-agnostic, and shallow-vs-graft
+    is chosen per node by accept_peer_node from the event type.
   protocol operation wrappers: create_child, modify, delete, copy, move,
 
 Used API:
@@ -1192,6 +1192,7 @@ class Session:
         return SessionResult("ok", value=self._snapshot_node(replaced),
                              effects=self.sync_effects(replaced.uuid))
 
+    @_session_locked
     def accept_peer_node(self, peer_addr: str, node_uuid: str,
                          adopt_absence: bool = False) -> SessionResult:
         if adopt_absence:
@@ -1200,9 +1201,23 @@ class Session:
         if not peer:
             return SessionResult("error", reason="peer node not found")
         local = self._protocol.index.get(node_uuid)
+        if local is not None:
+            # The node already exists locally: adopt its OWN fields only (a
+            # field-level, base-preserving update). Descendants are separate
+            # per-node decisions, so a container adopt never clobbers a card
+            # the recipient is keeping. Applies uniformly to cards (leaves)
+            # and containers - see ProtocolState.adopt_own_fields.
+            result = self._protocol.adopt_own_fields(node_uuid, peer)
+            self.trace_event(
+                "protocol.adopt_own_fields",
+                node_uuid=node_uuid,
+                state_hash=peer.state_hash,
+                ok=result.ok,
+                reason=result.reason,
+            )
+            return self._operation_result(result, node_uuid)
+        # Brand-new node the peer has and we don't: graft the whole subtree.
         parent_uuid = peer.parent_uuid if peer.parent_uuid in self._protocol.index else None
-        if not parent_uuid and local:
-            parent_uuid = local.parent_uuid
         if not parent_uuid or parent_uuid not in self._protocol.index:
             return SessionResult("error", reason="local parent not found")
         return self.adopt_subtree(peer, parent_uuid, remove_descendant_duplicates=True)
@@ -1227,6 +1242,7 @@ class Session:
             return SessionResult("error", reason="target is not from the same revision wave")
         return SessionResult("ok", value=peer)
 
+    @_session_locked
     def rollback_peer_node(self, peer_addr: str,
                            node_uuid: str,
                            rollback_absence: bool = False) -> SessionResult:
@@ -1245,17 +1261,14 @@ class Session:
         peer_addr: str,
         topic_uuid: str,
         node_is_eligible: Callable[[PRSPNode, str], bool] | None = None,
-        node_adopt_mode: Callable[[PRSPNode], str] | None = None,
         allow_wholesale_replace: bool = False,
     ) -> bool:
         # Generic "adopt incoming changes" walk - every app on this protocol
-        # wants the same thing (adopt whatever a peer changed for one topic,
-        # the only thing that's ever genuinely app-specific is which individual nodes are
-        # eligible to auto-adopt (node_is_eligible) and whether a given node
-        # should be merged field-only or grafted as a whole subtree
-        # (node_adopt_mode - "shallow" vs "full", default "full").
+        # wants the same thing (adopt whatever a peer changed for one topic).
+        # The only genuinely app-specific input is which individual nodes are
+        # eligible to auto-adopt (node_is_eligible); shallow-vs-graft is
+        # decided per node by accept_peer_node from the event type.
         node_is_eligible = node_is_eligible or (lambda node, event_type: True)
-        node_adopt_mode = node_adopt_mode or (lambda node: "full")
 
         peer_topic = self.get_cached_peer_subtree(peer_addr, topic_uuid)
         if not peer_topic:
@@ -1332,16 +1345,11 @@ class Session:
                 event_type=event["type"],
                 peer_state_hash=event.get("peer_state_hash"),
             )
-            if node_adopt_mode(reference_node) == "shallow" and event["type"] == "peer_made_changes" and peer_node:
-                # Update the node's own fields only - never cascade into its
-                # children, so an allowed shallow change can't smuggle in a
-                # filtered-out descendant change underneath it.
-                result = self.modify(
-                    event["node_uuid"], peer_node.data, peer_node.weights,
-                    revision_origin_identity=peer_node.revision_origin_identity,
-                )
-            else:
-                result = self.accept_peer_node(peer_addr, event["node_uuid"])
+            # accept_peer_node adopts an existing node's own fields (shallow,
+            # so a container change never drags in a filtered-out descendant)
+            # and grafts a brand-new node's whole subtree - the event type
+            # already tells the two apart, so no adopt-mode hint is needed.
+            result = self.accept_peer_node(peer_addr, event["node_uuid"])
             changed = changed or result.status == "ok"
         self.trace_event("session.reconcile_done", peer_addr=peer_addr,
                           topic_uuid=topic_uuid, changed=changed)
