@@ -770,10 +770,79 @@ class RelayLogic:
         os.replace(tmp_path, path)
 
 
-def create_logic(session: Session, config: dict) -> RelayLogic:
-    logic = RelayLogic(session, config)
-    config["_relay_logic_instance"] = logic
-    return logic
+def _relay_fingerprint(storage) -> str:
+    # Stable key for a connection: two targets that resolve to the same
+    # server+root are the same connection (natural dedup). Reuses the exact
+    # fingerprint the per-location state file is already keyed on
+    # (default_relay_state_file), so a connection and its state file always
+    # agree on identity.
+    if storage is None:
+        return "unconfigured"
+    return _storage_fingerprint(RelayLogic._config_from_storage(storage))
+
+
+class RelayManager:
+    """Owns every relay connection this client runs at once.
+
+    A RelayLogic is one connection to one target (one storage + state file);
+    the manager holds them keyed by storage fingerprint. Today it holds a
+    single implicit connection built from the startup config or an accepted
+    token - identical to the previous single-storage behavior - but the
+    surface is already the "many connections" one so per-board targets can
+    layer on without touching callers again.
+    """
+
+    def __init__(self, session: Session, config: dict):
+        self.session = session
+        self.config = config
+        self.connections: dict[str, RelayLogic] = {}
+        # The implicit connection: built from the flat config (or a persisted
+        # adopted-descriptor) exactly as before. Registered by fingerprint.
+        self.primary = RelayLogic(session, config)
+        self.connections[_relay_fingerprint(self.primary.storage)] = self.primary
+
+    def all_connections(self) -> list[RelayLogic]:
+        return list(self.connections.values())
+
+    def peer_liveness(self, peer_id: str) -> dict:
+        # Whichever connection actually knows this peer answers; "unknown"
+        # from a connection that never saw it isn't a real answer.
+        for conn in self.all_connections():
+            result = conn.peer_liveness(peer_id)
+            if result.get("state") != "unknown":
+                return result
+        return {"state": "unknown"}
+
+    @property
+    def storage(self):
+        # Back-compat shim for the single-storage readers (kanban liveness):
+        # the primary connection's storage.
+        return self.primary.storage
+
+    def channel_descriptor(self) -> dict | None:
+        return self.primary.channel_descriptor()
+
+    def status_payload(self) -> dict:
+        conns = self.all_connections()
+        if len(conns) == 1:
+            return conns[0].status_payload()
+        return {"connections": [conn.status_payload() for conn in conns]}
+
+    def delete_topic(self, topic_uuid: str) -> SessionResult:
+        for conn in self.all_connections():
+            if topic_uuid in conn._state.get("published", {}) or topic_uuid in conn._state.get("applied", {}):
+                return conn.delete_topic(topic_uuid)
+        return self.primary.delete_topic(topic_uuid)
+
+
+def create_logic(session: Session, config: dict) -> RelayManager:
+    manager = RelayManager(session, config)
+    config["_relay_manager"] = manager
+    # Alias to the implicit connection so existing single-storage readers
+    # (accept_connect_token, token arming, kanban liveness) keep working
+    # unchanged while the manager is introduced.
+    config["_relay_logic_instance"] = manager.primary
+    return manager
 
 
 def channel_descriptor(runtime, config: dict) -> dict | None:
@@ -781,7 +850,7 @@ def channel_descriptor(runtime, config: dict) -> dict | None:
     return logic.channel_descriptor() if logic else None
 
 
-def build_routes(logic: RelayLogic, runtime, config: dict) -> list[Route]:
+def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
     async def api_relay_status(request: Request):
         # SFTP liveness checks are blocking and share the serialized storage
         # connection with the relay poll worker. Never block the event loop.
