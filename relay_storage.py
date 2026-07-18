@@ -11,7 +11,7 @@ Offered API:
   LocalFolderRelayStorage(root)
   SftpRelayStorage(host, username, remote_root, port=22, password=None,
                    private_key_path=None, private_key_passphrase=None)
-    Both implement the same eight methods:
+    Both implement the same nine methods:
     write_snapshot(topic_uuid, peer_id, state_hash, payload)
     read_head(topic_uuid, peer_id) -> dict | None
     read_snapshot(topic_uuid, peer_id, state_hash) -> dict | None
@@ -30,6 +30,9 @@ Offered API:
     read_presence_with_mtime(peer_id) -> tuple[dict | None, float | None]
       Content and server-side mtime together, in one call - reading them
       separately would risk a race between the two.
+    timing_probe() -> tuple[float | None, float]
+      Returns relay-server mtime and one metadata-request roundtrip using a
+      temporary probe that is removed before the call returns.
 
 Used API:
   LocalFolderRelayStorage: Python standard library only.
@@ -61,6 +64,7 @@ import os
 import posixpath
 import stat
 import threading
+import time
 import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
@@ -71,6 +75,8 @@ def now_iso() -> str:
 
 
 class LocalFolderRelayStorage:
+    mtime_resolution_seconds = 0.001
+
     def __init__(self, root: str):
         self.root = Path(root)
 
@@ -145,6 +151,19 @@ class LocalFolderRelayStorage:
             return None, None
         return self._read_json(path), path.stat().st_mtime
 
+    def timing_probe(self) -> tuple[float | None, float]:
+        """Return server mtime plus one metadata-request roundtrip."""
+        self.root.mkdir(parents=True, exist_ok=True)
+        probe = self.root / f".s-kanban-timing-{os.getpid()}-{uuid_mod.uuid4().hex}"
+        try:
+            probe.write_bytes(b"")
+            started = time.monotonic()
+            mtime = probe.stat().st_mtime
+            roundtrip = time.monotonic() - started
+            return mtime, roundtrip
+        finally:
+            probe.unlink(missing_ok=True)
+
     def _presence_path(self, peer_id: str) -> Path:
         return self.root / "identities" / peer_id / "presence.json"
 
@@ -169,6 +188,9 @@ class LocalFolderRelayStorage:
 
 
 class SftpRelayStorage:
+    # SFTP v3 exposes st_mtime in whole seconds.
+    mtime_resolution_seconds = 1.0
+
     def __init__(self, host: str, username: str, remote_root: str,
                 port: int = 22, password: str | None = None,
                 private_key_path: str | None = None,
@@ -297,6 +319,30 @@ class SftpRelayStorage:
         if content is None:
             return None, None
         return content, self._stat_mtime(path)
+
+    def timing_probe(self) -> tuple[float | None, float]:
+        """Measure one SFTP request and remove the clock probe afterwards."""
+        probe = posixpath.join(
+            self.root,
+            f".s-kanban-timing-{os.getpid()}-{uuid_mod.uuid4().hex}",
+        )
+
+        def operation(sftp):
+            self._mkdir_p(sftp, self.root)
+            try:
+                with sftp.open(probe, "wb") as f:
+                    f.write(b"")
+                started = time.monotonic()
+                mtime = sftp.stat(probe).st_mtime
+                roundtrip = time.monotonic() - started
+                return mtime, roundtrip
+            finally:
+                try:
+                    sftp.remove(probe)
+                except FileNotFoundError:
+                    pass
+
+        return self._with_retry(operation)
 
     def _presence_path(self, peer_id: str) -> str:
         return posixpath.join(self.root, "identities", peer_id, "presence.json")

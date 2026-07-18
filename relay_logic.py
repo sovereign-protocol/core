@@ -104,13 +104,18 @@ import asyncio
 import copy
 import hashlib
 import json
+import math
 import os
 import re
+import statistics
+import threading
+import time
 import uuid as uuid_mod
+from collections import deque
 from pathlib import Path
 from typing import Any
 
-from kanban_logic import KanbanLogic
+from kanban_logic import KANBAN_APP_NAME, KanbanLogic
 from protocol import PRSPNode
 from session import Session, SessionResult
 from starlette.requests import Request
@@ -158,11 +163,167 @@ def default_relay_state_file(config: dict, identity: str) -> str:
 PRESENCE_LIVENESS_MARGIN = 2.0
 MIN_RELAY_POLL_SECONDS = 1.0
 MAX_RELAY_POLL_SECONDS = 300.0
+TIMING_CALIBRATION_SECONDS = 300.0
+
+# Relay polling, token handling, and UI requests can all persist the same
+# connection bookkeeping.  Serialize writers by absolute file name, even
+# when two RelayLogic objects temporarily refer to that file during startup.
+_STATE_SAVE_LOCKS: dict[str, threading.Lock] = {}
+_STATE_SAVE_LOCKS_GUARD = threading.Lock()
+
+
+class RelayTiming:
+    """Transient timing model for one relay storage location.
+
+    All timestamps used to compare clients stay in the relay server's clock.
+    Local wall time is translated only for scheduling and diagnostics.
+    """
+
+    def __init__(self, timestamp_resolution_seconds: float = 1.0):
+        self.timestamp_resolution_seconds = max(
+            0.0, float(timestamp_resolution_seconds),
+        )
+        self._offset_samples = deque(maxlen=30)
+        self._roundtrip_samples = deque(maxlen=30)
+        self._cycle_samples = deque(maxlen=30)
+        self._peer_presence: dict[str, tuple[float, float]] = {}
+        self._last_probe_monotonic: float | None = None
+        self._lock = threading.RLock()
+
+    @staticmethod
+    def _spread(samples) -> float:
+        values = list(samples)
+        return max(values) - min(values) if len(values) > 1 else 0.0
+
+    def observe_server_clock(self, started_monotonic: float, started_wall: float,
+                             ended_monotonic: float, ended_wall: float,
+                             server_mtime: float | None,
+                             roundtrip_seconds: float | None = None) -> None:
+        if server_mtime is None:
+            return
+        operation_seconds = max(0.0, ended_monotonic - started_monotonic)
+        # An integer SFTP mtime represents an interval one resolution wide;
+        # its midpoint is the least biased estimate of the server's clock.
+        server_midpoint = float(server_mtime) + self.timestamp_resolution_seconds / 2
+        local_midpoint = (started_wall + ended_wall) / 2
+        uncertainty = operation_seconds / 2 + self.timestamp_resolution_seconds / 2
+        with self._lock:
+            self._offset_samples.append((server_midpoint - local_midpoint, uncertainty))
+            if roundtrip_seconds is not None:
+                self._roundtrip_samples.append(max(0.0, float(roundtrip_seconds)))
+                self._last_probe_monotonic = ended_monotonic
+
+    def observe_cycle(self, duration_seconds: float) -> None:
+        with self._lock:
+            self._cycle_samples.append(max(0.0, float(duration_seconds)))
+
+    def observe_peer_presence(self, peer_id: str, server_mtime: float | None,
+                              poll_interval_seconds: float) -> None:
+        if not peer_id or server_mtime is None:
+            return
+        with self._lock:
+            self._peer_presence[peer_id] = (
+                float(server_mtime), max(0.1, float(poll_interval_seconds)),
+            )
+
+    def probe_due(self, now_monotonic: float | None = None) -> bool:
+        now_monotonic = time.monotonic() if now_monotonic is None else now_monotonic
+        with self._lock:
+            return (
+                self._last_probe_monotonic is None
+                or now_monotonic - self._last_probe_monotonic
+                >= TIMING_CALIBRATION_SECONDS
+            )
+
+    def _summary(self) -> dict:
+        with self._lock:
+            offsets = list(self._offset_samples)
+            roundtrips = list(self._roundtrip_samples)
+            cycles = list(self._cycle_samples)
+            peers = dict(self._peer_presence)
+        offset = statistics.median(value for value, _uncertainty in offsets) if offsets else None
+        uncertainty = max(
+            (min(item[1] for item in offsets) if offsets else 0.0),
+            self.timestamp_resolution_seconds / 2,
+        )
+        roundtrip = min(roundtrips) if roundtrips else None
+        roundtrip_jitter = self._spread(roundtrips)
+        relay_cycle = statistics.median(cycles) if cycles else None
+        cycle_jitter = self._spread(cycles)
+        return {
+            "offset": offset,
+            "uncertainty": uncertainty,
+            "roundtrip": roundtrip,
+            "roundtrip_jitter": roundtrip_jitter,
+            "relay_cycle": relay_cycle,
+            "cycle_jitter": cycle_jitter,
+            "peers": peers,
+            "sample_count": len(roundtrips),
+            "cycle_sample_count": len(cycles),
+        }
+
+    def server_now(self, local_wall: float | None = None) -> float | None:
+        summary = self._summary()
+        if summary["offset"] is None:
+            return None
+        return (time.time() if local_wall is None else local_wall) + summary["offset"]
+
+    def response_check_delay(self, stable_interval_seconds: float,
+                             published_server_time: float | None = None,
+                             local_wall: float | None = None) -> float:
+        """When a response to a just-published revision should be present."""
+        stable = max(0.1, float(stable_interval_seconds))
+        summary = self._summary()
+        if summary["offset"] is None or not summary["peers"]:
+            return stable
+        server_now = (time.time() if local_wall is None else local_wall) + summary["offset"]
+        published_at = (
+            server_now if published_server_time is None else published_server_time
+        )
+        jitter = max(summary["roundtrip_jitter"], summary["cycle_jitter"])
+        relay_work = max(
+            summary["roundtrip"] or 0.0,
+            summary["relay_cycle"] or 0.0,
+            0.05,
+        )
+        response_margin = relay_work + jitter + summary["uncertainty"]
+        candidates = []
+        for peer_mtime, peer_interval in summary["peers"].values():
+            age = server_now - peer_mtime
+            stale_after = PRESENCE_LIVENESS_MARGIN * (stable + peer_interval)
+            if age > stale_after:
+                continue
+            if peer_mtime >= published_at - summary["uncertainty"]:
+                peer_poll = peer_mtime
+            else:
+                periods = max(1, math.ceil((published_at - peer_mtime) / peer_interval))
+                peer_poll = peer_mtime + periods * peer_interval
+            candidates.append(max(0.05, peer_poll + response_margin - server_now))
+        return min(candidates) if candidates else stable
+
+    def status_payload(self) -> dict:
+        summary = self._summary()
+
+        def milliseconds(value):
+            return round(value * 1000, 1) if value is not None else None
+
+        return {
+            "calibrated": summary["offset"] is not None,
+            "roundtrip_ms": milliseconds(summary["roundtrip"]),
+            "roundtrip_jitter_ms": milliseconds(summary["roundtrip_jitter"]),
+            "relay_cycle_ms": milliseconds(summary["relay_cycle"]),
+            "relay_cycle_jitter_ms": milliseconds(summary["cycle_jitter"]),
+            "server_clock_offset_ms": milliseconds(summary["offset"]),
+            "clock_uncertainty_ms": milliseconds(summary["uncertainty"]),
+            "samples": summary["sample_count"],
+            "cycle_samples": summary["cycle_sample_count"],
+        }
 
 
 class RelayLogic:
     def __init__(self, session: Session, config: dict):
         self.session = session
+        self._session_lock = threading.RLock()
         self.kanban = KanbanLogic(session, config)
         self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
         self.storage = self._build_storage(config)
@@ -172,6 +333,10 @@ class RelayLogic:
                 "relay_adopted_storage_descriptor",
             )
             self.storage = self._storage_from_descriptor(adopted_descriptor)
+        self.timing = RelayTiming(
+            getattr(self.storage, "mtime_resolution_seconds", 1.0),
+        )
+        self._last_publish_server_time: float | None = None
         self.poll_interval_seconds = self._normalize_poll_interval(
             config.get(
                 "relay_poll_interval_seconds",
@@ -196,6 +361,10 @@ class RelayLogic:
             state_config, self.identity,
         )
         self._state = self._load_state()
+        # None preserves the legacy implicit-connection behavior (all local
+        # boards + broad discovery). RelayManager sets an explicit set for
+        # every registered target, including the empty set.
+        self._scoped_topic_uuids: set[str] | None = None
         # Re-mark any previously-shared boards as active discussions, so a
         # restart doesn't silently drop the issuer's auto-adopt for them
         # (see _activate_shared_boards).
@@ -311,6 +480,10 @@ class RelayLogic:
 
     def _install_adopted_storage(self, storage, descriptor: dict | None = None) -> None:
         self.storage = storage
+        self.timing = RelayTiming(
+            getattr(self.storage, "mtime_resolution_seconds", 1.0),
+        )
+        self._last_publish_server_time = None
         if descriptor:
             # A token-provisioned accepter has no local relay config to load
             # on its next start. Keep the accepted descriptor with the
@@ -379,7 +552,13 @@ class RelayLogic:
         # path. poll_and_apply already caches any non-"kanban_board" topic
         # via apply_peer_subtree without attempting to graft it, so no
         # change is needed on the receiving side.
-        return [board.uuid for board in self.kanban.boards()] + [self.session.identity.uuid]
+        board_uuids = {board.uuid for board in self.kanban.boards()}
+        if self._scoped_topic_uuids is not None:
+            board_uuids &= self._scoped_topic_uuids
+        return sorted(board_uuids) + [self.session.identity.uuid]
+
+    def set_scoped_topics(self, topic_uuids: set[str] | list[str]) -> None:
+        self._scoped_topic_uuids = {str(topic) for topic in topic_uuids if topic}
 
     def channel_descriptor(self) -> dict | None:
         if not self.storage:
@@ -428,6 +607,16 @@ class RelayLogic:
         self._state["desired"] = sorted(desired)
         self._save_state()
         return SessionResult("ok", value=topic_uuids)
+
+    def unmark_topics_desired(self, topic_uuids: list[str]) -> SessionResult:
+        if not isinstance(topic_uuids, list) or not topic_uuids:
+            return SessionResult("error", reason="no topic_uuids given")
+        remove = {str(uuid) for uuid in topic_uuids}
+        self._state["desired"] = [
+            topic for topic in self._state.get("desired", []) if topic not in remove
+        ]
+        self._save_state()
+        return SessionResult("ok", value=sorted(remove))
 
     def mark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
         # The issuer-side counterpart of mark_topics_desired: recording that
@@ -491,11 +680,21 @@ class RelayLogic:
         # a place to read/write.
         if not self.storage:
             return False
-        if self._state.get("shared") or self._state.get("desired"):
+        active_desired = set(self._state.get("desired", [])) - set(
+            self._state.get("identity_topics", [])
+        )
+        if self._state.get("shared") or active_desired:
             return True
+        if self._scoped_topic_uuids is None:
+            return any(addr.startswith("relay:") for addr in self.session.peer_topic_sets)
+        relevant = (
+            self._scoped_topic_uuids
+            | set(self._state.get("shared", []))
+            | active_desired
+        )
         return any(
-            addr.startswith("relay:")
-            for addr in self.session.peer_topic_sets
+            addr.startswith("relay:") and bool(relevant & set(topics))
+            for addr, topics in self.session.peer_topic_sets.items()
         )
 
     def write_presence(self) -> None:
@@ -510,12 +709,58 @@ class RelayLogic:
             return
         payload = {
             "identity": self.identity,
+            # Scoped polling deliberately does not enumerate every topic on
+            # a shared target. Carry the public profile in the heartbeat so
+            # a peer discovered on an assigned board can still be named
+            # without scanning that peer's separate identity topic.
+            "profile": self.session.identity.to_dict(),
             "updated_at": now_iso(),
             "poll_interval_seconds": self.poll_interval_seconds,
         }
+        started_monotonic = time.monotonic()
+        started_wall = time.time()
         mtime = self.storage.write_presence(self.identity, payload)
+        ended_monotonic = time.monotonic()
+        ended_wall = time.time()
+        self.timing.observe_server_clock(
+            started_monotonic, started_wall,
+            ended_monotonic, ended_wall,
+            mtime,
+        )
         if mtime is not None:
             self._own_presence_mtime = mtime
+
+    def calibrate_timing(self, samples: int = 1) -> dict:
+        if not self.storage:
+            return self.timing.status_payload()
+        probe = getattr(self.storage, "timing_probe", None)
+        if not probe:
+            return self.timing.status_payload()
+        for _ in range(max(1, int(samples))):
+            started_monotonic = time.monotonic()
+            started_wall = time.time()
+            server_mtime, roundtrip = probe()
+            ended_monotonic = time.monotonic()
+            ended_wall = time.time()
+            self.timing.observe_server_clock(
+                started_monotonic, started_wall,
+                ended_monotonic, ended_wall,
+                server_mtime, roundtrip,
+            )
+        return self.timing.status_payload()
+
+    def calibrate_timing_if_due(self) -> None:
+        if self.timing.probe_due():
+            self.calibrate_timing(1)
+
+    def record_cycle_duration(self, duration_seconds: float) -> None:
+        self.timing.observe_cycle(duration_seconds)
+
+    def response_check_delay(self) -> float:
+        return self.timing.response_check_delay(
+            self.poll_interval_seconds,
+            self._last_publish_server_time,
+        )
 
     def known_peer_identities(self) -> list[str]:
         # Peers we've actually exchanged something with, per our own applied
@@ -554,7 +799,13 @@ class RelayLogic:
             return []
         published = []
         for topic_uuid in self.relay_topic_uuids():
-            current_hash = self.session.node_state_hash(topic_uuid)
+            # Reads under the shared session lock: a sibling connection's
+            # poll_and_apply may be grafting a board into the same tree
+            # concurrently (relay_tick now runs connections' I/O in parallel),
+            # and an unlocked walk here could observe a half-grafted subtree
+            # or a dict mutated mid-iteration.
+            with self._session_lock:
+                current_hash = self.session.node_state_hash(topic_uuid)
             if current_hash is None:
                 continue
             observed = self._state.get("observed", {}).get(topic_uuid, {})
@@ -565,8 +816,13 @@ class RelayLogic:
                     and self._state["published_observations"].get(topic_uuid)
                     == observed_digest):
                 continue
-            payload = self.session.get_subtree(topic_uuid)
-            if payload is None:
+            # Re-read hash and subtree together so the snapshot we write is
+            # the one current_hash actually names (a concurrent apply between
+            # the two reads would otherwise mismatch head hash and payload).
+            with self._session_lock:
+                current_hash = self.session.node_state_hash(topic_uuid)
+                payload = self.session.get_subtree(topic_uuid)
+            if current_hash is None or payload is None:
                 continue
             payload["_relay_observed"] = observed
             self.storage.write_snapshot(topic_uuid, self.identity, current_hash, payload)
@@ -574,6 +830,7 @@ class RelayLogic:
             self._state["published_observations"][topic_uuid] = observed_digest
             published.append(topic_uuid)
         if published:
+            self._last_publish_server_time = self.timing.server_now()
             self._save_state()
         return published
 
@@ -606,12 +863,44 @@ class RelayLogic:
         if not self.storage:
             return []
         applied: set[tuple[str, str]] = set()
-        for topic_uuid in self.storage.list_topics():
+        # A peer appears under every topic it shares with us; its presence
+        # file is per-identity, not per-topic, so read it once per cycle
+        # instead of re-fetching (an SFTP round-trip) for each topic.
+        presence_cache: dict[str, tuple[dict | None, float | None]] = {}
+
+        def read_presence(peer_id: str) -> tuple[dict | None, float | None]:
+            if peer_id not in presence_cache:
+                presence_cache[peer_id] = self.storage.read_presence_with_mtime(peer_id)
+            return presence_cache[peer_id]
+
+        if self._scoped_topic_uuids is None:
+            topic_uuids = self.storage.list_topics()
+        else:
+            # Explicit targets never enumerate unrelated discussions that
+            # happen to share the same SFTP root. Desired topics come from
+            # accepted tokens; scoped topics are locally assigned boards.
+            topic_uuids = sorted(
+                self._scoped_topic_uuids
+                | set(self._state.get("desired", []))
+            )
+        for topic_uuid in topic_uuids:
             for peer_id in self.storage.list_peers(topic_uuid):
                 if peer_id == self.identity:
                     continue
                 peer_addr = f"relay:{peer_id}"
-                if self._is_redundant_relay_peer(peer_addr):
+                presence, _mtime = read_presence(peer_id)
+                peer_interval = float(
+                    (presence or {}).get("poll_interval_seconds")
+                    or self.poll_interval_seconds
+                )
+                self.timing.observe_peer_presence(peer_id, _mtime, peer_interval)
+                profile = (presence or {}).get("profile")
+                if isinstance(profile, dict):
+                    with self._session_lock:
+                        self.session.apply_peer_identity_snapshot(peer_addr, profile)
+                with self._session_lock:
+                    redundant = self._is_redundant_relay_peer(peer_addr)
+                if redundant:
                     # This identity is already reachable through a live,
                     # preferred (non-relay) channel - the ongoing poll
                     # loop runs independently of connect-time channel
@@ -632,7 +921,11 @@ class RelayLogic:
                 if not head:
                     continue
                 observed_for_me = (head.get("observed") or {}).get(self.identity, {})
-                if self.session.record_peer_observations(peer_addr, observed_for_me):
+                with self._session_lock:
+                    observations_changed = self.session.record_peer_observations(
+                        peer_addr, observed_for_me,
+                    )
+                if observations_changed:
                     applied.add((topic_uuid, peer_id))
                 state_hash = head.get("hash")
                 if not state_hash:
@@ -644,10 +937,11 @@ class RelayLogic:
                 # would then permanently skip it as "nothing changed," even
                 # though grafting is still pending - so an unchanged hash
                 # only short-circuits when there's nothing left to do.
-                wants_graft = (
-                    topic_uuid in self._state.get("desired", [])
-                    and self.session.protocol.index.get(topic_uuid) is None
-                )
+                with self._session_lock:
+                    wants_graft = (
+                        topic_uuid in self._state.get("desired", [])
+                        and self.session.protocol.index.get(topic_uuid) is None
+                    )
                 if state_hash == last_seen and not wants_graft:
                     continue
                 payload = self.storage.read_snapshot(topic_uuid, peer_id, state_hash)
@@ -658,23 +952,22 @@ class RelayLogic:
                 # Session.note_relay_peer_topic) is what lets kanban_logic's
                 # auto-adopt recognize this cache as discussing the topic;
                 # without it, the apply below would be invisible to adoption.
-                self.session.note_relay_peer_topic(peer_addr, topic_uuid)
-                is_new_board = wants_graft and subtree.data.get("type") == "kanban_board"
-                if is_new_board:
-                    # Graft the original object as our own board; cache a
-                    # deep copy separately so the two don't become the same
-                    # object (which would make future divergence checks
-                    # between "our board" and "the peer's cache" trivially
-                    # always agree) - same split the live-join accept path
-                    # already uses (kanban_logic.py's join_discussion).
-                    self.kanban.accept_relay_board(subtree)
-                    self.session.apply_peer_subtree(
-                        peer_addr, copy.deepcopy(subtree), payload.get("parent_uuid"),
-                    )
-                else:
-                    self.session.apply_peer_subtree(
-                        peer_addr, subtree, payload.get("parent_uuid"),
-                    )
+                with self._session_lock:
+                    self.session.note_relay_peer_topic(peer_addr, topic_uuid)
+                    is_new_board = wants_graft and subtree.data.get("type") == "kanban_board"
+                    if is_new_board:
+                        # Graft the original object as our own board; cache a
+                        # deep copy separately so the two don't become the same
+                        # object (which would make future divergence checks
+                        # between "our board" and the peer cache always agree).
+                        self.kanban.accept_relay_board(subtree)
+                        self.session.apply_peer_subtree(
+                            peer_addr, copy.deepcopy(subtree), payload.get("parent_uuid"),
+                        )
+                    else:
+                        self.session.apply_peer_subtree(
+                            peer_addr, subtree, payload.get("parent_uuid"),
+                        )
                 self._state["observed"].setdefault(topic_uuid, {})[peer_id] = (
                     self.session.node_revision_map(subtree)
                 )
@@ -696,6 +989,7 @@ class RelayLogic:
             "identity": self.identity,
             "root": str(self.storage.root) if self.storage else None,
             "state_file": self._state_path,
+            "timing": self.timing.status_payload(),
             "desired": list(self._state.get("desired", [])),
             "presence": {
                 peer_id: self.peer_liveness(peer_id)
@@ -723,6 +1017,9 @@ class RelayLogic:
         self._state["observed"].pop(topic_uuid, None)
         self._state["applied"].pop(topic_uuid, None)
         self._state["desired"] = [t for t in self._state.get("desired", []) if t != topic_uuid]
+        self._state["identity_topics"] = [
+            t for t in self._state.get("identity_topics", []) if t != topic_uuid
+        ]
         self._state["shared"] = [t for t in self._state.get("shared", []) if t != topic_uuid]
         self._save_state()
         return SessionResult("ok", value=topic_uuid)
@@ -736,6 +1033,7 @@ class RelayLogic:
             data.setdefault("published_observations", {})
             data.setdefault("observed", {})
             data.setdefault("desired", [])
+            data.setdefault("identity_topics", [])
             data.setdefault("shared", [])
             # `applied` is deliberately NOT restored (see _save_state) - it
             # always starts empty so a restart re-fetches and re-caches
@@ -744,7 +1042,7 @@ class RelayLogic:
             return data
         return {
             "published": {}, "published_observations": {}, "observed": {},
-            "applied": {}, "desired": [], "shared": [],
+            "applied": {}, "desired": [], "identity_topics": [], "shared": [],
         }
 
     def _save_state(self) -> None:
@@ -760,14 +1058,47 @@ class RelayLogic:
         # DOES persist (it tracks snapshots that stay on the server, which
         # does persist); `desired`/`shared` persist (durable consent/intent).
         # Same lesson as not persisting Session.peer_sync_state.
-        persisted = {k: v for k, v in self._state.items() if k != "applied"}
         path = Path(self._state_path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        tmp_path = path.with_name(f"{path.name}.{os.getpid()}.{uuid_mod.uuid4().hex}.tmp")
-        with tmp_path.open("w", encoding="utf-8") as f:
-            json.dump(persisted, f, sort_keys=True, indent=2)
-            f.write("\n")
-        os.replace(tmp_path, path)
+        absolute_path = str(path.resolve())
+        with _STATE_SAVE_LOCKS_GUARD:
+            save_lock = _STATE_SAVE_LOCKS.setdefault(absolute_path, threading.Lock())
+        with save_lock:
+            # Copy while holding the writer lock so JSON serialization does
+            # not follow nested dictionaries that another save is replacing.
+            persisted = copy.deepcopy({
+                key: value for key, value in self._state.items() if key != "applied"
+            })
+            tmp_path = path.with_name(
+                f"{path.name}.{os.getpid()}.{uuid_mod.uuid4().hex}.tmp"
+            )
+            try:
+                with tmp_path.open("w", encoding="utf-8") as f:
+                    json.dump(persisted, f, sort_keys=True, indent=2)
+                    f.write("\n")
+                # Windows can briefly deny replacement while another thread,
+                # process, virus scanner, or indexer still has the destination
+                # open.  Match the retry policy used by main session saves.
+                for attempt in range(12):
+                    try:
+                        os.replace(tmp_path, path)
+                        break
+                    except PermissionError as exc:
+                        if attempt == 11:
+                            raise
+                        if attempt >= 2:
+                            print(
+                                "[relay] state save replace blocked, retrying "
+                                f"{attempt + 1}/11 for {path}: {exc}",
+                                flush=True,
+                            )
+                        time.sleep(0.08 * (attempt + 1))
+            finally:
+                if tmp_path.exists():
+                    try:
+                        tmp_path.unlink()
+                    except OSError:
+                        pass
 
 
 def _relay_fingerprint(storage) -> str:
@@ -795,23 +1126,400 @@ class RelayManager:
     def __init__(self, session: Session, config: dict):
         self.session = session
         self.config = config
+        self.kanban = KanbanLogic(session, config)
+        self._session_lock = threading.RLock()
         self.connections: dict[str, RelayLogic] = {}
         # The implicit connection: built from the flat config (or a persisted
         # adopted-descriptor) exactly as before. Registered by fingerprint.
         self.primary = RelayLogic(session, config)
+        self.primary._session_lock = self._session_lock
         self.connections[_relay_fingerprint(self.primary.storage)] = self.primary
+        self._bootstrap_registry()
+        for target in self.list_targets():
+            self.ensure_connection(self.target_descriptor(target["id"]))
+        self.refresh_scopes()
+
+    def _target_registry(self) -> dict[str, dict]:
+        registry = self.session.app_metadata.setdefault("relay_targets", {})
+        if not isinstance(registry, dict):
+            registry = {}
+            self.session.app_metadata["relay_targets"] = registry
+        return registry
+
+    def _board_target_map(self) -> dict[str, str]:
+        apps = self.session.app_metadata.setdefault("apps", {})
+        metadata = apps.setdefault(KANBAN_APP_NAME, {})
+        mapping = metadata.setdefault("board_target", {})
+        if not isinstance(mapping, dict):
+            mapping = {}
+            metadata["board_target"] = mapping
+        return mapping
+
+    @staticmethod
+    def _record_from_descriptor(descriptor: dict, name: str | None = None) -> dict:
+        channel_type = descriptor.get("type")
+        if channel_type == "sftp":
+            return {
+                "name": name or descriptor.get("target_name") or f"{descriptor.get('host', '')} relay",
+                "backend": "sftp",
+                "host": descriptor.get("host") or "",
+                "port": int(descriptor.get("port", 22)),
+                "username": descriptor.get("username") or "",
+                "root": descriptor.get("root", "/"),
+                "password": descriptor.get("password") or "",
+                "poll_interval_seconds": RelayLogic._normalize_poll_interval(
+                    descriptor.get("poll_interval_seconds"), 3.0,
+                ),
+            }
+        return {
+            "name": name or descriptor.get("target_name") or "Local relay",
+            "backend": "local",
+            "root": descriptor.get("root") or "",
+            "poll_interval_seconds": RelayLogic._normalize_poll_interval(
+                descriptor.get("poll_interval_seconds"), 3.0,
+            ),
+        }
+
+    @staticmethod
+    def _descriptor_from_record(record: dict) -> dict:
+        if record.get("backend") == "sftp":
+            return {
+                "type": "sftp", "version": 1,
+                "host": record.get("host") or "",
+                "port": int(record.get("port", 22)),
+                "username": record.get("username") or "",
+                "root": record.get("root", "/"),
+                "password": record.get("password") or "",
+                "poll_interval_seconds": record.get("poll_interval_seconds", 3),
+                "target_name": record.get("name") or "Relay",
+            }
+        return {
+            "type": "relay", "version": 1,
+            "root": record.get("root") or "",
+            "poll_interval_seconds": record.get("poll_interval_seconds", 3),
+            "target_name": record.get("name") or "Local relay",
+        }
+
+    def _bootstrap_registry(self) -> None:
+        if not self.primary.storage:
+            return
+        descriptor = self.primary.channel_descriptor()
+        if not descriptor:
+            return
+        fingerprint = _relay_fingerprint(self.primary.storage)
+        registry = self._target_registry()
+        target_id = next(
+            (
+                item_id for item_id, record in registry.items()
+                if _relay_fingerprint(
+                    RelayLogic._storage_from_descriptor(self._descriptor_from_record(record))
+                ) == fingerprint
+            ),
+            None,
+        )
+        if target_id is None:
+            target_id = str(uuid_mod.uuid4())
+            record = self._record_from_descriptor(descriptor, "Configured relay")
+            record["configured"] = bool(
+                self.config.get("relay_root") or self.config.get("relay_sftp_host")
+            )
+            registry[target_id] = record
+        # Migrate durable relay intent to explicit assignments. New boards
+        # remain unassigned, as required by the explicit-target model.
+        mapping = self._board_target_map()
+        for topic_uuid in set(self.primary._state.get("shared", [])) | set(
+            self.primary._state.get("desired", [])
+        ):
+            node = self.session.protocol.index.get(topic_uuid)
+            if node and node.data.get("type") == "kanban_board":
+                mapping.setdefault(topic_uuid, target_id)
+
+    def list_targets(self) -> list[dict]:
+        assignments = self._board_target_map()
+        result = []
+        for target_id, record in sorted(
+            self._target_registry().items(),
+            key=lambda item: str(item[1].get("name", "")).lower(),
+        ):
+            public = {key: value for key, value in record.items() if key != "password"}
+            public.update({
+                "id": target_id,
+                "has_password": bool(record.get("password")),
+                "board_uuids": sorted(
+                    board_uuid for board_uuid, assigned in assignments.items()
+                    if assigned == target_id
+                ),
+            })
+            connection = self.connection_for_target(target_id)
+            if connection:
+                public["timing"] = connection.timing.status_payload()
+            result.append(public)
+        return result
+
+    def target_descriptor(self, target_id: str) -> dict | None:
+        record = self._target_registry().get(target_id)
+        if not record:
+            return None
+        descriptor = self._descriptor_from_record(record)
+        descriptor["identity"] = self.primary.identity
+        descriptor["target_id"] = target_id
+        return descriptor
+
+    def ensure_connection(self, descriptor: dict | None) -> RelayLogic | None:
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        if storage is None:
+            return None
+        fingerprint = _relay_fingerprint(storage)
+        existing = self.connections.get(fingerprint)
+        if existing:
+            # Fingerprints intentionally exclude credentials. A corrected
+            # token for the same server/root must refresh the live storage
+            # object instead of retaining a stale password forever.
+            existing.storage = storage
+            existing.adopt_poll_interval_from_descriptor(descriptor or {})
+            return existing
+        record = self._record_from_descriptor(descriptor or {})
+        connection_config = {
+            "app_module": self.config.get("app_module"),
+            "relay_identity": self.config.get("relay_identity") or self.session.identity.uuid,
+            "relay_poll_interval_seconds": record.get("poll_interval_seconds", 3),
+        }
+        state_directory = self.config.get("relay_state_directory")
+        if state_directory:
+            safe_fingerprint = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]
+            connection_config["relay_state_file"] = str(
+                Path(state_directory) / f"relay-{safe_fingerprint}.json"
+            )
+        if record.get("backend") == "sftp":
+            connection_config.update({
+                "relay_backend": "sftp",
+                "relay_sftp_host": record.get("host"),
+                "relay_sftp_port": record.get("port", 22),
+                "relay_sftp_username": record.get("username"),
+                "relay_sftp_root": record.get("root", "/"),
+                "relay_sftp_password": record.get("password"),
+            })
+        else:
+            connection_config.update({
+                "relay_backend": "local", "relay_root": record.get("root"),
+            })
+        connection = RelayLogic(self.session, connection_config)
+        connection._session_lock = self._session_lock
+        self.connections[fingerprint] = connection
+        return connection
+
+    def connection_for_target(self, target_id: str) -> RelayLogic | None:
+        descriptor = self.target_descriptor(target_id)
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        return self.connections.get(_relay_fingerprint(storage)) if storage else None
+
+    def refresh_scopes(self) -> None:
+        topics_by_fingerprint: dict[str, set[str]] = {}
+        for board_uuid, target_id in self._board_target_map().items():
+            descriptor = self.target_descriptor(target_id)
+            storage = RelayLogic._storage_from_descriptor(descriptor)
+            if storage:
+                topics_by_fingerprint.setdefault(_relay_fingerprint(storage), set()).add(board_uuid)
+        for fingerprint, connection in self.connections.items():
+            if fingerprint == "unconfigured":
+                continue
+            connection.set_scoped_topics(topics_by_fingerprint.get(fingerprint, set()))
+
+    def create_target(self, values: dict, verify: bool = True) -> SessionResult:
+        backend = values.get("backend", "sftp")
+        try:
+            port = int(values.get("port") or 22)
+        except (TypeError, ValueError):
+            return SessionResult("error", reason="port must be a number")
+        if not 1 <= port <= 65535:
+            return SessionResult("error", reason="port must be between 1 and 65535")
+        descriptor = {
+            "type": "sftp" if backend == "sftp" else "relay",
+            "version": 1,
+            "host": str(values.get("host") or "").strip(),
+            "port": port,
+            "username": str(values.get("username") or "").strip(),
+            "root": str(values.get("root") or ("/" if backend == "sftp" else "")).strip(),
+            "password": values.get("password") or "",
+            "poll_interval_seconds": values.get("poll_interval_seconds", 3),
+        }
+        if backend == "sftp" and (not descriptor["host"] or not descriptor["username"]):
+            return SessionResult("error", reason="host and username are required")
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        if not storage:
+            return SessionResult("error", reason="relay target is not usable")
+        if verify:
+            try:
+                checker = getattr(storage, "verify_access", None)
+                checker() if checker else storage.list_topics()
+            except Exception as exc:
+                return SessionResult(
+                    "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
+                )
+        target_id = str(uuid_mod.uuid4())
+        self._target_registry()[target_id] = self._record_from_descriptor(
+            descriptor, str(values.get("name") or "Relay target").strip(),
+        )
+        self.ensure_connection(self.target_descriptor(target_id))
+        self.refresh_scopes()
+        return SessionResult("ok", value=target_id)
+
+    def register_descriptor(self, descriptor: dict) -> SessionResult:
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        if not storage:
+            return SessionResult("error", reason="relay descriptor is not usable")
+        fingerprint = _relay_fingerprint(storage)
+        for target_id, record in self._target_registry().items():
+            existing = RelayLogic._storage_from_descriptor(self._descriptor_from_record(record))
+            if existing and _relay_fingerprint(existing) == fingerprint:
+                replacement = self._record_from_descriptor(
+                    descriptor, record.get("name") or None,
+                )
+                if record.get("configured"):
+                    replacement["configured"] = True
+                self._target_registry()[target_id] = replacement
+                self.ensure_connection(descriptor)
+                return SessionResult("ok", value=target_id)
+        target_id = str(uuid_mod.uuid4())
+        self._target_registry()[target_id] = self._record_from_descriptor(descriptor)
+        self.ensure_connection(descriptor)
+        self.refresh_scopes()
+        return SessionResult("ok", value=target_id)
+
+    def accept_descriptor(self, descriptor: dict, topic_uuids: list[str],
+                          inviter_identity_uuid: str | None = None) -> SessionResult:
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        if not storage:
+            return SessionResult("error", reason="relay descriptor is not usable")
+        try:
+            checker = getattr(storage, "verify_access", None)
+            checker() if checker else storage.list_topics()
+        except Exception as exc:
+            return SessionResult(
+                "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
+            )
+        registered = self.register_descriptor(descriptor)
+        if registered.status != "ok":
+            return registered
+        target_id = registered.value
+        connection = self.connection_for_target(target_id)
+        if not connection:
+            return SessionResult("error", reason="relay connection could not be created")
+        connection.adopt_poll_interval_from_descriptor(descriptor)
+        desired = connection.mark_topics_desired(topic_uuids)
+        if desired.status != "ok":
+            return desired
+        if inviter_identity_uuid:
+            identity_topics = set(connection._state.get("identity_topics", []))
+            identity_topics.add(inviter_identity_uuid)
+            connection._state["identity_topics"] = sorted(identity_topics)
+            connection._save_state()
+        mapping = self._board_target_map()
+        for topic_uuid in topic_uuids:
+            if topic_uuid not in {inviter_identity_uuid, self.session.identity.uuid}:
+                mapping[topic_uuid] = target_id
+        self.refresh_scopes()
+        return SessionResult("ok", value=target_id)
+
+    def assign_board_target(self, board_uuid: str, target_id: str | None) -> SessionResult:
+        board = self.session.protocol.index.get(board_uuid)
+        if not board or board.data.get("type") != "kanban_board":
+            return SessionResult("error", reason="board not found")
+        if target_id and target_id not in self._target_registry():
+            return SessionResult("error", reason="relay target not found")
+        mapping = self._board_target_map()
+        previous_id = mapping.get(board_uuid)
+        if previous_id and previous_id != target_id:
+            previous = self.connection_for_target(previous_id)
+            if previous:
+                previous.unmark_topics_shared([board_uuid])
+                previous.unmark_topics_desired([board_uuid])
+        if target_id:
+            mapping[board_uuid] = target_id
+        else:
+            mapping.pop(board_uuid, None)
+        self.refresh_scopes()
+        if target_id:
+            connection = self.connection_for_target(target_id)
+            if connection:
+                connection.mark_topics_shared([board_uuid])
+        return SessionResult("ok", value=target_id or "")
+
+    def target_for_board(self, board_uuid: str) -> str | None:
+        return self._board_target_map().get(board_uuid)
+
+    def test_target(self, target_id: str) -> SessionResult:
+        descriptor = self.target_descriptor(target_id)
+        connection = self.connection_for_target(target_id)
+        if not descriptor or not connection or not connection.storage:
+            return SessionResult("error", reason="relay target not found")
+        try:
+            checker = getattr(connection.storage, "verify_access", None)
+            checker() if checker else connection.storage.list_topics()
+            connection.calibrate_timing(5)
+        except Exception as exc:
+            return SessionResult(
+                "error", reason=f"relay unavailable: {type(exc).__name__}: {exc}",
+            )
+        return SessionResult("ok", value=target_id)
+
+    def delete_target(self, target_id: str) -> SessionResult:
+        registry = self._target_registry()
+        record = registry.get(target_id)
+        if not record:
+            return SessionResult("error", reason="relay target not found")
+        if record.get("configured"):
+            return SessionResult("error", reason="startup-configured targets cannot be deleted here")
+        descriptor = self.target_descriptor(target_id)
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        fingerprint = _relay_fingerprint(storage) if storage else None
+        connection = self.connections.get(fingerprint) if fingerprint else None
+        mapping = self._board_target_map()
+        for board_uuid in [uuid for uuid, assigned in mapping.items() if assigned == target_id]:
+            mapping.pop(board_uuid, None)
+        registry.pop(target_id)
+        remaining_same_connection = any(
+            _relay_fingerprint(
+                RelayLogic._storage_from_descriptor(self._descriptor_from_record(item))
+            ) == fingerprint
+            for item in registry.values()
+        ) if fingerprint else False
+        if connection and not remaining_same_connection:
+            connection._state["shared"] = []
+            connection._state["desired"] = []
+            connection._state["identity_topics"] = []
+            connection._save_state()
+            if connection is not self.primary:
+                self.connections.pop(fingerprint, None)
+        self.refresh_scopes()
+        return SessionResult("ok", value=target_id)
 
     def all_connections(self) -> list[RelayLogic]:
         return list(self.connections.values())
 
-    def peer_liveness(self, peer_id: str) -> dict:
-        # Whichever connection actually knows this peer answers; "unknown"
-        # from a connection that never saw it isn't a real answer.
+    def has_any_active_relationship(self) -> bool:
+        return any(conn.has_active_relationship() for conn in self.all_connections())
+
+    def peer_liveness(self, peer_id: str, target_id: str | None = None) -> dict:
+        # The same identity may exist on an old and a current target. An
+        # alive heartbeat on any connection is stronger evidence than a
+        # stale heartbeat on another; never let insertion order decide.
+        if target_id:
+            connection = self.connection_for_target(target_id)
+            return connection.peer_liveness(peer_id) if connection else {"state": "unknown"}
+        known = []
         for conn in self.all_connections():
             result = conn.peer_liveness(peer_id)
             if result.get("state") != "unknown":
-                return result
-        return {"state": "unknown"}
+                known.append(result)
+        if not known:
+            return {"state": "unknown"}
+        alive = [item for item in known if item.get("state") == "alive"]
+        candidates = alive or known
+        return min(
+            candidates,
+            key=lambda item: abs(float(item.get("last_seen_seconds_ago", float("inf")))),
+        )
 
     @property
     def storage(self):
@@ -838,16 +1546,12 @@ class RelayManager:
 def create_logic(session: Session, config: dict) -> RelayManager:
     manager = RelayManager(session, config)
     config["_relay_manager"] = manager
-    # Alias to the implicit connection so existing single-storage readers
-    # (accept_connect_token, token arming, kanban liveness) keep working
-    # unchanged while the manager is introduced.
-    config["_relay_logic_instance"] = manager.primary
     return manager
 
 
 def channel_descriptor(runtime, config: dict) -> dict | None:
-    logic = config.get("_relay_logic_instance")
-    return logic.channel_descriptor() if logic else None
+    manager = config.get("_relay_manager")
+    return manager.channel_descriptor() if manager else None
 
 
 def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
@@ -864,7 +1568,55 @@ def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
             return JSONResponse({"status": "error", "reason": result.reason}, status_code=400)
         return JSONResponse({"status": "ok", "topic_uuid": result.value})
 
+    async def api_targets(request: Request):
+        if request.method == "GET":
+            return JSONResponse({"targets": logic.list_targets()})
+        data = await request.json()
+        result = await asyncio.to_thread(logic.create_target, data, True)
+        if result.status != "ok":
+            return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
+        runtime.notify_change("relay-target")
+        return JSONResponse({"status": "ok", "target_id": result.value})
+
+    async def api_test_target(request: Request):
+        data = await request.json()
+        target_id = data.get("target_id", "")
+        result = await asyncio.to_thread(logic.test_target, target_id)
+        status = 200 if result.status == "ok" else 409
+        connection = logic.connection_for_target(target_id)
+        return JSONResponse(
+            {
+                "status": result.status,
+                "target_id": result.value,
+                "reason": result.reason,
+                "timing": connection.timing.status_payload() if connection else None,
+            },
+            status_code=status,
+        )
+
+    async def api_delete_target(request: Request):
+        data = await request.json()
+        result = logic.delete_target(data.get("target_id", ""))
+        if result.status != "ok":
+            return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
+        runtime.notify_change("relay-target")
+        return JSONResponse({"status": "ok", "target_id": result.value})
+
+    async def api_assign_board(request: Request):
+        data = await request.json()
+        result = logic.assign_board_target(
+            data.get("board_uuid", ""), data.get("target_id") or None,
+        )
+        if result.status != "ok":
+            return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
+        runtime.notify_change("relay-target")
+        return JSONResponse({"status": "ok", "target_id": result.value})
+
     return [
         Route("/api/relay/status", api_relay_status),
         Route("/api/relay/delete_topic", api_relay_delete_topic, methods=["POST"]),
+        Route("/api/relay/targets", api_targets, methods=["GET", "POST"]),
+        Route("/api/relay/targets/test", api_test_target, methods=["POST"]),
+        Route("/api/relay/targets/delete", api_delete_target, methods=["POST"]),
+        Route("/api/relay/boards/assign", api_assign_board, methods=["POST"]),
     ]
