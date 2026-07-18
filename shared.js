@@ -104,6 +104,37 @@ function transitionActorLabel(info) {
   return peerLabel(info.peer_addr);
 }
 
+function eventChangeSummary(event, limit = 3) {
+  const summaries = (event?.changes || [])
+    .map((change) => change.summary)
+    .filter(Boolean);
+  if (summaries.length <= limit) return summaries.join("; ");
+  return `${summaries.slice(0, limit).join("; ")}; +${summaries.length - limit} more`;
+}
+
+function localChangeSummary(info, limit = 3) {
+  const summaries = dedupe(
+    (info?.events || [info])
+      .flatMap((event) => event?.changes || [])
+      .map((change) => change.local_summary)
+      .filter(Boolean),
+  );
+  if (summaries.length <= limit) return summaries.join("; ");
+  return `${summaries.slice(0, limit).join("; ")}; +${summaries.length - limit} more`;
+}
+
+function transitionChangeDetails(info) {
+  return (info.events || [info])
+    .filter((event) => event && event.type !== "in_agreement")
+    .map((event) => {
+      const summary = eventChangeSummary(event, 6);
+      if (!summary) return "";
+      return `${transitionActorLabel(event)}: ${summary}`;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
 function groupedTransitionLabel(events) {
   const order = [
     "divergence",
@@ -134,7 +165,11 @@ function groupedTransitionLabel(events) {
 
 function transitionLabel(info) {
   const events = (info.events || [info]).filter((event) => event.type !== "in_agreement");
-  if (events.length > 1) return groupedTransitionLabel(events);
+  const details = transitionChangeDetails(info);
+  if (events.length > 1) {
+    const grouped = groupedTransitionLabel(events);
+    return details ? `${grouped}\n${details}` : grouped;
+  }
   const peer = transitionActorLabel(info);
   const labels = {
     in_agreement: "In agreement",
@@ -145,5 +180,6 @@ function transitionLabel(info) {
     divergence: `Diverged from ${peer}`,
     in_transition: `Waiting for ${peer} to process this change`,
   };
-  return labels[info.type] || "Difference";
+  const label = labels[info.type] || "Difference";
+  return details ? `${label}\n${details}` : label;
 }
