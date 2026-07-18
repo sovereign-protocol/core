@@ -28,10 +28,18 @@ must upgrade together; there is no cross-version interop.
   type (`peer_made_changes` vs `local_missing_node`) picks between them, so the
   `node_adopt_mode` callable and kanban's `adopt_mode` / container
   special-casing are gone. Two behaviors fell out of doing it properly:
-  container **deletion now propagates** (as a shallow `deleted` flag, children
-  handled by their own eligibility-checked events — a kept card survives), and
+  container **deletion now propagates** (as a shallow `deleted` flag), and
   shallow adopt now **preserves the remote revision's base** (adopt_subtree
   already did; the old container path did not).
+
+  Because deleting a container removes its whole subtree at the protocol level
+  (no orphans - a necessary CRDT-tree invariant), the *decision* to accept a
+  container deletion is closed over its subtree **in the app**: under
+  `not_owner`/`not_member`, kanban's eligibility declines a column/board
+  deletion while it still holds a card the mode protects (a later prune would
+  otherwise take that card). The container then stays as a divergence to
+  resolve by hand; unprotected cards in it still delete via their own events.
+  The protocol is asked to delete only when the app means it.
 
 _Written 2026-07-19. Follows [DESIGN_REVISIONS_AND_REACTIONS.md] (compound
 revisions, staging, reactions), whose semantics this aligns the hash model to._
