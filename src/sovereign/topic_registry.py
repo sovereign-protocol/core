@@ -11,7 +11,7 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from protocol import ProtocolNode
+from .protocol import ProtocolNode
 
 
 @dataclass(frozen=True)

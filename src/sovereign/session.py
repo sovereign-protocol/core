@@ -41,13 +41,13 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable
 
-from protocol import (
+from .protocol import (
     ProtocolNode, ProtocolState, collect_subtree_uuids,
     protocol_tree_envelope, stable_hash,
 )
-from topic_registry import SharedTopicRegistry
-from trace_log import TraceLogger
-from versions import CORE_PROFILE_SCHEMA_VERSION
+from .topic_registry import SharedTopicRegistry
+from .trace_log import TraceLogger
+from .versions import CORE_PROFILE_SCHEMA_VERSION
 
 
 _LOCAL_REVISION_ORIGIN = object()

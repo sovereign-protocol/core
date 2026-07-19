@@ -1,8 +1,8 @@
 import unittest
 
-from protocol import ProtocolNode, stable_hash
-from session import Session, SessionEffect
-from transport import HttpTransportAdapter, TransportHttpError
+from sovereign.protocol import ProtocolNode, stable_hash
+from sovereign.session import Session, SessionEffect
+from sovereign.transport import HttpTransportAdapter, TransportHttpError
 
 
 class FakeHttpClient:

@@ -40,7 +40,7 @@ class TraceLogger:
     def from_config(cls, config: dict, port: int, address: str) -> "TraceLogger":
         path = config.get("trace_log_file") or os.environ.get("SKANBAN_TRACE_LOG")
         if not path and os.environ.get("SKANBAN_TRACE"):
-            path = str(Path(__file__).with_name("data") / f"trace_{port}.jsonl")
+            path = str(Path.cwd() / "data" / f"trace_{port}.jsonl")
         return cls(path, node=address)
 
     @classmethod

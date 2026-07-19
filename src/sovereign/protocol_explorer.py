@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from session import Session, SessionResult
+from .session import Session, SessionResult
 
 
 class ManualLogic:

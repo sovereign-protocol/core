@@ -1,7 +1,7 @@
 import unittest
 
-from protocol import ProtocolNode
-from session import Session
+from sovereign.protocol import ProtocolNode
+from sovereign.session import Session
 
 
 class SessionTests(unittest.TestCase):

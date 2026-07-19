@@ -2,11 +2,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from blob_store import (
+from sovereign.blob_store import (
     BlobStore, blob_id_for, canonical_attachments, is_valid_image,
     referenced_blob_ids,
 )
-from protocol import ProtocolNode
+from sovereign.protocol import ProtocolNode
 
 
 class BlobStoreTests(unittest.TestCase):

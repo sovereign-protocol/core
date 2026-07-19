@@ -1,6 +1,6 @@
 import unittest
 
-from protocol import ProtocolNode, ProtocolState
+from sovereign.protocol import ProtocolNode, ProtocolState
 
 
 class ProtocolTests(unittest.TestCase):

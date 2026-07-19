@@ -1,7 +1,7 @@
 import unittest
 
-from protocol import ProtocolNode
-from topic_registry import SharedTopicRegistry
+from sovereign.protocol import ProtocolNode
+from sovereign.topic_registry import SharedTopicRegistry
 
 
 class SharedTopicRegistryTests(unittest.TestCase):

@@ -109,15 +109,15 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
-from blob_store import blob_hex, referenced_blob_ids
-from protocol import ProtocolNode, protocol_node_from_envelope
-from session import Session, SessionResult
+from .blob_store import blob_hex, referenced_blob_ids
+from .protocol import ProtocolNode, protocol_node_from_envelope
+from .session import Session, SessionResult
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from relay_storage import LocalFolderRelayStorage, SftpRelayStorage, now_iso
-from versions import CHANNEL_DESCRIPTOR_VERSION
+from .relay_storage import LocalFolderRelayStorage, SftpRelayStorage, now_iso
+from .versions import CHANNEL_DESCRIPTOR_VERSION
 
 
 def _storage_fingerprint(config: dict) -> str:
@@ -150,7 +150,7 @@ def default_relay_state_file(config: dict, identity: str) -> str:
     safe_identity = re.sub(r"[^A-Za-z0-9_-]+", "_", identity).strip("_") or "default"
     fingerprint = hashlib.sha256(_storage_fingerprint(config).encode("utf-8")).hexdigest()[:12]
     return str(
-        Path(__file__).with_name("data")
+        Path.cwd() / "data"
         / f"relay_state_{app_name}_{safe_identity}_{fingerprint}.json"
     )
 

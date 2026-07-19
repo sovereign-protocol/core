@@ -2,7 +2,7 @@ import json
 import unittest
 from pathlib import Path
 
-from protocol import (
+from sovereign.protocol import (
     UnsupportedProtocolVersion,
     protocol_node_from_envelope,
     protocol_tree_envelope,

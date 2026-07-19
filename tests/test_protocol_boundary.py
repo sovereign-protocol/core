@@ -2,7 +2,7 @@ import re
 import unittest
 from pathlib import Path
 
-from session import Session
+from sovereign.session import Session
 
 
 class ProtocolBoundaryTests(unittest.TestCase):
@@ -29,8 +29,8 @@ class ProtocolBoundaryTests(unittest.TestCase):
     def test_app_logic_does_not_mutate_protocol_directly(self):
         root = Path(__file__).resolve().parents[1]
         app_files = [
-            root / "kanban_logic.py",
-            root / "manual_logic.py",
+            root / "applications" / "s-kanban" / "src" / "s_kanban" / "logic.py",
+            root / "src" / "sovereign" / "protocol_explorer.py",
         ]
         forbidden = [
             r"\.(?:children|parent_uuid|content_hash|state_hash|base_hash|base_parent_uuid|data|weights)\s*=",

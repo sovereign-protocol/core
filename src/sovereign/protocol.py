@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
-from versions import PROTOCOL_SCHEMA_VERSION
+from .versions import PROTOCOL_SCHEMA_VERSION
 
 
 _REVISION_ORIGIN_UNSET = object()

@@ -39,11 +39,11 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from protocol import (
+from .protocol import (
     ProtocolNode, UnsupportedProtocolVersion, protocol_node_from_envelope,
 )
-from session import Session, SessionEffect, SessionResult
-from trace_log import TraceLogger
+from .session import Session, SessionEffect, SessionResult
+from .trace_log import TraceLogger
 
 
 class JsonHttpClient(Protocol):

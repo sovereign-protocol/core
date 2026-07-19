@@ -676,6 +676,31 @@ previous format is rejected with a clear, tested message.
 
 Exit: editable installation and clean installation both pass.
 
+**Implemented R2 record:**
+
+| Distribution | Import package | Monorepo source root |
+|---|---|---|
+| `sovereign-core 0.1.0` | `sovereign` | `src/sovereign` |
+| `s-kanban 0.1.0a1` | `s_kanban` | `applications/s-kanban/src/s_kanban` |
+| `personal-cockpit 0.1.0a1` | `personal_cockpit` | `applications/personal-cockpit/src/personal_cockpit` |
+
+- Declared Python floor: **3.10**. CI coverage of that floor remains an R8
+  publication gate; the development verification ran on Python 3.14.2.
+- Browser assets are package resources, not working-directory-relative files.
+- Runtime state now defaults to the caller's `data/` directory, never inside an
+  installed package.
+- Root `app_server.py` and `trace_view.py` remain compatibility launchers;
+  installed commands are `sovereign-host` and `sovereign-trace-view`.
+- Editable installs: all three distributions built and installed successfully.
+- Clean install: all three wheels installed into an isolated target; imports,
+  packaged assets, and construction of a Kanban runtime succeeded outside the
+  repository.
+- Full suite after extraction: **410 passed**.
+
+Personal Cockpit's direct `s_kanban` dependency remains an explicitly temporary
+private-monorepo dependency under §10. R6 must replace it with optional facade
+lookup before R8/repository publication.
+
 ### R3 — formalize application registration and host
 
 - Implement ApplicationRegistration and ApplicationHost.

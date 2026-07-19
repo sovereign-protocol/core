@@ -69,7 +69,7 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
 
-from blob_store import blob_hex, blob_id_for
+from .blob_store import blob_hex, blob_id_for
 
 
 def now_iso() -> str:
