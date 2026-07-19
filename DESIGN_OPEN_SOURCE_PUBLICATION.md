@@ -94,13 +94,10 @@ public announcement. P2 may follow publicly.
 
 #### Architecture and licenses
 
-- [ ] Architecture R0–R7 and the R8 repository-split rehearsal completed.
-      R0–R7 are done. The R8 tooling and release scaffolding exist
-      (`tools/rehearse_repository_split.py`, `tools/verify_repository_split.py`,
-      `release/repositories/`); the rehearsal result itself is **pending an
-      independently reproduced run** — record it under "R8 — Evidence" in
-      `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` §14 before ticking this box.
-- [ ] Core, S-Kanban, and Personal Cockpit repositories pass clean-install and
+- [x] Architecture R0–R7 and the R8 repository-split rehearsal completed.
+      Rehearsal reproduced on a clean machine 2026-07-19; evidence under
+      "R8 — Evidence" in `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` §14.
+- [x] Core, S-Kanban, and Personal Cockpit repositories pass clean-install and
       cross-repository integration tests. Automated by
       `verify_repository_split.py` across four distributions — Core,
       `examples/s-agreement` inside Core, S-Kanban, Personal Cockpit — against
@@ -111,7 +108,12 @@ public announcement. P2 may follow publicly.
 
 #### Secrets and privacy
 
-- [ ] Scan the complete Git history, not only the working tree.
+- [x] Scan the complete Git history, not only the working tree. Automated in
+      `verify_repository_split.py` and re-verified independently: all 145
+      commits across the three split repositories, zero hits for private keys,
+      GitHub tokens, AWS keys, or machine-specific absolute paths. Re-run on
+      the final pre-publication commit, since this proves the history as split
+      on 2026-07-19 and not any commit added afterwards.
 - [ ] Remove **secrets**: credentials, tokens, private keys, machine-specific
       usernames, and unnecessary absolute paths.
 - [ ] Rotate every credential that may ever have been committed.

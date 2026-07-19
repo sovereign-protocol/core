@@ -984,19 +984,35 @@ rehearsal:
 `verify_repository_split.py` writes `R8_VERIFICATION.json` into the rehearsal
 output directory. Record the run here before ticking the R8 publication gate.
 
-- **Status: PENDING an independently reproduced run.**
-- Codex reported a full passing rehearsal (four wheels, pinned and editable
-  integration, all split-repository tests, license payloads present, history
-  scans passed, no remotes) on 2026-07-19. That result is **recorded as reported
-  and not independently reproduced** — a review run failed at the license fetch,
-  which is why the User-Agent fix below exists. Treat the claim as unverified
-  until a clean-machine run is pasted in.
+- **Status: PASSED, reproduced on a clean machine 2026-07-19.**
+
+Run: `tools/rehearse_repository_split.py` then `verify_repository_split.py`,
+Windows 11, Python 3.14.2, after the User-Agent fix below.
+
+| Check | Result |
+|---|---|
+| Distributions built | 4 wheels — `sovereign_core-0.1.0`, `s_agreement-0.1.0a1`, `s_kanban-0.1.0a1`, `personal_cockpit-0.1.0a1` |
+| Cross-repository install | pinned (`sovereign-core==0.1.0`) and editable, both green |
+| Per-repository tests | passed in all three isolated repositories |
+| Packaged license payloads | present in every wheel |
+| Remotes | absent in all three clones |
+| Filtered-history scan | passed |
+
+Independently re-verified rather than taken from the tool's own report: three
+repositories, zero remotes each, clean trees, history preserved (68 / 56 / 21
+commits); `LICENSE` is LGPL for Core and Apache-2.0 for both applications, as
+L1/L3 require; 177 distinct historical paths across all repositories contain no
+`.claude/`, `data/`, `traces/`, or non-example `relay_sftp_*`; and a scan of all
+145 commits for private-key blocks, GitHub tokens, and `<user-profile path>` / `<workspace path>`
+paths returned zero hits.
+
 - Reproducibility defect, fixed: the license hosts reject urllib's default
   User-Agent with `HTTP 403`, so a clean-machine rehearsal could not fetch the
   official texts and only succeeded with a pre-populated `--license-cache` that
   is not in the repository. `download_verified` now sends a tool User-Agent and
   writes the cache after the digest matches, so the first run populates it and
-  later runs can work offline.
+  later runs can work offline. The verified run above exercised this path and
+  populated the cache from cold.
 
 ## 14.1 Review follow-ups
 
