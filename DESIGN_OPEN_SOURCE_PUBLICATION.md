@@ -384,7 +384,7 @@ Repository-specific labels can be added after real usage shows a need.
 - **O4 — ACCEPTED:** use GitHub Discussions first; add no separate chat initially.
 - **O5 — ACCEPTED:** SFTP bearer credentials are an experimental, prominently
   documented limitation under the C2 safeguards.
-- **O6 — ACCEPTED:** use R2 names after availability/domain/trademark checks.
+- **O6 — ACCEPTED:** use G2 names after availability/domain/trademark checks.
 - **O7 — ACCEPTED:** publish accepted near-term work, not every exploratory
   backlog item.
 

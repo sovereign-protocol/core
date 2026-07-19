@@ -505,7 +505,7 @@ During the private monorepo phases, the existing file may retain its direct
 `KanbanLogic` import until the public facade contract exists. Before R8, that
 import must be replaced by an optional, version-checked Kanban facade obtained
 through generic host lookup. Personal Cockpit then moves mechanically to its own
-repository as accepted in R2. The seven methods it currently consumes define the
+repository as accepted in G2. The seven methods it currently consumes define the
 initial facade coverage to design and test.
 
 ### S-Agreement conformance application

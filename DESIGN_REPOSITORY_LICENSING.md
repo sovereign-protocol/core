@@ -263,10 +263,10 @@ Initial governance:
 
 ## 11. GitHub organization and names
 
-**ACCEPTED R1:** create a **Sovereign Protocol** GitHub organization, initially
+**ACCEPTED G1:** create a **Sovereign Protocol** GitHub organization, initially
 owned and merged solely by the founder.
 
-**ACCEPTED R2, subject to availability/trademark checks:**
+**ACCEPTED G2, subject to availability/trademark checks:**
 
 - Repositories: `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`.
 - Core distribution: `sovereign-core`; Python import namespace: `sovereign`.
@@ -277,12 +277,12 @@ only availability conflicts reopen the naming decision.
 
 ## 11.1 Source and executable release order
 
-**ACCEPTED R4:** publish the Core source distribution/wheel and S-Kanban source
+**ACCEPTED G4:** publish the Core source distribution/wheel and S-Kanban source
 alpha first. Add the Windows executable afterward, once a focused review confirms
 LGPL notices, exact Core source availability, and library replacement/recombination
 requirements.
 
-**ACCEPTED R5:** complete one professional review of the code/documentation/
+**ACCEPTED G5:** complete one professional review of the code/documentation/
 contribution license package before public contribution, and a second focused
 review before distributing a frozen executable.
 
@@ -316,12 +316,12 @@ statement.
 - [x] L3: Core profile/shell LGPL; application UIs Apache-2.0.
 - [x] L4: documentation/specification `CC-BY-4.0`; code/fixtures retain software
       license.
-- [x] R1: Sovereign Protocol GitHub organization; founder sole initial owner.
-- [x] R2: `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; names
+- [x] G1: Sovereign Protocol GitHub organization; founder sole initial owner.
+- [x] G2: `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; names
       remain subject to availability/trademark checks.
-- [x] R3: Core `0.1.0`; Kanban `v0.1.0-alpha.1` / `0.1.0a1`.
-- [x] R4: source/wheel first; executable after LGPL packaging review.
-- [x] R5: license review before publication and focused executable review later.
+- [x] G3: Core `0.1.0`; Kanban `v0.1.0-alpha.1` / `0.1.0a1`.
+- [x] G4: source/wheel first; executable after LGPL packaging review.
+- [x] G5: license review before publication and focused executable review later.
 
 ## 14. Primary references
 

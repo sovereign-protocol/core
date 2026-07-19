@@ -11,6 +11,40 @@ Documents:
 - `DESIGN_REPOSITORY_LICENSING.md`
 - `DESIGN_OPEN_SOURCE_PUBLICATION.md`
 
+## 0. Identifier scheme
+
+Every identifier is a letter for its topic plus a number. **`R` is reserved for
+refactoring phases and never for a decision.**
+
+| Prefix | Meaning | Defined in |
+|---|---|---|
+| `P` | Protocol vocabulary, versions, compatibility | this log §1 |
+| `S` | Session/application lifecycle | this log §1 |
+| `H` | Host and framework | this log §1 |
+| `C` | Channel and mailbox storage | this log §1 |
+| `A` | Application boundaries, profile, cockpit | this log §1 |
+| `L` | Licensing | this log §2 |
+| `G` | Governance: repositories, names, versions, release, legal review | this log §2 |
+| `O` | Operational/publication choices | this log §3 |
+| `B` | Findings from implementation review | this log §1 |
+| **`R`** | **Refactoring phases `R0`–`R8` (plus `R3a`)** | `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` §14 |
+
+**Renamed 2026-07-19:** the repository/governance decisions were previously
+`R1`–`R5`, which collided with refactoring phases `R1`–`R5`. `R3` meant both
+"formalize application registration and host" and "Core `0.1.0` initial
+versions." They are now `G1`–`G5` with the same content and ordering:
+
+| Was | Now | Decision |
+|---|---|---|
+| `R1` | `G1` | Repository owner / GitHub organization |
+| `R2` | `G2` | Names (repos, distribution, import namespace) |
+| `R3` | `G3` | Initial versions |
+| `R4` | `G4` | Executable compliance and release order |
+| `R5` | `G5` | Legal review timing |
+
+Commit `b0fd498` and earlier documents refer to the old numbering; the table
+above is the mapping.
+
 ## 1. Decisions that block refactoring
 
 | ID | Question | Recommendation | Status/decision |
@@ -80,11 +114,11 @@ version negotiation. All are deferred past `1.0`.
 | L2 | Inbound contribution model? | No planned proprietary dual-license; DCO 1.1, no CLA | **ACCEPTED** |
 | L3 | Profile/UI license boundary? | Minimal profile and host shell follow Core’s LGPL; application UIs follow their application license | **ACCEPTED** |
 | L4 | Documentation license? | Documentation and normative S-Protocol specification use `CC-BY-4.0`; code/fixtures retain repository software license | **ACCEPTED** |
-| R1 | Repository owner? | Sovereign Protocol GitHub organization; founder is sole initial owner/merger | **ACCEPTED** |
-| R2 | Names? | Organization repos `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; distribution `sovereign-core`; import `sovereign` | **ACCEPTED, subject to availability/trademark checks** |
-| R3 | Initial versions? | Core `0.1.0`; Kanban tag `v0.1.0-alpha.1` / Python `0.1.0a1`, with explicit Core range | **ACCEPTED** |
-| R4 | Executable compliance? | Publish Core wheel/source and Kanban source first; add Windows executable after focused LGPL packaging review | **ACCEPTED** |
-| R5 | Legal review timing? | License/contribution review before publication; frozen-executable review before executable distribution | **ACCEPTED** |
+| G1 | Repository owner? | Sovereign Protocol GitHub organization; founder is sole initial owner/merger | **ACCEPTED** |
+| G2 | Names? | Organization repos `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; distribution `sovereign-core`; import `sovereign` | **ACCEPTED, subject to availability/trademark checks** |
+| G3 | Initial versions? | Core `0.1.0`; Kanban tag `v0.1.0-alpha.1` / Python `0.1.0a1`, with explicit Core range | **ACCEPTED** |
+| G4 | Executable compliance? | Publish Core wheel/source and Kanban source first; add Windows executable after focused LGPL packaging review | **ACCEPTED** |
+| G5 | Legal review timing? | License/contribution review before publication; frozen-executable review before executable distribution | **ACCEPTED** |
 
 ## 3. Decisions that block public announcement
 
@@ -95,7 +129,7 @@ version negotiation. All are deferred past `1.0`.
 | O3 | Initial artifact? | Core source/wheel and Kanban source alpha first; executable later | **ACCEPTED** |
 | O4 | Community channel? | GitHub Discussions first; no additional chat initially | **ACCEPTED** |
 | O5 | Relay credential posture? | Experimental SFTP with prominent threat model, bearer-secret warning, and jailed-account requirement | **ACCEPTED** |
-| O6 | Public naming? | Use R2 names after repository/package/domain/trademark checks | **ACCEPTED** |
+| O6 | Public naming? | Use G2 names after repository/package/domain/trademark checks | **ACCEPTED** |
 | O7 | Roadmap visibility? | Publish accepted near-term work, not the full exploratory backlog | **ACCEPTED** |
 
 ## 4. Suggested review order
@@ -104,7 +138,7 @@ version negotiation. All are deferred past `1.0`.
 2. S1, H1–H3: application lifecycle and host.
 3. C1–C2: channel/storage and relay security posture.
 4. A1–A4: profile, Protocol Explorer, UI, and Personal Cockpit integration.
-5. L1–L4 and R1–R5: licenses, contribution terms, names, and repositories.
+5. L1–L4 and G1–G5: licenses, contribution terms, names, and repositories.
 6. O1–O7: launch audience and operational choices.
 
 Resolve one group at a time. A decision may revise the detailed documents before
