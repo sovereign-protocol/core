@@ -905,6 +905,30 @@ smoke.
 
 Exit: two independent applications run on the same installed core.
 
+**Implemented R7 record:**
+
+- Added the independently packaged `s-agreement 0.1.0a1` conformance
+  application. It owns agreement, section, and clause data, its controllers,
+  and a deliberately minimal document view.
+- `agreement` is registered as an application topic root. Invitations mount
+  beneath S-Agreement's local container through the existing generic Session
+  registration contract.
+- The application exposes Session transition classifications but defines no
+  auto-adoption policy. Expiry, sign-off, and the finished negotiation UI remain
+  explicitly deferred product work.
+- Two-client tests prove invitation and updates over direct HTTP and the local
+  mailbox backend. A deterministic child-before-parent test proves a new
+  agreement → section → clause structure converges in one reconciliation pass.
+- No Protocol, Session, channel, or ApplicationHost production code changed.
+  The suspected S-6 failure does not occur: when the missing parent is reached,
+  `accept_peer_node` grafts its complete cached subtree, including descendants
+  skipped earlier in that same pass.
+- Packaging and boundary checks now include all four monorepo distributions and
+  reject imports among any application packages.
+
+Verification: **445 tests passed**, plus the isolated four-wheel install smoke
+and a clean frozen-launcher build/entry-point smoke on Windows.
+
 ### R8 — split repositories and rehearse release
 
 - Follow `DESIGN_REPOSITORY_LICENSING.md`.
@@ -945,11 +969,17 @@ above.
 | F4 | Ignored build trees contained stale routes | Generated application build trees were removed; smoke builds use temporary directories |
 | F5 | Personal Cockpit imported S-Kanban internals | Optional version-checked facade lookup; no package/import dependency remains |
 
+### Closed by R7
+
+| ID | Finding | How it was closed |
+|---|---|---|
+| S-6 | UUID-sorted reconciliation was suspected to prevent one-pass adoption of a new nested subtree | The S-Agreement conformance test forces clause-before-section processing. The clause is initially skipped, then grafted with the complete section subtree when its parent event is processed, so one pass succeeds without a Core change. |
+
 ### Open
 
 | ID | Sev | Finding | Evidence | Target |
 |---|---|---|---|---|
-| S-6 | Medium | `reconcile_peer_changes` walks events uuid-sorted rather than parents-first, so a brand-new container and its children can fail to adopt in one pass | `ARCHITECTURE_REVIEW.md` S-6; consequence documented inline in the Kanban auto-adopt eligibility comment | R7 — the Agreement proof must test three-level nested adoption (§10); if it fails, S-6 becomes R7 scope |
+| — | — | No open implementation-review finding remains before R8. | — | — |
 
 ## 15. Verification matrix
 

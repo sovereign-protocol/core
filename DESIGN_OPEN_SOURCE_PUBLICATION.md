@@ -341,7 +341,8 @@ Repository-specific labels can be added after real usage shows a need.
 
 ### Next public development
 
-- Build S-Agreement as the second real application.
+- Grow the minimal S-Agreement conformance application into the second real
+  product application.
 - Let it challenge and stabilize the Core public API.
 - Implement WebDAV only after the mailbox storage contract is public and tested.
 - Defer Core `1.0` until at least two real applications have exercised it.
