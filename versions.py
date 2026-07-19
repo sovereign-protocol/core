@@ -12,3 +12,6 @@ SESSION_ENVELOPE_VERSION = 1
 CONNECT_TOKEN_VERSION = 1
 CHANNEL_DESCRIPTOR_VERSION = 1
 
+# Core-owned data layered on the generic protocol tree. This is not an
+# application schema: the minimal public profile exists even with zero apps.
+CORE_PROFILE_SCHEMA_VERSION = 1

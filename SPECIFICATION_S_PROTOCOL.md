@@ -8,15 +8,16 @@ is not migrated automatically.
 
 The following versions are independent and must not share a wire field:
 
-| Domain | Current field/value |
-|---|---|
-| Python distribution | `0.1.0` |
-| Protocol tree envelope | `protocol_schema_version: 1` |
-| Session persistence envelope | `format: sovereign-session`, `version: 1` |
-| Connect token | `token_version: 1` |
-| Channel descriptor | `descriptor_version: 1` |
-| Application data schema | owned and versioned by each application |
-| Application facade/API | owned and versioned by each application facade |
+| Domain | Current field/value | Status |
+|---|---|---|
+| Python distribution | `0.1.0` | implemented |
+| Protocol tree envelope | `protocol_schema_version: 1` | implemented |
+| Session persistence envelope | `format: sovereign-session`, `version: 1` | implemented |
+| Connect token | `token_version: 1` | implemented |
+| Channel descriptor | `descriptor_version: 1` | implemented |
+| Core public-profile schema | `profile_schema_version: 1` | implemented |
+| Application data schema | owned and versioned by each application | reserved for R3/R4 |
+| Application facade/API | owned and versioned by each application facade | reserved for R6 |
 
 ## Canonical hash input
 
@@ -81,3 +82,8 @@ A saved session contains `format`, `version`, `protocol_schema_version`,
 descriptor contains its own `descriptor_version` and channel-specific fields.
 
 These outer formats may evolve independently from the protocol tree schema.
+
+The Core public profile is also independent structured data. Version 1 contains
+only `identity_key`, `display_name`, optional avatar data (`picture` and
+`attachments`), and structural `type`/`name` fields. It does not contain email
+or other contact information.

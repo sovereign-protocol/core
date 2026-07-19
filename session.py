@@ -47,9 +47,40 @@ from protocol import (
 )
 from topic_registry import SharedTopicRegistry
 from trace_log import TraceLogger
+from versions import CORE_PROFILE_SCHEMA_VERSION
 
 
 _LOCAL_REVISION_ORIGIN = object()
+
+_CORE_PROFILE_FIELDS = frozenset({
+    "type", "name", "profile_schema_version", "identity_key",
+    "display_name", "picture", "attachments",
+})
+
+
+def _core_profile_schema_error(data: dict) -> str | None:
+    if data.get("type") != "shared_user_profile":
+        return "Core profile type must be 'shared_user_profile'"
+    version = data.get("profile_schema_version")
+    if version != CORE_PROFILE_SCHEMA_VERSION:
+        return (
+            f"unsupported Core profile schema version {version!r}; "
+            f"expected {CORE_PROFILE_SCHEMA_VERSION}"
+        )
+    extra = sorted(set(data) - _CORE_PROFILE_FIELDS)
+    if extra:
+        return f"unsupported Core profile fields: {', '.join(extra)}"
+    if data.get("name") != "public_profile":
+        return "Core profile name must be 'public_profile'"
+    if not isinstance(data.get("identity_key"), str) or not data["identity_key"]:
+        return "Core profile identity_key is required"
+    if not isinstance(data.get("display_name"), str):
+        return "Core profile display_name must be a string"
+    if not isinstance(data.get("picture"), str):
+        return "Core profile picture must be a string"
+    if not isinstance(data.get("attachments"), list):
+        return "Core profile attachments must be a list"
+    return None
 
 
 def _session_locked(method):
@@ -205,15 +236,14 @@ class Session:
         container = self._folder(self.protocol.root, "shared_user_data")
         for child in container.children:
             if child.data.get("type") == "shared_user_profile":
-                return self._ensure_identity_defaults(child)
+                return self._validated_identity(child)
         return self.create_child(
             container.uuid,
             {
                 "type": "shared_user_profile",
                 "name": "public_profile",
-                "version": 1,
+                "profile_schema_version": CORE_PROFILE_SCHEMA_VERSION,
                 "identity_key": str(uuid_mod.uuid4()),
-                "email": "",
                 "display_name": "",
                 "picture": "",
                 "attachments": [],
@@ -221,41 +251,28 @@ class Session:
             {},
         ).value
 
-    def _ensure_identity_defaults(self, node: ProtocolNode) -> ProtocolNode:
+    def _validated_identity(self, node: ProtocolNode) -> ProtocolNode:
         data = dict(node.data)
-        changed = False
-        if data.get("type") != "shared_user_profile":
-            data["type"] = "shared_user_profile"
-            changed = True
-        if data.get("name") != "public_profile":
-            data["name"] = "public_profile"
-            changed = True
-        if not data.get("version"):
-            data["version"] = 1
-            changed = True
-        if not data.get("identity_key"):
-            data["identity_key"] = str(uuid_mod.uuid4())
-            changed = True
-        if "email" not in data:
-            data["email"] = ""
-            changed = True
-        if "display_name" not in data:
-            data["display_name"] = ""
-            changed = True
-        if "picture" not in data:
-            data["picture"] = ""
-            changed = True
-        if "attachments" not in data:
-            data["attachments"] = []
-            changed = True
-        if changed:
-            self.modify(node.uuid, data, node.weights)
-            return self.get_node(node.uuid) or node
+        error = _core_profile_schema_error(data)
+        if error:
+            raise ValueError(error)
         return node
 
+    @staticmethod
+    def validate_core_tree(root: ProtocolNode) -> str | None:
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if node.data.get("type") == "shared_user_profile":
+                error = _core_profile_schema_error(node.data)
+                if error:
+                    return f"node {node.uuid}: {error}"
+            stack.extend(node.children)
+        return None
+
     @_session_locked
-    def set_identity(self, display_name: str, picture: str | None = None,
-                     email: str | None = None) -> SessionResult:
+    def set_identity(self, display_name: str,
+                     picture: str | None = None) -> SessionResult:
         profile = self.identity
         data = dict(profile.data)
         data.update({
@@ -265,8 +282,6 @@ class Session:
         })
         if picture is not None:
             data["picture"] = picture or ""
-        if email is not None:
-            data["email"] = email
         return self.modify(profile.uuid, data, profile.weights)
 
     def find_peer_identity(self, identity_key: str) -> ProtocolNode | None:
@@ -332,7 +347,20 @@ class Session:
         # themselves." Degrades gracefully (no-op) on anything it doesn't
         # recognize, rather than raising - a peer running a newer identity
         # version should never be able to break an older one's connect flow.
-        if not isinstance(identity, dict) or identity.get("data", {}).get("version") != 1:
+        data = identity.get("data", {}) if isinstance(identity, dict) else {}
+        schema_error = (
+            _core_profile_schema_error(data)
+            if data.get("type") == "shared_user_profile"
+            else "identity snapshot is not a Core profile"
+        )
+        if schema_error:
+            self.trace_event(
+                "session.reject_peer_identity_schema",
+                peer_addr=peer_addr,
+                received_version=data.get("profile_schema_version"),
+                expected_version=CORE_PROFILE_SCHEMA_VERSION,
+                reason=schema_error,
+            )
             return
         try:
             node = ProtocolNode.from_dict(identity)
@@ -1038,6 +1066,10 @@ class Session:
     @_session_locked
     def create_child(self, parent_uuid: str, data: dict,
                      weights: dict[str, float] | None = None) -> SessionResult:
+        if data.get("type") == "shared_user_profile":
+            profile_error = _core_profile_schema_error(data)
+            if profile_error:
+                return SessionResult("error", reason=profile_error)
         revision_origin = self._local_revision_origin(data)
         result = self._protocol.create_child(
             parent_uuid, data, weights, revision_origin,
@@ -1061,6 +1093,11 @@ class Session:
                weights: dict[str, float] | None = None,
                revision_origin: str | None | object = _LOCAL_REVISION_ORIGIN) -> SessionResult:
         before = self._protocol.index.get(node_uuid)
+        if (data.get("type") == "shared_user_profile"
+                or (before and before.data.get("type") == "shared_user_profile")):
+            profile_error = _core_profile_schema_error(data)
+            if profile_error:
+                return SessionResult("error", reason=profile_error)
         old_state_hash = before.state_hash if before else None
         origin = (
             self._local_revision_origin(data)

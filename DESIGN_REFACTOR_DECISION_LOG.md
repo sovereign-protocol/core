@@ -17,7 +17,7 @@ Documents:
 |---|---|---|---|
 | P1 | Rename `revision_origin_identity`? | Rename to `revision_origin` before public persistence/wire compatibility | **ACCEPTED** |
 | P2 | Public protocol name? | Formal name “Sovereign Protocol”; short name “S-Protocol”; retire PRSP | **ACCEPTED** |
-| P3 | Version domains? | Independent versions for package, protocol, persistence, token, channel descriptor, app schema, and **application facade/API** (seventh domain, required once A4 facades exist) | **ACCEPTED** |
+| P3 | Version domains? | Independent versions for package, protocol, persistence, token, channel descriptor, **Core profile schema**, app schema, and application facade/API. The Core-profile eighth domain was made explicit by R1 review because A1 keeps it outside applications. | **ACCEPTED; EXPANDED TO EIGHT** |
 | P4 | `0.x` compatibility? | Permit documented breaking changes; no automatic migrations for now; reject incompatible data clearly; promise stability only at `1.0` | **ACCEPTED** |
 | P5 | Normative specification? | Markdown wire/hash specification plus golden fixtures and executable conformance tests | **ACCEPTED** |
 | S1 | Meaning of app load/unload? | Installed apps can activate/deactivate at runtime without deleting data; installing/updating code requires restart | **ACCEPTED** |

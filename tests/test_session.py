@@ -725,9 +725,9 @@ class SessionTests(unittest.TestCase):
         profile = session.identity
 
         self.assertEqual(profile.data["type"], "shared_user_profile")
-        self.assertEqual(profile.data["version"], 1)
+        self.assertEqual(profile.data["profile_schema_version"], 1)
         self.assertTrue(profile.data["identity_key"])
-        self.assertEqual(profile.data["email"], "")
+        self.assertNotIn("email", profile.data)
         self.assertEqual(profile.data["display_name"], "")
         self.assertEqual(session.identity.uuid, profile.uuid)
         # identity_key is generated once and stays stable across repeated
@@ -744,24 +744,35 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(profile.data["display_name"], "Alice")
         self.assertEqual(profile.data["picture"], "https://example.test/a.png")
 
-    def test_set_identity_can_set_email_without_clearing_identity_key(self):
+    def test_core_identity_excludes_contact_information(self):
         session = Session("si-a")
         identity_key = session.identity.data["identity_key"]
 
-        session.set_identity("Alice", email="alice@example.test")
+        session.set_identity("Alice")
 
         profile = session.identity
-        self.assertEqual(profile.data["email"], "alice@example.test")
+        self.assertNotIn("email", profile.data)
         self.assertEqual(profile.data["identity_key"], identity_key)
+
+    def test_core_identity_rejects_contact_fields(self):
+        session = Session("si-a")
+        profile = session.identity
+        data = dict(profile.data)
+        data["email"] = "alice@example.test"
+
+        result = session.modify(profile.uuid, data, profile.weights)
+
+        self.assertEqual(result.status, "error")
+        self.assertIn("email", result.reason)
+        self.assertNotIn("email", session.identity.data)
 
     def test_find_peer_identity_searches_cached_peer_perspectives(self):
         session = Session("si-a")
         peer_profile = ProtocolNode({
             "type": "shared_user_profile",
             "name": "public_profile",
-            "version": 1,
+            "profile_schema_version": 1,
             "identity_key": "key-b",
-            "email": "",
             "display_name": "Bob",
             "picture": "",
         })
@@ -782,14 +793,14 @@ class SessionTests(unittest.TestCase):
         session = Session("si-a")
         bob_v1 = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
-            "version": 1, "identity_key": "key-bob", "email": "",
+            "profile_schema_version": 1, "identity_key": "key-bob",
             "display_name": "Bob", "picture": "",
         })
         bob_v1.refresh_hashes()
         session.peer_perspectives["old-address"] = bob_v1
         bob_v2 = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
-            "version": 1, "identity_key": "key-bob", "email": "",
+            "profile_schema_version": 1, "identity_key": "key-bob",
             "display_name": "Bob", "picture": "",
         })
         bob_v2.refresh_hashes()
@@ -831,7 +842,7 @@ class SessionTests(unittest.TestCase):
         session = Session("si-a")
         bob = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
-            "version": 1, "identity_key": "key-bob", "email": "",
+            "profile_schema_version": 1, "identity_key": "key-bob",
             "display_name": "Bob", "picture": "",
         })
         bob.refresh_hashes()
@@ -867,7 +878,7 @@ class SessionTests(unittest.TestCase):
         session = Session("si-a")
         bob = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
-            "version": 1, "identity_key": "key-bob", "email": "",
+            "profile_schema_version": 1, "identity_key": "key-bob",
             "display_name": "Bob", "picture": "",
         })
         bob.refresh_hashes()
@@ -897,7 +908,7 @@ class SessionTests(unittest.TestCase):
         bob_session = Session("si-b")
         bob_session.set_identity("Bob")
         payload = bob_session.identity.to_dict()
-        payload["data"]["version"] = 99
+        payload["data"]["profile_schema_version"] = 99
 
         session.apply_peer_identity_snapshot("si-b", payload)
 

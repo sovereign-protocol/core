@@ -195,12 +195,13 @@ These versions are independent:
 - Session persistence envelope version.
 - Connect-token version.
 - Channel-descriptor version.
+- Core public-profile schema version.
 - Application data-schema version.
 - Application facade/API version — the contract a consuming application calls
   through host facade lookup. Required once A4 facades exist; declared in the
   application manifest and checked at lookup.
 
-Do not reuse one integer as all seven meanings. The connect token and the
+Do not reuse one integer as all eight meanings. The connect token and the
 channel descriptor currently both serialize a bare `"version": 1`; R1 must make
 them distinguishable.
 

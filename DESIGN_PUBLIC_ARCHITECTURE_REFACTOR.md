@@ -204,7 +204,9 @@ The following must be decided before the first public compatibility promise:
    freely.
 3. **ACCEPTED P3 — schema version:** define a protocol envelope version
    independent from application, token, channel-descriptor, persistence-envelope,
-   package, and **application facade/API** versions — seven domains, not six.
+   package, **Core public-profile schema**, and application facade/API versions
+   — eight domains. The Core-profile domain was made explicit during R1 review:
+   A1 makes it Core data, not application data.
    The facade version is required as soon as A4 facade lookup exists, because a
    consumer application must know which facade contract it is calling; it is
    neither the producer's data-schema version nor its distribution version.
@@ -654,9 +656,9 @@ recent enough that an unstated floor would strand most contributors.
   - `SESSION_FORMAT` persistence discriminator, which currently embeds the
     retired protocol name (`"prsp-session-v1"`), with an explicit rejection
     message for the old value (P2/P4).
-- Define version ownership across **seven** domains: package, protocol envelope,
-  session persistence envelope, connect token, channel descriptor, application
-  data schema, and application facade/API.
+- Define version ownership across **eight** domains: package, protocol envelope,
+  session persistence envelope, connect token, channel descriptor, Core public-
+  profile schema, application data schema, and application facade/API.
 - Give the connect token and the channel descriptor **distinguishable** version
   fields; today both are a bare `"version": 1`.
 - Add the `0.x` incompatibility policy and golden serialization fixtures; do not
