@@ -278,7 +278,13 @@ const SovereignShell = {
     const button = document.getElementById("shellConnectionBtn");
     const state = this._options.state ? this._options.state() : {};
     if (!button || !state) return;
-    const peers = Object.entries((state.network && state.network.peers) || {});
+    // Every session peer by default. An application whose view is scoped to
+    // one topic - a board, an agreement - says which addresses belong to it,
+    // so the cluster shows who is on *this* thing rather than everyone.
+    const all = (state.network && state.network.peers) || {};
+    const peers = this._options.peerAddresses
+      ? this._options.peerAddresses().map((addr) => [addr, all[addr] || {}])
+      : Object.entries(all);
     button.replaceChildren();
     button.className = peers.length ? "peer-cluster" : "peer-cluster local";
     if (!peers.length) {
@@ -289,11 +295,24 @@ const SovereignShell = {
     for (const entry of peers.slice(0, 4)) {
       const addr = entry[0];
       const info = entry[1] || {};
+      // An application that models people - names, avatars - can describe a
+      // peer far better than an address allows. Core knows identities, not
+      // faces, so it asks and falls back to initials of the address.
+      const described = this._options.describePeer
+        ? this._options.describePeer(addr) || {} : {};
       const avatar = document.createElement("span");
-      const online = !info.status || info.status.state !== "offline";
+      const online = described.online !== undefined
+        ? described.online
+        : !info.status || info.status.state !== "offline";
       avatar.className = "header-avatar " + (online ? "status-online" : "status-offline");
-      avatar.textContent = (addr.replace(/^relay:/, "").slice(0, 2) || "?").toUpperCase();
-      avatar.title = info.channel ? addr + " (" + info.channel + ")" : addr;
+      if (described.picture) {
+        avatar.style.backgroundImage = 'url("' + described.picture + '")';
+      } else {
+        const source = described.label || addr.replace(/^relay:/, "");
+        avatar.textContent = (source.slice(0, 2) || "?").toUpperCase();
+      }
+      const label = described.label || addr;
+      avatar.title = info.channel ? label + " (" + info.channel + ")" : label;
       button.append(avatar);
     }
     if (peers.length > 4) {
@@ -303,7 +322,12 @@ const SovereignShell = {
       button.append(more);
     }
     button.title = peers
-      .map((entry) => entry[0] + (entry[1] && entry[1].channel ? " [" + entry[1].channel + "]" : ""))
+      .map((entry) => {
+        const described = this._options.describePeer
+          ? this._options.describePeer(entry[0]) || {} : {};
+        const channel = entry[1] && entry[1].channel;
+        return (described.label || entry[0]) + (channel ? " [" + channel + "]" : "");
+      })
       .join("\n");
   },
 
@@ -314,6 +338,7 @@ const SovereignShell = {
       '<dialog id="shellConnectionModal" class="shell-dialog">',
       '<form method="dialog" class="shell-panel">',
       "<h2>Connection</h2>",
+      '<div id="shellConnectionContent"></div>',
       '<label for="shellTargetSelect">Relay target for this topic</label>',
       '<select id="shellTargetSelect"></select>',
       '<div class="shell-row"><button type="button" id="shellCopyTokenBtn">Copy share token</button></div>',
@@ -414,9 +439,21 @@ const SovereignShell = {
     this._ensureDialogs();
     this._panelTopic = request.topicUuid || "";
     const state = this._options.state ? this._options.state() : {};
+    // An application can put its own view of the topic at the top of the
+    // panel - Kanban shows who is on the board, with faces Core cannot know.
+    const content = document.getElementById("shellConnectionContent");
+    content.replaceChildren();
+    const supplied = request.content
+      || (this._options.panelContent && this._options.panelContent(this._panelTopic));
+    if (supplied) content.append(supplied);
+
     const extraRow = document.getElementById("shellConnectionExtras");
     extraRow.replaceChildren();
-    for (const extra of request.extras || []) {
+    // Opening the panel from the shell's own button carries no request, so
+    // fall back to the actions the application registered at mount.
+    const extras = request.extras
+      || (this._options.extras ? this._options.extras() : []);
+    for (const extra of extras || []) {
       const button = document.createElement("button");
       button.type = "button";
       if (extra.className) button.className = extra.className;
