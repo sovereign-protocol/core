@@ -1164,32 +1164,5 @@ class SessionTests(unittest.TestCase):
 
         self.assertNotIn(leaf.uuid, local.protocol.index)
 
-    def test_reconcile_peer_changes_wholesale_replace_when_allowed(self):
-        peer = Session("si-b")
-        topic = peer.create_child(
-            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
-        ).value
-        child = peer.create_child(topic.uuid, {"type": "note_item", "text": "orig"}, {}).value
-        local = Session("si-a")
-        local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            local.protocol.root.uuid,
-        )
-
-        # A single peer-side operation keeps the topic root's own hash chain
-        # a clean one-hop "peer_made_changes" from local's frozen baseline
-        # The peer's successive edits remain one compound revision wave.
-        peer.modify(child.uuid, {"type": "note_item", "text": "new"}, {})
-        local.apply_peer_subtree(
-            "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
-            local.protocol.root.uuid,
-        )
-
-        changed = local.reconcile_peer_changes("si-b", topic.uuid, allow_wholesale_replace=True)
-
-        self.assertTrue(changed)
-        self.assertEqual(local.protocol.index[child.uuid].data["text"], "new")
-
 if __name__ == "__main__":
     unittest.main()

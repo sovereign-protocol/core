@@ -190,6 +190,49 @@ class ProtocolTests(unittest.TestCase):
         self.assertFalse(card.deleted)
         self.assertIn(card.uuid, state.index)
 
+    def test_adopt_own_fields_preserves_source_timestamp(self):
+        # Adoption copies the source revision's updated_at, not the adopter's
+        # clock - Session orders forwarded same-origin revisions by updated_at,
+        # so a fresh stamp could make a stale adopted copy look newer.
+        state = ProtocolState("si-a")
+        node = state.create_child(
+            state.root.uuid, {"name": "n"}, {}, "identity-a",
+        ).value
+        source = PRSPNode({"name": "n2"}, revision_origin_identity="identity-b")
+        source.updated_at = "2020-01-01T00:00:00.000+00:00"
+        source.refresh_hashes()
+
+        state.adopt_own_fields(node.uuid, source)
+
+        self.assertEqual(node.updated_at, "2020-01-01T00:00:00.000+00:00")
+        self.assertEqual(node.data["name"], "n2")
+
+    def test_adopt_own_fields_defers_move_to_absent_parent(self):
+        # A move to a parent not present locally defers the WHOLE adoption
+        # (atomic) rather than adopting content onto a node left at the old
+        # parent - that would be a hybrid revision that never existed remotely.
+        state = ProtocolState("si-a")
+        column = state.create_child(
+            state.root.uuid, {"name": "col"}, {}, "identity-a",
+        ).value
+        card = state.create_child(
+            column.uuid, {"name": "card"}, {}, "identity-a",
+        ).value
+        before_parent = card.parent_uuid
+        before_content = card.content_hash
+        source = PRSPNode(
+            {"name": "card-edited"}, parent_uuid="missing-parent",
+            revision_origin_identity="identity-a",
+        )
+        source.refresh_hashes()
+
+        result = state.adopt_own_fields(card.uuid, source)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(card.parent_uuid, before_parent)
+        self.assertEqual(card.content_hash, before_content)
+        self.assertEqual(card.data["name"], "card")
+
     def test_revision_origin_survives_roundtrip_and_only_real_node_edits_replace_it(self):
         state = ProtocolState("si-a")
         parent = state.create_child(

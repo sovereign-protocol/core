@@ -5,14 +5,16 @@
 Every node perspective is described by three protocol values:
 
 ```text
-(base_hash, state_hash, revision_origin)
+(base_hash, content_hash, revision_origin)
 ```
 
-`state_hash` identifies the node's actual current version. `base_hash` is
-the version from which the current originator started its uninterrupted
-wave of edits. Successive edits by that same originator change only
-`state_hash`; this lets a peer that was offline see the latest result as
-one compound change.
+`content_hash` identifies the node's own current version - its own fields
+only, excluding descendants. (The recursive subtree fingerprint is a separate
+value, `state_hash`, used for sync/transfer, not for revisions - see
+[DESIGN_NODE_SUBTREE_HASH_SPLIT.md].) `base_hash` is the version from which the
+current originator started its uninterrupted wave of edits. Successive edits by
+that same originator change only `content_hash`; this lets a peer that was
+offline see the latest result as one compound change.
 
 Adoption copies the complete remote revision, including its base and
 origin. It never changes the origin to the adopting client. A local edit

@@ -15,8 +15,7 @@ Offered API:
   get_network_info()
   peer_discusses_node(peer_addr, node_uuid)
   accept_peer_node(peer_addr, node_uuid, adopt_absence=False)
-  reconcile_peer_changes(peer_addr, topic_uuid, node_is_eligible=None,
-    allow_wholesale_replace=False)
+  reconcile_peer_changes(peer_addr, topic_uuid, node_is_eligible=None)
     Generic peer-content reconciliation (the "adopt incoming changes"
     mechanism): walks a peer's transitions for one topic and adopts each
     eligible change. Apps supply only their own eligibility policy via
@@ -1166,33 +1165,6 @@ class Session:
                              effects=self.sync_effects(adopted.uuid))
 
     @_session_locked
-    def replace_subtree(self, tree: PRSPNode) -> SessionResult:
-        local = self._protocol.index.get(tree.uuid)
-        old_state_hash = local.state_hash if local else None
-        result = self._protocol.replace_subtree(tree)
-        if not result.ok:
-            self.trace_event(
-                "protocol.replace_subtree",
-                node_uuid=tree.uuid,
-                old_state_hash=old_state_hash,
-                incoming_state_hash=tree.state_hash,
-                ok=False,
-                reason=result.reason,
-            )
-            return SessionResult("error", reason=result.reason)
-        replaced = result.value
-        self.trace_event(
-            "protocol.replace_subtree",
-            node_uuid=replaced.uuid,
-            old_state_hash=old_state_hash,
-            incoming_state_hash=tree.state_hash,
-            state_hash=replaced.state_hash,
-            ok=True,
-        )
-        return SessionResult("ok", value=self._snapshot_node(replaced),
-                             effects=self.sync_effects(replaced.uuid))
-
-    @_session_locked
     def accept_peer_node(self, peer_addr: str, node_uuid: str,
                          adopt_absence: bool = False) -> SessionResult:
         if adopt_absence:
@@ -1206,8 +1178,13 @@ class Session:
             # field-level, base-preserving update). Descendants are separate
             # per-node decisions, so a container adopt never clobbers a card
             # the recipient is keeping. Applies uniformly to cards (leaves)
-            # and containers - see ProtocolState.adopt_own_fields.
-            result = self._protocol.adopt_own_fields(node_uuid, peer)
+            # and containers - see ProtocolState.adopt_own_fields. A topic
+            # root's parent differs only because each session attaches it under
+            # its own local container, so its move must not be adopted.
+            is_topic_root = self._topic_for_node(node_uuid) == node_uuid
+            result = self._protocol.adopt_own_fields(
+                node_uuid, peer, adopt_move=not is_topic_root,
+            )
             self.trace_event(
                 "protocol.adopt_own_fields",
                 node_uuid=node_uuid,
@@ -1261,7 +1238,6 @@ class Session:
         peer_addr: str,
         topic_uuid: str,
         node_is_eligible: Callable[[PRSPNode, str], bool] | None = None,
-        allow_wholesale_replace: bool = False,
     ) -> bool:
         # Generic "adopt incoming changes" walk - every app on this protocol
         # wants the same thing (adopt whatever a peer changed for one topic).
@@ -1297,7 +1273,6 @@ class Session:
                               peer_addr=peer_addr, topic_uuid=topic_uuid)
             return False
 
-        top_event = peer_events[0] if peer_events else None
         self.trace_event(
             "session.reconcile_start",
             peer_addr=peer_addr,
@@ -1305,27 +1280,10 @@ class Session:
             local_state_hash=local_topic.state_hash,
         )
 
-        # The topic root's own event only ever decides this wholesale-replace
-        # shortcut - it must NOT gate whether the per-node loop below runs at
-        # all. A root of "in_agreement" or "local_made_changes" just means
-        # the topic's own top-level fields didn't change (or we're ahead
-        # there) - a descendant node can still independently have a real
-        # peer_made_changes/local_missing_node event that the per-node
-        # loop's own guards already know how to evaluate safely.
-        if (top_event and top_event["type"] == "peer_made_changes"
-                and allow_wholesale_replace):
-            self.trace_event(
-                "session.reconcile_replace_subtree",
-                peer_addr=peer_addr,
-                topic_uuid=topic_uuid,
-                local_state_hash=top_event.get("local_state_hash"),
-                peer_state_hash=top_event.get("peer_state_hash"),
-            )
-            self.replace_subtree(peer_topic)
-            self.trace_event("session.reconcile_done", peer_addr=peer_addr,
-                              topic_uuid=topic_uuid, changed=True)
-            return True
-
+        # Reconciliation is always per node. There is deliberately no
+        # wholesale-subtree replace: with node_hash classification the topic
+        # root's own event reflects only its own fields, so it can't safely
+        # decide to overwrite an unrelated local descendant change.
         changed = False
         for event in peer_events:
             if event["type"] not in ("peer_made_changes", "local_missing_node"):

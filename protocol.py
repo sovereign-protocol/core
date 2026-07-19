@@ -263,7 +263,8 @@ class ProtocolState:
         )
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
-    def adopt_own_fields(self, node_uuid: str, source: PRSPNode) -> ProtocolResult:
+    def adopt_own_fields(self, node_uuid: str, source: PRSPNode,
+                         adopt_move: bool = True) -> ProtocolResult:
         # Shallow adopt: make an existing node's OWN revision identical to
         # `source` (data, weights, deleted, base and origin) while leaving its
         # children untouched. Children are independent revision decisions - a
@@ -275,25 +276,39 @@ class ProtocolState:
         if not node:
             return ProtocolResult(False, reason="node not found")
         # A node's own parent is part of its own identity (base_parent_uuid
-        # tracks it), so adopt the node's own move too - just not its
-        # children. _move_child_impl updates both parents' child lists and
-        # cascades; it no-ops on an invalid destination (cycle / root).
-        if (source.parent_uuid and source.parent_uuid != node.parent_uuid
-                and source.parent_uuid in self.index):
-            self._move_child_impl(
-                node_uuid, source.parent_uuid, None,
-                source.revision_origin_identity,
-            )
+        # tracks it), so adopt the node's own move too - just not its children.
+        # Do it ATOMICALLY: if the remote parent isn't present locally yet or
+        # the move isn't applicable (would cycle), defer the whole adoption
+        # rather than copy content/base onto a node still at the old parent -
+        # that would publish a hybrid revision that never existed remotely.
+        # _move_child_impl checks its guards before mutating, so a False return
+        # leaves the tree untouched. `adopt_move` is False for a topic root,
+        # whose parent is the peer's own local container (an attachment
+        # artifact, not a shared position) - the caller knows which node is a
+        # topic root; the protocol does not.
+        if adopt_move and source.parent_uuid and source.parent_uuid != node.parent_uuid:
+            if source.parent_uuid not in self.index:
+                return ProtocolResult(False, reason="destination parent not present")
+            if not self._move_child_impl(
+                    node_uuid, source.parent_uuid, None,
+                    source.revision_origin_identity):
+                return ProtocolResult(False, reason="move not applicable")
         node.data = copy.deepcopy(source.data)
         node.weights = copy.deepcopy(source.weights)
         node.deleted = source.deleted
         node.revision_origin_identity = source.revision_origin_identity
-        node.updated_at = now_iso()
+        # Preserve the source revision's timestamp. Session orders forwarded
+        # same-origin revisions by updated_at, so stamping the adopter's clock
+        # would let a stale adopted copy look newer than the originator's head.
+        node.updated_at = source.updated_at
         self.cascade_hash(node_uuid)
         # Adoption copies the complete remote revision, including its base -
         # set it after cascade so recomputing content_hash doesn't reset it.
+        # The base parent is only meaningful when we adopt the move; a topic
+        # root's parent is a local artifact, so leave it as-is.
         node.base_hash = source.base_hash
-        node.base_parent_uuid = source.base_parent_uuid
+        if adopt_move:
+            node.base_parent_uuid = source.base_parent_uuid
         return ProtocolResult(True, node)
 
     def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
@@ -308,12 +323,6 @@ class ProtocolState:
         )
         return ProtocolResult(ok, adopted if ok else None,
                               None if ok else "adopt failed")
-
-    def replace_subtree(self, tree: PRSPNode) -> ProtocolResult:
-        local = self.index.get(tree.uuid)
-        if not local or not local.parent_uuid:
-            return ProtocolResult(False, reason="node not found")
-        return self.adopt_subtree(tree, local.parent_uuid)
 
     def remove_subtree_uuids(self, root_uuid: str, uuids: set[str]) -> ProtocolResult:
         root = self.index.get(root_uuid)
@@ -458,10 +467,10 @@ class ProtocolState:
             # detaching `existing` would take the destination with it and
             # leave nothing to re-attach to - the node would vanish from the
             # tree. Refuse before mutating anything rather than fail halfway
-            # through. No current caller can reach this (replace_subtree
-            # uses the node's own parent; accept_peer_node verifies the
-            # parent in the local index) - the guard makes that an invariant
-            # of the function instead of a property of its callers.
+            # through. No current caller can reach this (accept_peer_node
+            # verifies the parent in the local index) - the guard makes that
+            # an invariant of the function instead of a property of its
+            # callers.
             return False
         touched_parent_uuids = {parent.uuid}
         adopted.parent_uuid = parent.uuid

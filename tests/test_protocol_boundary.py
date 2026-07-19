@@ -37,7 +37,7 @@ class ProtocolBoundaryTests(unittest.TestCase):
             r"\.(?:data|weights)\s*\[",
             r"\.children\.append\s*\(",
             r"\.children\.(?:clear|extend|insert|pop|remove)\s*\(",
-            r"session\.protocol\.(?:create_child|modify|delete|copy|move|attach_topic|deindex_subtree|index_subtree|cascade_hash|adopt_subtree|replace_subtree|remove_subtree_uuids)\s*\(",
+            r"session\.protocol\.(?:create_child|modify|delete|copy|move|attach_topic|deindex_subtree|index_subtree|cascade_hash|adopt_subtree|remove_subtree_uuids)\s*\(",
         ]
 
         violations = []
