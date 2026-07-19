@@ -24,10 +24,9 @@ class _Adapter:
 def _services(session):
     return ApplicationServices(
         session=session,
-        adapter=_Adapter(),
+        channel_manager=_Adapter(),
         blob_store=object(),
         trace=None,
-        relay_manager=None,
         notify_change=lambda _kind: None,
         collect_local_blobs=lambda: [],
     )

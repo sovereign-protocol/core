@@ -44,8 +44,6 @@ Functionality:
 
 Offered API:
   RelayManager(session, config, blob_store)
-  build_routes(manager, runtime, config) -> list[Route]
-    Core service/controller surface. Relay is not an application plugin.
   RelayManager.channel_descriptor()
     Advertises relay as a connectable channel for /api/connect_token, if
     configured - {"type": "relay", "descriptor_version": 1, "root": ...,
@@ -66,11 +64,11 @@ Offered API:
       (app_server.py) once it decides the relay channel is usable, same as
       the HTTP channel's own accept path is called for the http channel.
     delete_topic(topic_uuid) -> SessionResult
-      Storage/bookkeeping cleanup only (POST /api/relay/delete_topic) -
+      Storage/bookkeeping cleanup only (mailbox topic-delete endpoint) -
       never touches a peer's own already-adopted local topic, if any.
     write_presence() -> None
       Heartbeat, called once per poll tick (app_server.py's
-      relay_poll_loop) regardless of whether any topic content changed -
+      channel_poll_loop) regardless of whether any topic content changed -
       head.json's own "updated_at" is ambiguous between "fine, nothing to
       publish" and "stopped running," this isn't.
     peer_liveness(peer_id) -> dict
@@ -94,7 +92,6 @@ Used API:
 
 from __future__ import annotations
 
-import asyncio
 import copy
 import hashlib
 import json
@@ -113,10 +110,6 @@ from typing import Any
 from .blob_store import blob_hex, referenced_blob_ids
 from .protocol import ProtocolNode, protocol_node_from_envelope
 from .session import Session, SessionResult
-from starlette.requests import Request
-from starlette.responses import JSONResponse
-from starlette.routing import Route
-
 from .relay_storage import LocalFolderRelayStorage, SftpRelayStorage, now_iso
 from .versions import CHANNEL_DESCRIPTOR_VERSION
 
@@ -808,7 +801,7 @@ class RelayLogic:
         for topic_uuid in self.relay_topic_uuids():
             # Reads under the shared session lock: a sibling connection's
             # poll_and_apply may be grafting a topic into the same tree
-            # concurrently (relay_tick now runs connections' I/O in parallel),
+            # concurrently (the channel poll tick runs connection I/O in parallel),
             # and an unlocked walk here could observe a half-grafted subtree
             # or a dict mutated mid-iteration.
             with self._session_lock:
@@ -1065,10 +1058,11 @@ class RelayLogic:
                 subtree = protocol_node_from_envelope(payload)
                 peer_copy = copy.deepcopy(subtree)
                 # Registering peer_topic_sets (not add_peer - see
-                # Session.note_relay_peer_topic) is what lets application
+                # Session.note_indirect_peer_topic) is what lets application
                 # reconciliation recognize this cache as discussing the topic.
                 with self._session_lock:
-                    self.session.note_relay_peer_topic(peer_addr, topic_uuid)
+                    self.session.note_indirect_peer_topic(peer_addr, topic_uuid)
+                    self.session.note_peer_channel(peer_addr, "mailbox")
                     if wants_graft:
                         # Applications own validation, mounting and defaults.
                         # Unknown types remain visible only as peer cache and
@@ -1864,78 +1858,3 @@ class RelayManager:
             if topic_uuid in conn._state.get("published", {}) or topic_uuid in conn._state.get("applied", {}):
                 return conn.delete_topic(topic_uuid)
         return self.primary.delete_topic(topic_uuid)
-
-
-def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
-    async def api_relay_status(request: Request):
-        # SFTP liveness checks are blocking and share the serialized storage
-        # connection with the relay poll worker. Never block the event loop.
-        payload = await asyncio.to_thread(logic.status_payload)
-        return JSONResponse(payload)
-
-    async def api_relay_delete_topic(request: Request):
-        data = await request.json()
-        result = logic.delete_topic(data.get("topic_uuid", ""))
-        if result.status != "ok":
-            return JSONResponse({"status": "error", "reason": result.reason}, status_code=400)
-        return JSONResponse({"status": "ok", "topic_uuid": result.value})
-
-    async def api_relay_blob_gc(request: Request):
-        return JSONResponse(await asyncio.to_thread(logic.blob_gc_report))
-
-    async def api_targets(request: Request):
-        if request.method == "GET":
-            return JSONResponse({"targets": logic.list_targets()})
-        data = await request.json()
-        target_id = str(data.get("target_id") or "").strip()
-        operation = logic.update_target if target_id else logic.create_target
-        args = (target_id, data, True) if target_id else (data, True)
-        result = await asyncio.to_thread(operation, *args)
-        if result.status != "ok":
-            return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
-        runtime.notify_change("relay-target")
-        return JSONResponse({"status": "ok", "target_id": result.value})
-
-    async def api_test_target(request: Request):
-        data = await request.json()
-        target_id = data.get("target_id", "")
-        result = await asyncio.to_thread(logic.test_target, target_id)
-        status = 200 if result.status == "ok" else 409
-        connection = logic.connection_for_target(target_id)
-        return JSONResponse(
-            {
-                "status": result.status,
-                "target_id": result.value,
-                "reason": result.reason,
-                "timing": connection.timing.status_payload() if connection else None,
-            },
-            status_code=status,
-        )
-
-    async def api_delete_target(request: Request):
-        data = await request.json()
-        result = logic.delete_target(data.get("target_id", ""))
-        if result.status != "ok":
-            return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
-        runtime.notify_change("relay-target")
-        return JSONResponse({"status": "ok", "target_id": result.value})
-
-    async def api_assign_topic(request: Request):
-        data = await request.json()
-        result = logic.assign_topic_target(
-            data.get("topic_uuid", ""), data.get("target_id") or None,
-        )
-        if result.status != "ok":
-            return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
-        runtime.notify_change("relay-target")
-        return JSONResponse({"status": "ok", "target_id": result.value})
-
-    return [
-        Route("/api/relay/status", api_relay_status),
-        Route("/api/relay/delete_topic", api_relay_delete_topic, methods=["POST"]),
-        Route("/api/relay/blob_gc", api_relay_blob_gc),
-        Route("/api/relay/targets", api_targets, methods=["GET", "POST"]),
-        Route("/api/relay/targets/test", api_test_target, methods=["POST"]),
-        Route("/api/relay/targets/delete", api_delete_target, methods=["POST"]),
-        Route("/api/relay/topics/assign", api_assign_topic, methods=["POST"]),
-    ]

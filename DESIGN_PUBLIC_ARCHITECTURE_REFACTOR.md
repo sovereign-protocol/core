@@ -783,6 +783,32 @@ No `/api/kanban/*` route serves a Core concept.
 
 Exit: host and apps contain no channel-specific selection branches.
 
+**Implemented 2026-07-19.**
+
+- `ChannelManager` now owns registration order, descriptor validation, token
+  composition/acceptance, reconnect replacement, selected-channel persistence,
+  effect routing, polling endpoints, status, blob lookup, and shutdown.
+- `DirectHttpChannel` and `MailboxChannel` implement the common lifecycle;
+  `EffectDeliveryChannel`, `PollingChannel`, and `PollingEndpoint` keep their
+  unequal I/O capabilities explicit.
+- Local-folder and SFTP descriptors remain mailbox provisioning variants on the
+  existing `0.x` wire. They are not presented as separate channels.
+- Mailbox HTTP routes moved from `relay_logic.py` to `mailbox_controller.py` and
+  now live below `/api/channels/mailbox`. Applications receive only
+  `ChannelManager`; private manager lookup through application config is gone.
+- The app-owned legacy `board_target` migration was removed in accordance with
+  P4. There is no deployed-data compatibility promise during `0.x`.
+- Network views obtain channel status and optional liveness from the manager.
+  The selected channel is persisted, preventing restarted peers from appearing
+  as "local."
+- Core blob forwarding now uses `X-Sovereign-Blob-Hop`; the former application-
+  named header is intentionally unsupported under P4.
+
+Verification: **421 tests passed**. Dedicated channel tests cover offer errors,
+unknown options, descriptor collisions, policy, fallback order, reconnect
+replacement, per-peer effect routing, polling capabilities, and concrete HTTP
+and mailbox adapters.
+
 ### R5 — separate controllers from application logic
 
 - Move Starlette imports and route factories out of Kanban, Personal Cockpit, and
@@ -828,10 +854,11 @@ Findings from the implementation reviews, recorded so they survive independently
 of any one conversation. Each is either closed by a phase or carries a target
 phase. Severity uses the review scale: Blocker / High / Medium / Low.
 
-### Closed by the R2/R3/R3a batch
+### Closed by the R2/R3/R3a/R4 batch
 
-Do not reopen these; they were verified fixed in commits `bb2924c`, `c02e1b7`,
-`05deeb9`.
+Do not reopen these; the earlier entries were verified in commits `bb2924c`,
+`c02e1b7`, and `05deeb9`; the R4 entries are covered by the 421-test record
+above.
 
 | ID | Finding | How it was closed |
 |---|---|---|
@@ -839,17 +866,17 @@ Do not reopen these; they were verified fixed in commits `bb2924c`, `c02e1b7`,
 | S2f | S1 runtime activation/deactivation had no implementation path (`unregister` never called) | `ApplicationHost.activate()/deactivate()`; deactivation calls `Session.unregister_application`, which unregisters the topic handler |
 | S4f | The mailbox channel hand-appended the identity topic, special-casing a node type | `relay_topic_uuids` now calls `Session.shared_topic_uuids(scoped)`; the channel names no node type |
 | D12 | Route namespacing and collision policy undefined | `ApplicationHost._validate_routes` enforces `api_prefix`/`asset_prefix` and rejects duplicate, cross-application, and Core-reserved collisions with named errors |
+| F1 | Applications read private channel services from host config | R4 injects only `ApplicationServices.channel_manager`; legacy `_relay_manager`/`_channel_manager` config lookup is removed and guarded by `test_package_layout.py` |
+| S3f | Protocol Explorer had no mailbox topic handler despite an overly broad lifecycle claim | A2 was narrowed explicitly: Protocol Explorer is a local/HTTP diagnostic; mailbox conformance belongs to real applications, beginning with S-Agreement |
 
 ### Open
 
 | ID | Sev | Finding | Evidence | Target |
 |---|---|---|---|---|
-| F1 | Medium | The unstructured service dict survives as a fallback. Applications now receive `relay_manager` through `ApplicationServices`, but still fall back to `config.get("_relay_manager")`, so any application can still reach into host configuration | `s_kanban/logic.py` (constructor default and `create_application`), `personal_cockpit/logic.py` (same two places) | R4/R6 — remove the fallback once ChannelManager owns construction; add a boundary test asserting no application reads `config["_*"]` |
 | F2 | Medium | The `>=3.10` floor is declared in all three distributions but never executed; the suite only ever runs on the development interpreter. Verified *plausible*: a search for `Self`, `tomllib`, `TaskGroup`, `ExceptionGroup`, `datetime.UTC`, `itertools.batched`, `@override` and `StrEnum` across shipped code found none — but plausible is not tested | all three `pyproject.toml` | CI — pull earlier than R8; drift accumulates silently and the first contributor on 3.10 discovers it |
 | F3 | Medium | R2's exit criterion is half-proven. `tests/test_package_layout.py` verifies the *editable* install (versions, asset resources, src roots, old flat modules unimportable). A clean install into an empty environment cannot be tested from inside that environment | R2 exit text vs `tests/test_package_layout.py` | R2 exit note or CI — add a subprocess venv smoke test, or mark the exit partial |
 | F4 | Low | Stale build artifacts hold superseded routes: an old `logic.py`/`kanban.html` still registering `/api/kanban/profile{,/avatar}`. Untracked and correctly ignored, so not a publication risk, but they pollute grep-based review and could be swept into a careless `sdist` | `applications/s-kanban/build/lib/` | Housekeeping — delete; consider a clean step before packaging |
 | F5 | Low | Personal Cockpit still imports Kanban internals directly. This is the accepted A4-deferred state, not a defect | `personal_cockpit/logic.py`, `from s_kanban.logic import KanbanLogic`; it consumes seven methods — `boards`, `cards`, `columns`, `users`, `user_profile`, `transition_events`, `transition_by_node`, which define the initial facade coverage | R8 — must become an optional, version-checked facade before repository separation |
-| S3f | Medium | Protocol Explorer registers no topic handler, so its topics are never published by the mailbox channel and an invited explorer topic is never mounted. A2 presents it as the diagnostic for "application lifecycle testing", which it therefore cannot exercise over the mailbox channel | `src/sovereign/protocol_explorer.py` registers nothing | R3/R4 — either register a generic explorer root type, or narrow A2's claim to HTTP-only inspection |
 | S-6 | Medium | `reconcile_peer_changes` walks events uuid-sorted rather than parents-first, so a brand-new container and its children can fail to adopt in one pass | `ARCHITECTURE_REVIEW.md` S-6; consequence documented inline in the Kanban auto-adopt eligibility comment | R7 — the Agreement proof must test three-level nested adoption (§10); if it fails, S-6 becomes R7 scope |
 
 ## 15. Verification matrix

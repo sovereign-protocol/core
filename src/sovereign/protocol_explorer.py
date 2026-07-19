@@ -58,7 +58,7 @@ class ManualLogic:
     def join_discussion(self, runtime, address: str,
                         topic_uuid: str | None = None,
                         topic_uuids: list[str] | None = None) -> dict:
-        return runtime.adapter.join_discussion(
+        return runtime.channel_manager.join_discussion(
             address,
             topic_uuid,
             topic_uuids,
@@ -130,7 +130,7 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
             if result.status != "ok":
                 return await _json_result(runtime, result)
             invite = await asyncio.to_thread(
-                runtime.adapter.invite_to_discuss,
+                runtime.channel_manager.invite_to_discuss,
                 data["address"].strip().rstrip("/"),
                 topic_uuid,
                 read_only=bool(data.get("read_only")),
@@ -215,7 +215,7 @@ async def _json_result(runtime, result: SessionResult) -> JSONResponse:
             status_code=409,
         )
     deliveries = await asyncio.to_thread(
-        runtime.adapter.execute_effects,
+        runtime.channel_manager.execute_effects,
         result.effects,
     )
     runtime.notify_change()

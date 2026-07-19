@@ -544,8 +544,8 @@ class Session:
         return SessionResult("ok", value=topic_uuid)
 
     @_session_locked
-    def note_relay_peer_topic(self, peer_addr: str, topic_uuid: str) -> None:
-        # Relay peers (peer_addr like "relay:<identity>") never go through
+    def note_indirect_peer_topic(self, peer_addr: str, topic_uuid: str) -> None:
+        # Indirect peers never go through
         # add_peer - that would also add them to self.members, which
         # pending_sync_effects/sync_effects iterate to decide who to push
         # real HTTP effects to, and a relay identity isn't HTTP-reachable at
@@ -601,7 +601,7 @@ class Session:
         # "member" here specifically means "a real, HTTP-reachable address
         # worth telling other peers about" - peer_topic_sets alone isn't
         # enough evidence of that. A relay pseudo-address (e.g. "relay:B")
-        # also lives in peer_topic_sets (note_relay_peer_topic - deliberate,
+        # also lives in peer_topic_sets (note_indirect_peer_topic - deliberate,
         # so kanban's auto-adopt/eligibility checks still recognize it) but
         # was never registered via add_peer specifically to keep it out of
         # self.members and everything self.members feeds (pending_sync_effects,
@@ -1731,7 +1731,7 @@ class Session:
         # stays true after teardown. Clearing it here would erase the very
         # evidence relay's redundancy check needs to keep suppressing this
         # address on later polls - the self-erasing-evidence flip-flop,
-        # one level up. Reconnect-replace (accept_connect_token) forgets
+        # one level up. Reconnect replacement in ChannelManager forgets
         # superseded addresses explicitly instead.
         self.peer_topic_sets.pop(peer_addr, None)
         self.peer_fetch_topic_sets.pop(peer_addr, None)

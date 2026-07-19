@@ -17,26 +17,7 @@ Offered API:
   create_runtime(port, config)
   build_app(runtime)
   main(argv=None)
-  collect_channel_descriptors(runtime) -> list[dict]
-    The configured Core relay descriptor, prepended by {"type": "http", ...}
-    unless the
-    config sets "offer_http_channel": false (which advertises relay-only
-    tokens, so an accepter can never race a direct connection alongside
-    relay - the http server still serves the local UI).
-    `relay_only: true` applies the same omission as a client-wide policy.
-  accept_connect_token(runtime, identity, topic_uuids, channels) -> dict
-    The negotiation step behind POST /api/connect. Exactly one channel is
-    ever selected: http is tried first (its join doubles as the
-    reachability probe), relay only as a fallback - the accepting side
-    decides, regardless of the order the token lists candidates in. A
-    relay-only client skips HTTP completely. An
-    unrecognized (type, version) is silently skipped, not an error. A
-    relay accepter with no storage of its own provisions it from the
-    token (see DESIGN_IDENTITY_AND_TRANSPORT.md §1.6). Accepting a token
-    for an already-known identity supersedes that peer's old address
-    rather than accumulating a second one. The http channel reuses the
-    exact same Core dispatch as /api/join_discussion.
-
+  Channel composition, acceptance, and exclusivity are owned by ChannelManager.
 Expected app module API:
   APPLICATION_MANIFEST: ApplicationManifest
   create_application(services: ApplicationServices) -> ApplicationInstance
@@ -68,7 +49,11 @@ from starlette.routing import Route
 
 from .protocol import ProtocolNode, UnsupportedProtocolVersion
 from .application import ApplicationServices
+from .channel import ChannelManager
 from .host import ApplicationHost
+from .http_channel import DirectHttpChannel
+from .mailbox_channel import MailboxChannel
+from .mailbox_controller import build_routes as build_mailbox_routes
 from .profile import CoreProfileService
 from .blob_store import (
     BlobStore, SAFE_IMAGE_MIMES, blob_hex, canonical_attachments,
@@ -77,10 +62,8 @@ from .blob_store import (
 from .session import Session, SessionEffect
 from .trace_log import TraceLogger
 from .transport import HttpTransportAdapter
-from .relay_logic import RelayManager, build_routes as build_relay_routes
+from .relay_logic import RelayManager
 from .versions import (
-    CHANNEL_DESCRIPTOR_VERSION,
-    CONNECT_TOKEN_VERSION,
     PROTOCOL_SCHEMA_VERSION,
     SESSION_ENVELOPE_FORMAT,
     SESSION_ENVELOPE_VERSION,
@@ -145,20 +128,18 @@ class AppRuntime:
     blob_store: BlobStore
     profile: CoreProfileService
     relay_manager: RelayManager
+    channel_manager: ChannelManager
+    http_channel: DirectHttpChannel
+    mailbox_channel: MailboxChannel
     host: ApplicationHost | None = None
     logic: Any = None
-    relay_wakeup: asyncio.Event | None = None
-    relay_loop: asyncio.AbstractEventLoop | None = None
+    channel_wakeup: asyncio.Event | None = None
+    channel_loop: asyncio.AbstractEventLoop | None = None
 
     def persist(self) -> None:
         storage_file = self.config.get("storage_file")
         if storage_file:
-            if self.relay_manager is not None:
-                # Target registry and board assignments live in app_metadata;
-                # snapshot them while the manager cannot mutate them.
-                with self.relay_manager._manager_lock:
-                    save_session_to_file(self.session, storage_file)
-            else:
+            with self.channel_manager.persistence_guard():
                 save_session_to_file(self.session, storage_file)
         # Grace time protects a new upload until its reference is committed.
         # Running after persisted mutations completes local GC automatically.
@@ -171,11 +152,11 @@ class AppRuntime:
         # push channel, by design.
         self.persist()
         # Local edits should publish immediately instead of waiting for the
-        # next poll timeout. Relay-originated persistence must not wake the
-        # loop recursively; that cycle already publishes its response.
-        if kind not in ("relay", "network") and self.relay_wakeup and self.relay_loop:
-            if self.relay_loop.is_running():
-                self.relay_loop.call_soon_threadsafe(self.relay_wakeup.set)
+        # next polling timeout. Channel-originated persistence must not wake
+        # the loop recursively; that cycle already publishes its response.
+        if kind not in ("channel", "network") and self.channel_wakeup and self.channel_loop:
+            if self.channel_loop.is_running():
+                self.channel_loop.call_soon_threadsafe(self.channel_wakeup.set)
 
     def collect_local_blobs(self) -> list[str]:
         with self.session.lock:
@@ -364,6 +345,7 @@ def _session_metadata(session: Session) -> dict:
         },
         "peer_status": dict(sorted(session.peer_status.items())),
         "peer_identity_key": dict(sorted(session.peer_identity_key.items())),
+        "peer_channel": dict(sorted(session.peer_channel.items())),
         "observed_topics": {
             addr: sorted(topics)
             for addr, topics in sorted(session.observed_topics.items())
@@ -381,6 +363,7 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
     session.peer_topic_sets.clear()
     session.peer_status.clear()
     session.peer_sync_state.clear()
+    session.peer_channel.clear()
     session.app_metadata = dict(metadata.get("app_metadata") or {})
     session.observed_topics = {
         addr: set(topics)
@@ -403,7 +386,7 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
     peer_topic_sets = metadata.get("peer_topic_sets") or {}
     peer_fetch_topic_sets = metadata.get("peer_fetch_topic_sets") or {}
     # Only peers that were actually real members before persisting (i.e.
-    # went through add_peer, not e.g. Session.note_relay_peer_topic) get
+    # went through add_peer, not e.g. Session.note_indirect_peer_topic) get
     # restored via add_peer_topics/set_peer_fetch_topics - those calls are
     # what repopulate session.members. A relay pseudo-address legitimately
     # has its own peer_topic_sets entry (by design - kanban's eligibility
@@ -442,6 +425,12 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
                 "last_seen": status.get("last_seen"),
                 "last_error": status.get("last_error"),
             }
+    known_peers = set(session.peer_topic_sets) | (session.members - {session.address})
+    session.peer_channel = {
+        addr: kind
+        for addr, kind in (metadata.get("peer_channel") or {}).items()
+        if addr in known_peers and kind in {"http", "mailbox"}
+    }
     # peer_sync_state is deliberately not persisted/restored: it exists only
     # to avoid re-sending a sync_status peers already have. peer_perspectives
     # (the actual cache it's tracking) isn't persisted either, so restoring a
@@ -484,6 +473,19 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         session.observed_topics.clear()
     adapter = HttpTransportAdapter(session, trace=trace)
     relay_manager = RelayManager(session, config, blob_store=blob_store)
+    channel_manager = ChannelManager(session)
+    http_channel = DirectHttpChannel(
+        address,
+        adapter,
+        offer_enabled=(
+            not config.get("relay_only", False)
+            and config.get("offer_http_channel", True)
+        ),
+        accept_enabled=not config.get("relay_only", False),
+    )
+    mailbox_channel = MailboxChannel(relay_manager)
+    channel_manager.register(http_channel)
+    channel_manager.register(mailbox_channel)
     runtime = AppRuntime(
         port=port,
         address=address,
@@ -493,13 +495,15 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         blob_store=blob_store,
         profile=CoreProfileService(session),
         relay_manager=relay_manager,
+        channel_manager=channel_manager,
+        http_channel=http_channel,
+        mailbox_channel=mailbox_channel,
     )
     services = ApplicationServices(
         session=session,
-        adapter=adapter,
+        channel_manager=channel_manager,
         blob_store=blob_store,
         trace=trace,
-        relay_manager=relay_manager,
         notify_change=runtime.notify_change,
         collect_local_blobs=runtime.collect_local_blobs,
     )
@@ -514,28 +518,6 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
     return runtime
 
 
-def collect_channel_descriptors(runtime: AppRuntime) -> list[dict]:
-    # Transitional descriptor collector until R4's ChannelManager. Application
-    # modules are never probed for channels.
-    channels = []
-    if (not runtime.config.get("relay_only", False)
-            and runtime.config.get("offer_http_channel", True)):
-        channels.append({
-            "type": "http",
-            "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
-            "address": runtime.address,
-        })
-    manager = _runtime_relay_manager(runtime)
-    descriptor = manager.channel_descriptor() if manager else None
-    if descriptor:
-        channels.append(descriptor)
-    return channels
-
-
-def _runtime_relay_manager(runtime):
-    return getattr(runtime, "relay_manager", None)
-
-
 def _dispatch_join_discussion(runtime: AppRuntime, address: str,
                               topic_uuid: str | None,
                               topic_uuids: list[str] | None) -> dict:
@@ -544,145 +526,9 @@ def _dispatch_join_discussion(runtime: AppRuntime, address: str,
     return runtime.adapter.join_discussion(address, topic_uuid, topic_uuids)
 
 
-def accept_connect_token(runtime: AppRuntime, identity: dict | None,
-                         topic_uuids: list[str], channels: list[dict]) -> dict:
-    # The negotiation step: exactly one channel is ever selected per peer,
-    # chosen by the accepting side regardless of what order the token lists
-    # candidates in (so the offering side can't influence the outcome) -
-    # http is tried first since the join call is itself the reachability
-    # probe (no separate probe needed), and relay is only attempted as a
-    # fallback if http wasn't offered, was disallowed by relay_only, was
-    # self-referential, or failed. No
-    # failure-detection/fallback state machine after this point (this only
-    # ever runs once, at accept time) - a channel that later stops working
-    # just stops delivering until the user reconnects with a fresh token.
-    http_channel = next(
-        (c for c in channels
-         if c.get("type") == "http"
-         and c.get("descriptor_version") == CHANNEL_DESCRIPTOR_VERSION),
-        None,
-    )
-    relay_channel = next(
-        (c for c in channels
-         if c.get("type") in ("relay", "sftp")
-         and c.get("descriptor_version") == CHANNEL_DESCRIPTOR_VERSION),
-        None,
-    )
-
-    results: dict[str, Any] = {}
-    errors: dict[str, str] = {}
-    selected_type: str | None = None
-    selected_addr: str | None = None
-
-    if http_channel and runtime.config.get("relay_only", False):
-        errors["http"] = "disabled by local relay-only policy"
-    elif http_channel:
-        address = str(http_channel.get("address") or "").strip().rstrip("/")
-        if address and address != runtime.address:
-            join_result = _dispatch_join_discussion(runtime, address, None, topic_uuids)
-            results["http"] = join_result
-            if join_result.get("status") == "ok":
-                selected_type, selected_addr = "http", address
-            else:
-                errors["http"] = join_result.get("reason") or "join failed"
-
-    if selected_type is None and relay_channel:
-        # Both file-mailbox backends (local folder, sftp) share the same
-        # "relay:<identity>" peer-address namespace and the same accept
-        # mechanism - they differ only in where the storage actually
-        # writes/reads bytes (relay_storage.py), not in how a token is
-        # accepted.
-        channel_type = relay_channel.get("type")
-        relay_manager = _runtime_relay_manager(runtime)
-        # accept_descriptor verifies the advertised storage, registers it as a
-        # target, provisions a connection from the token (DESIGN §1.6), and
-        # persists the desired topics + board assignments atomically. Absent a
-        # relay manager (relay not configured on this instance) the relay
-        # channel is simply unusable and we fall through to the error below.
-        relay_identity = str(relay_channel.get("identity") or "").strip()
-        inviter_identity_uuid = (
-            str(identity.get("uuid") or "").strip()
-            if isinstance(identity, dict) else ""
-        )
-        if not relay_identity:
-            errors[channel_type] = "relay descriptor missing identity"
-        elif not inviter_identity_uuid:
-            errors[channel_type] = "token missing inviter identity"
-        elif relay_manager:
-            try:
-                storage_result = relay_manager.accept_descriptor(
-                    relay_channel,
-                    topic_uuids,
-                    inviter_identity_uuid,
-                )
-            except Exception as exc:
-                errors[channel_type] = (
-                    f"relay unavailable: {type(exc).__name__}: {exc}"
-                )
-            else:
-                if storage_result.status != "ok":
-                    errors[channel_type] = storage_result.reason or "relay unavailable"
-                else:
-                    results[channel_type] = {"status": "ok", "reason": None}
-                    selected_type, selected_addr = channel_type, f"relay:{relay_identity}"
-
-    if not selected_type or not selected_addr:
-        detail = "; ".join(
-            f"{channel}: {reason}" for channel, reason in sorted(errors.items())
-        )
-        reason = "no usable channel in token"
-        if detail:
-            reason = f"{reason} ({detail})"
-        runtime.session.trace_event(
-            "transport.connect_token_rejected",
-            offered_channel_types=[
-                channel.get("type") for channel in channels
-                if isinstance(channel, dict)
-            ],
-            errors=errors,
-        )
-        return {"status": "error", "reason": reason, "errors": errors}
-
-    # Reconnect replacement: if this identity is already known under other
-    # addresses (e.g. a fresh token after their old one stopped working),
-    # those old registrations are superseded, not kept alongside the new
-    # one - "closed before initiating a new one."
-    #
-    # A relay pseudo-address (relay:<identity>) is a special case: it is
-    # never a *superseded* address (there's only ever one relay address
-    # per identity, so a later relay token reuses the same one), but a
-    # *concurrent* channel that relay's poll-loop redundancy check owns.
-    # So we still tear down its registration here (no stale duplicate at
-    # connect time), but must NOT forget its identity_key - that entry is
-    # exactly what _is_redundant_relay_peer reads to keep relay:<id>
-    # suppressed on every later poll, and relay's `applied` bookkeeping
-    # means the unchanged identity topic never re-applies to re-teach it.
-    # Forgetting it (as a real dead address legitimately is) reopened the
-    # duplicate for good - caught live when relay discovered the peer
-    # before the http connect completed.
-    identity_key = identity.get("data", {}).get("identity_key") if isinstance(identity, dict) else None
-    if identity_key:
-        for old_addr in runtime.session.addresses_for_identity(identity_key):
-            if old_addr != selected_addr:
-                runtime.session.remove_peer(old_addr)
-                if not old_addr.startswith("relay:"):
-                    runtime.session.peer_identity_key.pop(old_addr, None)
-
-    if isinstance(identity, dict):
-        runtime.session.apply_peer_identity_snapshot(selected_addr, identity)
-    runtime.session.note_peer_channel(selected_addr, selected_type)
-    runtime.session.trace_event(
-        "transport.connect_token_selected",
-        selected_type=selected_type,
-        selected_addr=selected_addr,
-    )
-
-    return {"status": "ok", "channels_used": [selected_type], "results": results}
-
-
 def build_core_routes(runtime: AppRuntime) -> list[Route]:
     def direct_http_disabled() -> JSONResponse | None:
-        if not runtime.config.get("relay_only", False):
+        if runtime.http_channel.accept_enabled:
             return None
         return JSONResponse(
             {
@@ -713,7 +559,10 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         return JSONResponse(runtime.session.export_protocol_root())
 
     async def api_network(request: Request):
-        return JSONResponse(runtime.session.get_network_info())
+        return JSONResponse(await asyncio.to_thread(
+            runtime.channel_manager.network_info,
+            include_channel_status=True,
+        ))
 
     async def profile_result(result) -> JSONResponse:
         if result.status != "ok":
@@ -721,7 +570,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
                 {"status": "error", "reason": result.reason}, status_code=409,
             )
         deliveries = await asyncio.to_thread(
-            runtime.adapter.execute_effects, result.effects,
+            runtime.channel_manager.execute_effects, result.effects,
         )
         runtime.notify_change("profile")
         payload = {"status": "ok", **runtime.profile.view()}
@@ -780,8 +629,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         try:
             data = await request.json()
             result = await asyncio.to_thread(
-                _dispatch_join_discussion,
-                runtime,
+                runtime.channel_manager.join_discussion,
                 data["address"].strip().rstrip("/"),
                 data.get("topic_uuid"),
                 data.get("topic_uuids"),
@@ -797,13 +645,8 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             )
 
     async def api_connect_token(request: Request):
-        # A token is composed explicitly (POST) from a set of topics and an
-        # optional relay target. With a target, the token carries that
-        # target's relay descriptor and assigning the topics to it arms the
-        # relay loop (assignment replaced the old mark_topics_shared trigger).
-        # Without a target it is an HTTP-only token for a direct peer
-        # connection (e.g. on a LAN) that never touches a relay.
-        manager = _runtime_relay_manager(runtime)
+        # ChannelManager composes every locally offered channel descriptor;
+        # channel-specific options are passed through without server branches.
         data = await request.json()
         topic_uuids = sorted({
             str(value).strip()
@@ -815,71 +658,32 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
                 {"status": "error", "reason": "choose at least one topic"},
                 status_code=400,
             )
-        target_id = str(data.get("target_id") or "")
-        channels = []
-        if (not runtime.config.get("relay_only", False)
-                and runtime.config.get("offer_http_channel", True)):
-            channels.append({
-                "type": "http",
-                "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
-                "address": runtime.address,
-            })
-        if target_id:
-            if not manager:
-                return JSONResponse(
-                    {"status": "error", "reason": "relay manager is not available"},
-                    status_code=409,
-                )
-            descriptor = manager.target_descriptor(target_id)
-            if not descriptor:
-                return JSONResponse(
-                    {"status": "error", "reason": "relay target not found"},
-                    status_code=404,
-                )
-            # Validate and assign the complete topic selection as one
-            # operation; a bad UUID must not partially reassign earlier
-            # topics before the request fails.
-            result = manager.assign_topics_target(topic_uuids, target_id)
-            if result.status != "ok":
-                return JSONResponse(
-                    {"status": "error", "reason": result.reason}, status_code=409,
-                )
-            channels.append(descriptor)
-        if not channels:
+        channel_options = data.get("channel_options") or {}
+        result = runtime.channel_manager.compose_token(
+            topic_uuids, channel_options,
+        )
+        if not result.ok:
             return JSONResponse(
-                {"status": "error", "reason": "no channel available - assign a relay target"},
-                status_code=409,
+                {"status": "error", "reason": result.reason},
+                status_code=result.status_code,
             )
         runtime.notify_change("connect-token")
-        identity = runtime.session.identity
-        return JSONResponse({
-            "token_version": CONNECT_TOKEN_VERSION,
-            "identity": identity.to_dict(),
-            "topic_uuids": sorted({*topic_uuids, identity.uuid}),
-            "channels": channels,
-        })
+        return JSONResponse(result.value)
 
     async def api_connect(request: Request):
         try:
             data = await request.json()
             token = data.get("token") or {}
-            if (not isinstance(token, dict)
-                    or token.get("token_version") != CONNECT_TOKEN_VERSION):
-                return JSONResponse(
-                    {"status": "error", "reason": "unrecognized token version"},
-                    status_code=400,
-                )
-            result = await asyncio.to_thread(
-                accept_connect_token,
-                runtime,
-                token.get("identity"),
-                token.get("topic_uuids") or [],
-                token.get("channels") or [],
+            accepted = await asyncio.to_thread(
+                runtime.channel_manager.accept_token, token,
             )
-            if result.get("status") == "ok":
+            if accepted.ok:
                 runtime.notify_change()
-                return JSONResponse(result)
-            return JSONResponse(result, status_code=409)
+                return JSONResponse(accepted.value)
+            payload = {"status": "error", "reason": accepted.reason}
+            if isinstance(accepted.value, dict):
+                payload.update(accepted.value)
+            return JSONResponse(payload, status_code=accepted.status_code)
         except Exception as exc:
             return JSONResponse(
                 {"status": "error", "reason": str(exc)},
@@ -897,7 +701,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         try:
             data = await request.json()
             result = await asyncio.to_thread(
-                runtime.adapter.observe_topic,
+                runtime.channel_manager.observe_topic,
                 data["address"].strip().rstrip("/"),
                 data.get("topic_uuid"),
                 data.get("topic_uuids"),
@@ -936,7 +740,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         try:
             data = await request.json()
             result = await asyncio.to_thread(
-                runtime.adapter.invite_to_discuss,
+                runtime.channel_manager.invite_to_discuss,
                 data["address"].strip().rstrip("/"),
                 data.get("topic_uuid"),
                 data.get("topic_uuids"),
@@ -958,9 +762,9 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             data = {}
         topic_uuid = data.get("topic_uuid")
         if topic_uuid:
-            await asyncio.to_thread(runtime.adapter.leave_topic, topic_uuid)
+            await asyncio.to_thread(runtime.channel_manager.leave_topic, topic_uuid)
         else:
-            await asyncio.to_thread(runtime.adapter.leave_discussion)
+            await asyncio.to_thread(runtime.channel_manager.leave)
         runtime.notify_change()
         return JSONResponse({"status": "ok"})
 
@@ -969,7 +773,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             return denied
         payload = await request.json()
         response, status = await asyncio.to_thread(
-            runtime.adapter.p2p_sync_status,
+            runtime.http_channel.adapter.p2p_sync_status,
             payload,
         )
         if status == 200:
@@ -982,7 +786,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             return denied
         payload = await request.json()
         response, status = await asyncio.to_thread(
-            runtime.adapter.p2p_join,
+            runtime.http_channel.adapter.p2p_join,
             payload,
         )
         if status == 200:
@@ -995,7 +799,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             return denied
         payload = await request.json()
         response, status = await asyncio.to_thread(
-            runtime.adapter.p2p_announce,
+            runtime.http_channel.adapter.p2p_announce,
             payload,
         )
         if status == 200:
@@ -1006,7 +810,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
     async def p2p_leave(request: Request):
         payload = await request.json()
         response, status = await asyncio.to_thread(
-            runtime.adapter.p2p_leave,
+            runtime.http_channel.adapter.p2p_leave,
             payload,
         )
         if status == 200:
@@ -1016,7 +820,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
     async def p2p_subtree(request: Request):
         if denied := direct_http_disabled():
             return denied
-        response, status = runtime.adapter.p2p_subtree(
+        response, status = runtime.http_channel.adapter.p2p_subtree(
             request.path_params["uuid"]
         )
         return JSONResponse(response, status_code=status)
@@ -1068,30 +872,11 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         local = runtime.blob_store.read_blob(blob_id)
         if local is not None:
             return local
-        manager = _runtime_relay_manager(runtime)
-        if manager is not None:
-            fetched = manager.read_blob(blob_id)
-            if fetched is not None:
-                runtime.blob_store.write_blob(fetched)
-                return fetched
-        if not allow_peer_fetch:
-            return None
-        import requests
-        for peer in sorted(runtime.session.members - {runtime.session.address}):
-            if not peer.startswith(("http://", "https://")):
-                continue
-            try:
-                response = requests.get(
-                    f"{peer.rstrip('/')}/api/blob/{blob_id}",
-                    headers={"X-S-Kanban-Blob-Hop": "1"}, timeout=10,
-                )
-                if response.status_code != 200:
-                    continue
-                if runtime.blob_store.write_blob(response.content) != blob_id:
-                    continue
-                return response.content
-            except Exception:
-                continue
+        fetched = runtime.channel_manager.read_blob(
+            blob_id, allow_remote=allow_peer_fetch,
+        )
+        if fetched is not None and runtime.blob_store.write_blob(fetched) == blob_id:
+            return fetched
         return None
 
     async def api_blob_get(request: Request):
@@ -1105,7 +890,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         data = await asyncio.to_thread(
             resolve_blob,
             blob_id,
-            request.headers.get("x-s-kanban-blob-hop") != "1",
+            request.headers.get("x-sovereign-blob-hop") != "1",
         )
         if data is None:
             return JSONResponse(
@@ -1182,7 +967,7 @@ async def refresh_shared_peer_topics(runtime: AppRuntime) -> None:
                 {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
             ))
     if effects:
-        await asyncio.to_thread(runtime.adapter.execute_effects, effects)
+        await asyncio.to_thread(runtime.channel_manager.execute_effects, effects)
 
 
 def build_app(runtime: AppRuntime) -> Starlette:
@@ -1190,36 +975,35 @@ def build_app(runtime: AppRuntime) -> Starlette:
     async def lifespan(app: Starlette):
         sync_task = asyncio.create_task(peer_sync_loop(runtime))
         observer_task = asyncio.create_task(observer_sync_loop(runtime))
-        relay_task = asyncio.create_task(relay_poll_loop(runtime))
+        channel_task = asyncio.create_task(channel_poll_loop(runtime))
         blob_gc_task = asyncio.create_task(local_blob_gc_loop(runtime))
         try:
             yield
         finally:
             sync_task.cancel()
             observer_task.cancel()
-            relay_task.cancel()
+            channel_task.cancel()
             blob_gc_task.cancel()
-            for task in (sync_task, observer_task, relay_task, blob_gc_task):
+            for task in (sync_task, observer_task, channel_task, blob_gc_task):
                 try:
                     await task
                 except asyncio.CancelledError:
                     pass
             if runtime.host:
                 runtime.host.close()
+            runtime.channel_manager.close()
             runtime.persist()
 
     core_routes = build_core_routes(runtime)
-    relay_routes = build_relay_routes(
-        runtime.relay_manager, runtime, runtime.config,
-    )
+    mailbox_routes = build_mailbox_routes(runtime.mailbox_channel, runtime)
     application_routes = runtime.host.controller_routes() if runtime.host else []
     app = Starlette(
         debug=bool(runtime.config.get("debug", True)),
-        routes=core_routes + relay_routes + application_routes,
+        routes=core_routes + mailbox_routes + application_routes,
         lifespan=lifespan,
     )
     if runtime.host:
-        runtime.host.bind_starlette(app, [*core_routes, *relay_routes])
+        runtime.host.bind_starlette(app, [*core_routes, *mailbox_routes])
     return app
 
 
@@ -1230,7 +1014,9 @@ async def peer_sync_loop(runtime: AppRuntime) -> None:
         effects = runtime.session.pending_sync_effects()
         if not effects:
             continue
-        deliveries = await asyncio.to_thread(runtime.adapter.execute_effects, effects)
+        deliveries = await asyncio.to_thread(
+            runtime.channel_manager.execute_effects, effects,
+        )
         if any(delivery.ok for delivery in deliveries):
             await drain_peer_update_hook(runtime)
             runtime.notify_change("network")
@@ -1256,32 +1042,30 @@ async def observer_sync_loop(runtime: AppRuntime) -> None:
         changed = False
         for peer_addr, topic_uuid in pairs:
             result = await asyncio.to_thread(
-                runtime.adapter.observe_topic, peer_addr, topic_uuid,
+                runtime.channel_manager.observe_topic, peer_addr, topic_uuid,
             )
             changed = changed or result.get("status") == "ok"
         if changed:
             runtime.notify_change("network")
 
 
-async def relay_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
-    # One relay cycle: presence + publish + poll, then - crucially - the
+async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
+    # One polling-channel cycle: presence + publish + poll, then - crucially - the
     # app's adoption hook. Without that drain, relay-applied peer content
     # only ever reached the cache; adoption ran solely from UI polls and
     # http p2p endpoints, so a headless relay-only session synced content
     # it never adopted (and never republished merged). Factored out of the
     # loop so this behavior is testable without spinning the loop.
-    manager = _runtime_relay_manager(runtime)
-    if manager is None:
-        return False
+    endpoints = runtime.channel_manager.polling_endpoints()
     changed = False
     # A client can run several relay connections at once. Their network I/O
     # is independent and must be concurrent: one old or slow target must not
     # postpone every other target. RelayManager gives the connections a
     # shared lock around the brief Session mutation sections.
     now = time.monotonic()
-    next_due = runtime.config.setdefault("_relay_next_due", {})
+    next_due = runtime.config.setdefault("_channel_next_due", {})
     due_connections = []
-    for relay in manager.all_connections():
+    for relay in endpoints:
         connection_key = id(relay)
         scheduled_for = next_due.get(connection_key)
         was_due = scheduled_for is None or now >= scheduled_for
@@ -1304,7 +1088,7 @@ async def relay_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
             published_before = await asyncio.to_thread(relay.publish_due_topics)
             applied = await asyncio.to_thread(relay.poll_and_apply)
         except Exception as exc:
-            print(f"[relay] sync failed: {exc}", flush=True)
+            print(f"[channel] sync failed: {exc}", flush=True)
             return relay, [], [], False, time.monotonic() - cycle_started
         duration = time.monotonic() - cycle_started
         return relay, published_before, applied, True, duration
@@ -1329,7 +1113,7 @@ async def relay_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
             published = await asyncio.to_thread(relay.publish_due_topics) if applied else []
             return published, time.monotonic() - started
         except Exception as exc:
-            print(f"[relay] response publish failed: {exc}", flush=True)
+            print(f"[channel] response publish failed: {exc}", flush=True)
             return [], time.monotonic() - started
 
     response_results = await asyncio.gather(*(
@@ -1367,21 +1151,19 @@ async def relay_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
         if published_before or published_after or applied:
             changed = True
     if changed:
-        runtime.notify_change("relay")
+        runtime.notify_change("channel")
     return changed
 
 
-async def relay_poll_loop(runtime: AppRuntime) -> None:
-    # RelayManager is always a Core service. With no configured or accepted
-    # target it has no active relationship, so this loop remains idle without
-    # relying on application discovery or a private config handle.
-    runtime.relay_loop = asyncio.get_running_loop()
-    runtime.relay_wakeup = asyncio.Event()
+async def channel_poll_loop(runtime: AppRuntime) -> None:
+    # Polling channels are always Core services. With no active relationship,
+    # this loop remains idle without relying on application discovery.
+    runtime.channel_loop = asyncio.get_running_loop()
+    runtime.channel_wakeup = asyncio.Event()
     while True:
-        manager = _runtime_relay_manager(runtime)
-        connections = manager.all_connections() if manager else []
+        connections = runtime.channel_manager.polling_endpoints()
         now = time.monotonic()
-        next_due = runtime.config.setdefault("_relay_next_due", {})
+        next_due = runtime.config.setdefault("_channel_next_due", {})
         delays = [
             next_due.get(id(relay), now) - now
             for relay in connections if relay.has_active_relationship()
@@ -1392,13 +1174,13 @@ async def relay_poll_loop(runtime: AppRuntime) -> None:
         woke_for_change = False
         try:
             await asyncio.wait_for(
-                runtime.relay_wakeup.wait(), timeout=max(0.05, interval),
+                runtime.channel_wakeup.wait(), timeout=max(0.05, interval),
             )
             woke_for_change = True
-            runtime.relay_wakeup.clear()
+            runtime.channel_wakeup.clear()
         except asyncio.TimeoutError:
             pass
-        await relay_tick(runtime, due_only=not woke_for_change)
+        await channel_poll_tick(runtime, due_only=not woke_for_change)
 
 
 def main(argv: list[str] | None = None) -> None:

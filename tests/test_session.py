@@ -21,7 +21,7 @@ class SessionTests(unittest.TestCase):
 
     def test_topic_members_excludes_relay_pseudo_addresses(self):
         # Regression, found live: a relay pseudo-address (e.g. "relay:B")
-        # lives in peer_topic_sets (Session.note_relay_peer_topic -
+        # lives in peer_topic_sets (Session.note_indirect_peer_topic -
         # deliberate, so kanban's eligibility checks recognize it) but is
         # never registered via add_peer, specifically to keep it out of
         # self.members. topic_members used to union in peer_topic_sets
@@ -34,7 +34,7 @@ class SessionTests(unittest.TestCase):
         session = Session("si-a")
         topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
         session.start_discussion(topic.uuid)
-        session.note_relay_peer_topic("relay:B", topic.uuid)
+        session.note_indirect_peer_topic("relay:B", topic.uuid)
         session.add_peer("si-c", topic.uuid)
 
         members = session.topic_members(topic.uuid)

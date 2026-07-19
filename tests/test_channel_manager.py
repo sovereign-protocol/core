@@ -1,0 +1,239 @@
+import unittest
+
+from sovereign.channel import (
+    ChannelAcceptance,
+    ChannelManager,
+    ChannelResult,
+    Invitation,
+)
+from sovereign.http_channel import DirectHttpChannel
+from sovereign.mailbox_channel import MailboxChannel
+from sovereign.session import Session, SessionEffect
+from sovereign.versions import CHANNEL_DESCRIPTOR_VERSION
+
+
+class _Channel:
+    def __init__(self, kind, descriptor_type, *, offered=None, accept=None):
+        self.kind = kind
+        self.descriptor_types = frozenset({descriptor_type})
+        self.offered = offered
+        self.accept_result = accept
+        self.accepted = []
+        self.closed = False
+
+    def offer_descriptor(self, topics, options):
+        if options.get("fail"):
+            return ChannelResult.error("offer failed")
+        return ChannelResult.success(self.offered)
+
+    def accept_descriptor(self, descriptor, invitation):
+        self.accepted.append((descriptor, invitation))
+        return self.accept_result or ChannelResult.error("unavailable")
+
+    def attach_topics(self, topics, options=None):
+        return ChannelResult.success()
+
+    def detach_topics(self, topics):
+        return ChannelResult.success()
+
+    def status(self):
+        return {"kind": self.kind}
+
+    def close(self):
+        self.closed = True
+
+
+class _DeliveryChannel(_Channel):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.delivered = []
+
+    def execute_effect(self, effect):
+        return ("one", effect)
+
+    def execute_effects(self, effects):
+        self.delivered.extend(effects)
+        return [("many", item) for item in effects]
+
+
+class _PollingChannel(_Channel):
+    def polling_endpoints(self):
+        return ["poller"]
+
+
+class ChannelManagerTests(unittest.TestCase):
+    def test_compose_token_uses_registered_offers_and_identity(self):
+        session = Session("http://a")
+        manager = ChannelManager(session)
+        manager.register(_Channel("http", "http", offered={
+            "type": "http", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
+            "address": "http://a",
+        }))
+        manager.register(_Channel("mailbox", "relay"))
+
+        result = manager.compose_token(["topic-1"])
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            result.value["topic_uuids"],
+            sorted(["topic-1", session.identity.uuid]),
+        )
+        self.assertEqual([item["type"] for item in result.value["channels"]], ["http"])
+
+    def test_explicit_channel_offer_error_is_not_silently_ignored(self):
+        manager = ChannelManager(Session("http://a"))
+        manager.register(_Channel("mailbox", "relay"))
+
+        result = manager.compose_token(
+            ["topic-1"], {"mailbox": {"fail": True}},
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "offer failed")
+
+    def test_compose_token_rejects_unknown_channel_option(self):
+        manager = ChannelManager(Session("http://a"))
+        manager.register(_Channel("http", "http"))
+
+        result = manager.compose_token(
+            ["topic-1"], {"htpt": {"enabled": True}},
+        )
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.status_code, 400)
+
+    def test_accept_uses_registration_order_and_falls_back(self):
+        session = Session("http://a")
+        peer = Session("http://b")
+        manager = ChannelManager(session)
+        direct = _Channel("http", "http", accept=ChannelResult.error("offline"))
+        mailbox = _Channel("mailbox", "relay", accept=ChannelResult.success(
+            ChannelAcceptance("relay:B", {"status": "ok"}),
+        ))
+        manager.register(direct)
+        manager.register(mailbox)
+
+        result = manager.accept_invitation(
+            peer.identity.to_dict(), ["topic-1"], [
+                {"type": "relay", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION},
+                {"type": "http", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION},
+            ],
+        )
+
+        self.assertTrue(result.ok)
+        self.assertEqual(result.value["channels_used"], ["mailbox"])
+        self.assertEqual(session.peer_channel["relay:B"], "mailbox")
+        self.assertEqual(len(direct.accepted), 1)
+        self.assertEqual(len(mailbox.accepted), 1)
+
+    def test_accept_replaces_prior_address_for_same_identity(self):
+        session = Session("http://a")
+        peer = Session("http://b-old")
+        identity = peer.identity.to_dict()
+        session.add_peer("http://b-old", "topic-1")
+        session.apply_peer_identity_snapshot("http://b-old", identity)
+        manager = ChannelManager(session)
+        manager.register(_Channel("http", "http", accept=ChannelResult.success(
+            ChannelAcceptance("http://b-new", {"status": "ok"}),
+        )))
+
+        result = manager.accept_invitation(identity, ["topic-1"], [{
+            "type": "http", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
+        }])
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("http://b-old", session.members)
+        self.assertEqual(session.peer_channel["http://b-new"], "http")
+
+    def test_rejects_descriptor_collision(self):
+        manager = ChannelManager(Session("http://a"))
+        manager.register(_Channel("first", "same"))
+        with self.assertRaisesRegex(ValueError, "already handled"):
+            manager.register(_Channel("second", "same"))
+
+    def test_capabilities_route_effects_and_polling(self):
+        manager = ChannelManager(Session("http://a"))
+        manager.register(_DeliveryChannel("http", "http"))
+        manager.register(_PollingChannel("mailbox", "relay"))
+
+        self.assertEqual(manager.execute_effects(["x"]), [("many", "x")])
+        self.assertEqual(manager.polling_endpoints(), ["poller"])
+
+        manager.close()
+        self.assertTrue(all(channel.closed for channel in manager.channels()))
+
+    def test_effects_route_through_the_channel_selected_for_each_peer(self):
+        session = Session("http://a")
+        direct = _DeliveryChannel("http", "http")
+        alternate = _DeliveryChannel("alternate", "alternate")
+        manager = ChannelManager(session)
+        manager.register(direct)
+        manager.register(alternate)
+        session.note_peer_channel("peer-b", "http")
+        session.note_peer_channel("peer-c", "alternate")
+        effects = [
+            SessionEffect("pull_subtree", "peer-c", {}),
+            SessionEffect("pull_subtree", "peer-b", {}),
+        ]
+
+        deliveries = manager.execute_effects(effects)
+
+        self.assertEqual(alternate.delivered, [effects[0]])
+        self.assertEqual(direct.delivered, [effects[1]])
+        self.assertEqual([item[1] for item in deliveries], effects)
+
+    def test_direct_channel_enforces_policy_and_preserves_read_only_invite(self):
+        class Adapter:
+            def __init__(self):
+                self.invites = []
+
+            def invite_to_discuss(self, *args, **kwargs):
+                self.invites.append((args, kwargs))
+                return {"status": "ok"}
+
+        adapter = Adapter()
+        disabled = DirectHttpChannel(
+            "http://a", adapter, offer_enabled=False, accept_enabled=False,
+        )
+        self.assertIsNone(disabled.offer_descriptor(("topic",), {}).value)
+        rejected = disabled.accept_descriptor(
+            {"address": "http://b"}, Invitation(None, ("topic",)),
+        )
+        self.assertFalse(rejected.ok)
+
+        direct = DirectHttpChannel("http://a", adapter)
+        direct.invite_to_discuss("http://b", "topic", read_only=True)
+        self.assertEqual(adapter.invites[0][1], {"read_only": True})
+
+    def test_mailbox_channel_assigns_offer_and_accepts_with_inviter_identity(self):
+        class Manager:
+            def __init__(self):
+                self.assignments = []
+                self.accepted = []
+
+            def target_descriptor(self, target_id):
+                return {"type": "relay", "identity": "A", "target_id": target_id}
+
+            def assign_topics_target(self, topics, target_id):
+                self.assignments.append((topics, target_id))
+                return type("Result", (), {"status": "ok", "value": target_id})()
+
+            def accept_descriptor(self, descriptor, topics, inviter_uuid):
+                self.accepted.append((descriptor, topics, inviter_uuid))
+                return type("Result", (), {"status": "ok", "value": "target"})()
+
+        manager = Manager()
+        channel = MailboxChannel(manager)
+        offered = channel.offer_descriptor(("topic",), {"target_id": "target"})
+        self.assertTrue(offered.ok)
+        self.assertEqual(manager.assignments, [(["topic"], "target")])
+
+        invitation = Invitation({"uuid": "inviter"}, ("topic",))
+        accepted = channel.accept_descriptor(offered.value, invitation)
+        self.assertTrue(accepted.ok)
+        self.assertEqual(accepted.value.peer_addr, "relay:A")
+        self.assertEqual(manager.accepted[0][2], "inviter")
+
+
+if __name__ == "__main__":
+    unittest.main()

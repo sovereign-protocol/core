@@ -5,9 +5,12 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping
 
 from .topic_registry import ApplicationRegistration
+
+if TYPE_CHECKING:
+    from .channel import ChannelManager
 
 
 _APPLICATION_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
@@ -48,10 +51,9 @@ class ApplicationServices:
     """Typed, read-only services supplied to one active application."""
 
     session: Any
-    adapter: Any
+    channel_manager: "ChannelManager"
     blob_store: Any
     trace: Any
-    relay_manager: Any
     notify_change: Callable[[str], None]
     collect_local_blobs: Callable[[], list[str]]
     settings: Mapping[str, Any] = MappingProxyType({})
