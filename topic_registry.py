@@ -1,0 +1,98 @@
+"""Application-neutral registry for shared protocol topic roots.
+
+Applications register the root node types they own, how to enumerate their
+local topics, and how an invited topic is mounted into the local tree. Channel
+implementations consume only this contract and never import an application.
+"""
+
+from __future__ import annotations
+
+import threading
+from dataclasses import dataclass
+from typing import Any, Callable, Iterable
+
+from protocol import PRSPNode
+
+
+@dataclass(frozen=True)
+class SharedTopicHandler:
+    owner: str
+    root_types: frozenset[str]
+    list_topics: Callable[[], Iterable[str | PRSPNode]]
+    accept_invitation: Callable[[PRSPNode], Any]
+
+
+class SharedTopicRegistry:
+    """Runtime-only application topic handlers for one Session."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._handlers_by_owner: dict[str, SharedTopicHandler] = {}
+        self._owner_by_root_type: dict[str, str] = {}
+
+    def register(
+        self,
+        owner: str,
+        root_types: Iterable[str],
+        list_topics: Callable[[], Iterable[str | PRSPNode]],
+        accept_invitation: Callable[[PRSPNode], Any],
+    ) -> None:
+        owner = str(owner or "").strip()
+        normalized_types = frozenset(
+            str(value).strip() for value in root_types if str(value).strip()
+        )
+        if not owner or not normalized_types:
+            raise ValueError("shared topic handler requires owner and root types")
+        with self._lock:
+            conflicts = {
+                root_type: current_owner
+                for root_type in normalized_types
+                if (current_owner := self._owner_by_root_type.get(root_type))
+                and current_owner != owner
+            }
+            if conflicts:
+                root_type, current_owner = next(iter(conflicts.items()))
+                raise ValueError(
+                    f"topic type {root_type!r} is already handled by {current_owner!r}"
+                )
+            self.unregister(owner)
+            handler = SharedTopicHandler(
+                owner, normalized_types, list_topics, accept_invitation,
+            )
+            self._handlers_by_owner[owner] = handler
+            for root_type in normalized_types:
+                self._owner_by_root_type[root_type] = owner
+
+    def unregister(self, owner: str) -> None:
+        with self._lock:
+            handler = self._handlers_by_owner.pop(owner, None)
+            if not handler:
+                return
+            for root_type in handler.root_types:
+                if self._owner_by_root_type.get(root_type) == owner:
+                    self._owner_by_root_type.pop(root_type, None)
+
+    def handler_for(self, node: PRSPNode | None) -> SharedTopicHandler | None:
+        root_type = str((node.data if node else {}).get("type") or "")
+        with self._lock:
+            owner = self._owner_by_root_type.get(root_type)
+            return self._handlers_by_owner.get(owner) if owner else None
+
+    def supports(self, node: PRSPNode | None) -> bool:
+        return self.handler_for(node) is not None
+
+    def local_topic_uuids(self) -> list[str]:
+        with self._lock:
+            handlers = list(self._handlers_by_owner.values())
+        found = set()
+        for handler in handlers:
+            for item in handler.list_topics() or []:
+                topic_uuid = item.uuid if isinstance(item, PRSPNode) else str(item or "")
+                if topic_uuid:
+                    found.add(topic_uuid)
+        return sorted(found)
+
+    def accept_invited_topic(self, tree: PRSPNode):
+        handler = self.handler_for(tree)
+        return handler.accept_invitation(tree) if handler else None
+

@@ -4,7 +4,7 @@ File-mailbox relay sync.
 Functionality:
   Store-and-forward sync for peers who are never online at the same time,
   and/or not directly reachable (no inbound NAT traversal needed). Each peer
-  identity publishes its current view of every board it has into a shared
+  identity publishes its current view of every registered application topic into a shared
   storage location (see relay_storage.py - a local folder or a remote SFTP
   server, selected via config), and periodically polls every other known
   identity's published view, applying whatever changed through the
@@ -29,12 +29,12 @@ Functionality:
   identically to a real HTTP peer. It never adopts, judges, or merges on its
   own account - it is pure store-and-forward.
 
-  board_uuid IS topic_uuid (kanban_logic.py's boards are topic roots
-  directly), so every board this session has is *published* automatically -
-  no separate topic allow-list to keep in sync. *Polling*, by contrast, is
+  Applications register their topic root types, local-topic enumerator and
+  invitation handler with Session.shared_topics. Relay publishes those roots
+  without importing application code. *Polling*, by contrast, is
   driven by whatever topics actually exist in the relay storage, not by
-  this session's own board list - otherwise a peer who's never seen a given
-  board before could never learn about it this way, which would defeat the
+  this session's own topic list - otherwise a peer who's never seen a given
+  topic before could never learn about it this way, which would defeat the
   point of a standalone (no prior direct P2P join) relay path.
 
   Bookkeeping (which hash we last published/applied per topic/peer) is
@@ -56,16 +56,16 @@ Offered API:
     channel_descriptor() -> dict | None
     mark_topics_desired(topic_uuids) -> SessionResult
       Records topic_uuids as "desired" - the consent step that lets
-      poll_and_apply graft a not-yet-locally-known board into our own board
+      poll_and_apply graft a not-yet-locally-known topic into our own tree
       list the first time it shows up in the relay, instead of merely
       caching it as an (invisible, unowned) peer perspective forever. This
-      is how two peers can share a board via relay alone, with no live HTTP
+      is how two peers can share a topic via relay alone, with no live HTTP
       join ever required - called by the unified /api/connect accept flow
       (app_server.py) once it decides the relay channel is usable, same as
       the HTTP channel's own accept path is called for the http channel.
     delete_topic(topic_uuid) -> SessionResult
       Storage/bookkeeping cleanup only (POST /api/relay/delete_topic) -
-      never touches a peer's own already-adopted local board, if any.
+      never touches a peer's own already-adopted local topic, if any.
     write_presence() -> None
       Heartbeat, called once per poll tick (app_server.py's
       relay_poll_loop) regardless of whether any topic content changed -
@@ -85,8 +85,8 @@ Offered API:
       Peers we've actually applied something from, per our own bookkeeping.
 
 Used API:
-  kanban_logic.KanbanLogic (boards/user_profile only), protocol.PRSPNode,
-  session.Session, relay_storage.LocalFolderRelayStorage,
+  protocol.PRSPNode, session.Session and its shared-topic registry,
+  relay_storage.LocalFolderRelayStorage,
   relay_storage.SftpRelayStorage.
 """
 
@@ -109,7 +109,6 @@ from pathlib import Path
 from typing import Any
 
 from blob_store import blob_hex, referenced_blob_ids
-from kanban_logic import KANBAN_APP_NAME, KanbanLogic
 from protocol import PRSPNode
 from session import Session, SessionResult
 from starlette.requests import Request
@@ -335,7 +334,6 @@ class RelayLogic:
         self.session = session
         self._io_lock = threading.RLock()
         self._session_lock = session.lock
-        self.kanban = KanbanLogic(session, config)
         self.blob_store = config.get("_blob_store")
         self._manager = None
         try:
@@ -343,7 +341,7 @@ class RelayLogic:
         except (TypeError, ValueError):
             lease_seconds = 300.0
         self.blob_lease_seconds = max(30.0, lease_seconds)
-        self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
+        self.identity = config.get("relay_identity") or self.session.identity.uuid
         self.storage = self._build_storage(config)
         adopted_descriptor = None
         if self.storage is None:
@@ -380,13 +378,11 @@ class RelayLogic:
         )
         self._state = self._load_state()
         # None preserves the legacy implicit-connection behavior (all local
-        # boards + broad discovery). RelayManager sets an explicit set for
+        # topics + broad discovery). RelayManager sets an explicit set for
         # every registered target, including the empty set.
         self._scoped_topic_uuids: set[str] | None = None
-        # Re-mark any previously-shared boards as active discussions, so a
-        # restart doesn't silently drop the issuer's auto-adopt for them
-        # (see _activate_shared_boards).
-        self._activate_shared_boards()
+        # Re-mark previously shared application topics as active discussions.
+        self._activate_shared_topics()
 
     @staticmethod
     def _normalize_poll_interval(value: Any, fallback: float) -> float:
@@ -550,18 +546,17 @@ class RelayLogic:
 
     @_relay_io_locked
     def relay_topic_uuids(self) -> list[str]:
-        # Includes our own identity node alongside owned boards: identity is
+        # Includes our own identity node alongside application topics: identity is
         # otherwise only ever delivered once, inline in a connect token at
         # accept time (Session.apply_peer_identity_snapshot) - a later
         # display-name/picture edit would never reach an already-connected
         # relay peer without this, since relay has no other identity-sync
-        # path. poll_and_apply already caches any non-"kanban_board" topic
-        # via apply_peer_subtree without attempting to graft it, so no
-        # change is needed on the receiving side.
-        board_uuids = {board.uuid for board in self.kanban.boards()}
+        # path. Application handlers decide how invited topic roots are
+        # mounted; identity and unknown roots remain peer-cache-only.
+        topic_uuids = set(self.session.shared_topics.local_topic_uuids())
         if self._scoped_topic_uuids is not None:
-            board_uuids &= self._scoped_topic_uuids
-        return sorted(board_uuids) + [self.session.identity.uuid]
+            topic_uuids &= self._scoped_topic_uuids
+        return sorted(topic_uuids) + [self.session.identity.uuid]
 
     @_relay_io_locked
     def set_scoped_topics(self, topic_uuids: set[str] | list[str]) -> None:
@@ -606,8 +601,8 @@ class RelayLogic:
     def mark_topics_desired(self, topic_uuids: list[str]) -> SessionResult:
         # Recording topic_uuids as "desired" is the consent step:
         # poll_and_apply below will only ever graft a topic into our own
-        # board list if it's in this set, so merely sharing a relay_root
-        # with someone never exposes their boards to us - we still need to
+        # local tree if it's in this set, so merely sharing a relay_root
+        # with someone never exposes their topics to us - we still need to
         # be handed a token first, same as a live join.
         if not isinstance(topic_uuids, list) or not topic_uuids:
             return SessionResult("error", reason="no topic_uuids given")
@@ -635,7 +630,7 @@ class RelayLogic:
         # token. This is the only signal available before an accepter shows
         # up (a drop-box relay has no back-channel announcing acceptance),
         # and it's what arms has_active_relationship() so the issuer starts
-        # publishing - otherwise the accepter could never graft a board the
+        # publishing - otherwise the accepter could never graft a topic the
         # issuer never got around to publishing. Does not affect what/where
         # publish_due_topics writes; only whether the loop runs at all.
         if not isinstance(topic_uuids, list) or not topic_uuids:
@@ -644,13 +639,13 @@ class RelayLogic:
         shared.update(str(uuid) for uuid in topic_uuids)
         self._state["shared"] = sorted(shared)
         self._save_state()
-        self._activate_shared_boards()
+        self._activate_shared_topics()
         return SessionResult("ok", value=topic_uuids)
 
     @_relay_io_locked
     def unmark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
         # The unshare counterpart (review R-3): without this, `shared` only
-        # ever grew - unsharing a board never stopped relay publishing it,
+        # ever grew - unsharing a topic never stopped relay publishing it,
         # and has_active_relationship() stayed armed forever once anything
         # had ever been shared.
         if not isinstance(topic_uuids, list) or not topic_uuids:
@@ -663,23 +658,12 @@ class RelayLogic:
         self._save_state()
         return SessionResult("ok", value=sorted(remove))
 
-    def _activate_shared_boards(self) -> None:
-        # A board this session has shared via a relay token is one it is
-        # actively discussing - the relay analog of the /p2p/join that
-        # marks a topic active on the HTTP path (Session.handle_join).
-        # Without this the *issuer's own* board never enters
-        # active_topic_uuids, so kanban's auto-adopt (gated on
-        # _is_active_discussion_node) never runs for incoming relay changes
-        # to it - they surface as a diff with no Adopt button (auto-adopt
-        # is expected to handle it) yet nothing ever adopts. Caught live:
-        # A shared a board over relay, B edited a card, and A was stuck
-        # showing the change with no way to accept it. Idempotent; also
-        # called from __init__ so a restart re-activates shared boards
-        # (active_topic_uuids is persisted, but a board shared before this
-        # fix existed would not have been recorded active).
+    def _activate_shared_topics(self) -> None:
+        # Relay token issuance is the relay equivalent of a direct join: the
+        # application topic becomes an active discussion on the issuer too.
         for topic in self._state.get("shared", []):
             node = self.session.protocol.index.get(topic)
-            if node is not None and node.data.get("type") == "kanban_board":
+            if node is not None and self.session.shared_topics.supports(node):
                 self.session.start_discussion(topic)
 
     @_relay_io_locked
@@ -729,7 +713,7 @@ class RelayLogic:
             "identity": self.identity,
             # Scoped polling deliberately does not enumerate every topic on
             # a shared target. Carry the public profile in the heartbeat so
-            # a peer discovered on an assigned board can still be named
+            # a peer discovered on an assigned topic can still be named
             # without scanning that peer's separate identity topic.
             "profile": self.session.identity.to_dict(),
             "updated_at": now_iso(),
@@ -825,7 +809,7 @@ class RelayLogic:
         published = []
         for topic_uuid in self.relay_topic_uuids():
             # Reads under the shared session lock: a sibling connection's
-            # poll_and_apply may be grafting a board into the same tree
+            # poll_and_apply may be grafting a topic into the same tree
             # concurrently (relay_tick now runs connections' I/O in parallel),
             # and an unlocked walk here could observe a half-grafted subtree
             # or a dict mutated mid-iteration.
@@ -967,8 +951,8 @@ class RelayLogic:
     @_relay_io_locked
     def poll_and_apply(self) -> list[tuple[str, str]]:
         # Discovers topics from what's actually in the relay, not from
-        # relay_topic_uuids() (this session's own local boards) - otherwise
-        # a peer who's never seen a board before could never learn about it
+        # relay_topic_uuids() (this session's own local topics) - otherwise
+        # a peer who's never seen a topic before could never learn about it
         # this way, which defeats the point of a standalone relay path.
         if not self.storage:
             return []
@@ -988,7 +972,7 @@ class RelayLogic:
         else:
             # Explicit targets never enumerate unrelated discussions that
             # happen to share the same SFTP root. Desired topics come from
-            # accepted tokens; scoped topics are locally assigned boards.
+            # accepted tokens; scoped topics are locally assigned application topics.
             topic_uuids = sorted(
                 self._scoped_topic_uuids
                 | set(self._state.get("desired", []))
@@ -1075,28 +1059,22 @@ class RelayLogic:
                 if not payload:
                     continue
                 subtree = PRSPNode.from_dict(payload["subtree"])
+                peer_copy = copy.deepcopy(subtree)
                 # Registering peer_topic_sets (not add_peer - see
-                # Session.note_relay_peer_topic) is what lets kanban_logic's
-                # auto-adopt recognize this cache as discussing the topic;
-                # without it, the apply below would be invisible to adoption.
+                # Session.note_relay_peer_topic) is what lets application
+                # reconciliation recognize this cache as discussing the topic.
                 with self._session_lock:
                     self.session.note_relay_peer_topic(peer_addr, topic_uuid)
-                    is_new_board = wants_graft and subtree.data.get("type") == "kanban_board"
-                    if is_new_board:
-                        # Graft the original object as our own board; cache a
-                        # deep copy separately so the two don't become the same
-                        # object (which would make future divergence checks
-                        # between "our board" and the peer cache always agree).
-                        self.kanban.accept_relay_board(subtree)
-                        self.session.apply_peer_subtree(
-                            peer_addr, copy.deepcopy(subtree), payload.get("parent_uuid"),
-                        )
-                    else:
-                        self.session.apply_peer_subtree(
-                            peer_addr, subtree, payload.get("parent_uuid"),
-                        )
+                    if wants_graft:
+                        # Applications own validation, mounting and defaults.
+                        # Unknown types remain visible only as peer cache and
+                        # are retried if a matching application is loaded.
+                        self.session.shared_topics.accept_invited_topic(subtree)
+                    self.session.apply_peer_subtree(
+                        peer_addr, peer_copy, payload.get("parent_uuid"),
+                    )
                 self._state["observed"].setdefault(topic_uuid, {})[peer_id] = (
-                    self.session.node_revision_map(subtree)
+                    self.session.node_revision_map(peer_copy)
                 )
                 self._state["applied"].setdefault(topic_uuid, {})[peer_id] = state_hash
                 applied.add((topic_uuid, peer_id))
@@ -1106,9 +1084,9 @@ class RelayLogic:
 
     @_relay_io_locked
     def status_payload(self) -> dict:
-        # Union of locally-owned boards (which we publish) and any topic
+        # Union of locally-owned topics (which we publish) and any topic
         # we've ever applied something from (which may not be one of our
-        # own boards at all - e.g. a board only known via a peer's relay
+        # own topics at all - e.g. a topic only known via a peer's relay
         # snapshot) - reporting only the former hid exactly the kind of
         # state-file collision bug this diagnostic is meant to catch.
         topic_uuids = set(self.relay_topic_uuids()) | set(self._state["applied"])
@@ -1135,9 +1113,9 @@ class RelayLogic:
     @_relay_io_locked
     def delete_topic(self, topic_uuid: str) -> SessionResult:
         # Purely a storage/bookkeeping cleanup - never touches whatever a
-        # peer may have already grafted into their own local board list
-        # from this topic (that's kanban_logic's own board-delete, a
-        # separate, app-level decision this has no business making).
+        # peer may have already grafted into their own local application tree
+        # from this topic (local content deletion is a separate application
+        # decision this transport layer has no business making).
         if not self.storage:
             return SessionResult("error", reason="relay not configured")
         self.storage.delete_topic(topic_uuid)
@@ -1248,14 +1226,13 @@ class RelayManager:
     the manager holds them keyed by storage fingerprint. Today it holds a
     single implicit connection built from the startup config or an accepted
     token - identical to the previous single-storage behavior - but the
-    surface is already the "many connections" one so per-board targets can
+    surface is already the "many connections" one so per-topic targets can
     layer on without touching callers again.
     """
 
     def __init__(self, session: Session, config: dict):
         self.session = session
         self.config = config
-        self.kanban = KanbanLogic(session, config)
         self._session_lock = session.lock
         # Registry iteration/mutation has its own lock. Protocol snapshots
         # use Session.lock; keeping the two distinct avoids an io->session vs
@@ -1281,13 +1258,11 @@ class RelayManager:
             self.session.app_metadata["relay_targets"] = registry
         return registry
 
-    def _board_target_map(self) -> dict[str, str]:
-        apps = self.session.app_metadata.setdefault("apps", {})
-        metadata = apps.setdefault(KANBAN_APP_NAME, {})
-        mapping = metadata.setdefault("board_target", {})
+    def _topic_target_map(self) -> dict[str, str]:
+        mapping = self.session.app_metadata.setdefault("relay_topic_targets", {})
         if not isinstance(mapping, dict):
             mapping = {}
-            metadata["board_target"] = mapping
+            self.session.app_metadata["relay_topic_targets"] = mapping
         return mapping
 
     @staticmethod
@@ -1366,19 +1341,19 @@ class RelayManager:
             registry[target_id] = self._record_from_descriptor(
                 descriptor, "Imported relay",
             )
-        # Migrate durable relay intent to explicit assignments. New boards
+        # Migrate durable relay intent to explicit assignments. New topics
         # remain unassigned, as required by the explicit-target model.
-        mapping = self._board_target_map()
+        mapping = self._topic_target_map()
         for topic_uuid in set(self.primary._state.get("shared", [])) | set(
             self.primary._state.get("desired", [])
         ):
             node = self.session.protocol.index.get(topic_uuid)
-            if node and node.data.get("type") == "kanban_board":
+            if node and self.session.shared_topics.supports(node):
                 mapping.setdefault(topic_uuid, target_id)
 
     @_manager_locked
     def list_targets(self) -> list[dict]:
-        assignments = self._board_target_map()
+        assignments = self._topic_target_map()
         result = []
         for target_id, record in sorted(
             self._target_registry().items(),
@@ -1388,8 +1363,8 @@ class RelayManager:
             public.update({
                 "id": target_id,
                 "has_password": bool(record.get("password")),
-                "board_uuids": sorted(
-                    board_uuid for board_uuid, assigned in assignments.items()
+                "topic_uuids": sorted(
+                    topic_uuid for topic_uuid, assigned in assignments.items()
                     if assigned == target_id
                 ),
             })
@@ -1467,11 +1442,11 @@ class RelayManager:
     def refresh_scopes(self) -> None:
         with self._manager_lock:
             topics_by_fingerprint: dict[str, set[str]] = {}
-            for board_uuid, target_id in self._board_target_map().items():
+            for topic_uuid, target_id in self._topic_target_map().items():
                 descriptor = self.target_descriptor(target_id)
                 storage = RelayLogic._storage_from_descriptor(descriptor)
                 if storage:
-                    topics_by_fingerprint.setdefault(_relay_fingerprint(storage), set()).add(board_uuid)
+                    topics_by_fingerprint.setdefault(_relay_fingerprint(storage), set()).add(topic_uuid)
             for fingerprint, connection in self.connections.items():
                 if fingerprint == "unconfigured":
                     continue
@@ -1562,8 +1537,8 @@ class RelayManager:
             old_connection = (
                 self.connections.get(old_fingerprint) if old_fingerprint else None
             )
-            assigned_boards = {
-                board_uuid for board_uuid, assigned in self._board_target_map().items()
+            assigned_topics = {
+                topic_uuid for topic_uuid, assigned in self._topic_target_map().items()
                 if assigned == target_id
             }
             old_intent = {"shared": set(), "desired": set(), "identity_topics": set()}
@@ -1591,8 +1566,8 @@ class RelayManager:
                     for item_id, item in registry.items()
                 )
                 if other_old_reference:
-                    shared = old_intent["shared"] & assigned_boards
-                    desired = old_intent["desired"] & assigned_boards
+                    shared = old_intent["shared"] & assigned_topics
+                    desired = old_intent["desired"] & assigned_topics
                     identity_topics = old_intent["identity_topics"]
                     if shared:
                         old_connection.unmark_topics_shared(sorted(shared))
@@ -1670,17 +1645,17 @@ class RelayManager:
                 identity_topics.add(inviter_identity_uuid)
                 connection._state["identity_topics"] = sorted(identity_topics)
                 connection._save_state()
-        board_topics = [
+        application_topics = [
             topic_uuid for topic_uuid in topic_uuids
             if topic_uuid not in {inviter_identity_uuid, self.session.identity.uuid}
         ]
-        # A board can live on only one target. Clean durable intent from its
+        # An application topic can live on only one target. Clean durable intent from its
         # previous connection before moving the mapping; otherwise an old
-        # accepted target keeps polling the board through its `desired` set.
+        # accepted target keeps polling the topic through its `desired` set.
         with self._manager_lock:
-            mapping = self._board_target_map()
+            mapping = self._topic_target_map()
             previous_connections = []
-            for topic_uuid in board_topics:
+            for topic_uuid in application_topics:
                 previous_id = mapping.get(topic_uuid)
                 if previous_id and previous_id != target_id:
                     previous = self.connection_for_target(previous_id)
@@ -1689,60 +1664,62 @@ class RelayManager:
             for previous, topic_uuid in previous_connections:
                 previous.unmark_topics_shared([topic_uuid])
                 previous.unmark_topics_desired([topic_uuid])
-            for topic_uuid in board_topics:
+            for topic_uuid in application_topics:
                 mapping[topic_uuid] = target_id
             self.refresh_scopes()
         return SessionResult("ok", value=target_id)
 
     @_manager_locked
-    def assign_board_target(self, board_uuid: str, target_id: str | None) -> SessionResult:
-        board = self.session.get_node(board_uuid)
-        if not board or board.data.get("type") != "kanban_board":
-            return SessionResult("error", reason="board not found")
+    def assign_topic_target(self, topic_uuid: str, target_id: str | None) -> SessionResult:
+        topic = self.session.get_node(topic_uuid)
+        if not topic or not self.session.shared_topics.supports(topic):
+            return SessionResult("error", reason="application topic not found")
         if target_id and target_id not in self._target_registry():
             return SessionResult("error", reason="relay target not found")
-        mapping = self._board_target_map()
-        previous_id = mapping.get(board_uuid)
+        mapping = self._topic_target_map()
+        previous_id = mapping.get(topic_uuid)
         next_connection = self.connection_for_target(target_id) if target_id else None
         if previous_id and previous_id != target_id:
             previous = self.connection_for_target(previous_id)
             if previous and previous is not next_connection:
-                previous.unmark_topics_shared([board_uuid])
-                previous.unmark_topics_desired([board_uuid])
+                previous.unmark_topics_shared([topic_uuid])
+                previous.unmark_topics_desired([topic_uuid])
         if target_id:
-            mapping[board_uuid] = target_id
+            mapping[topic_uuid] = target_id
         else:
-            mapping.pop(board_uuid, None)
+            mapping.pop(topic_uuid, None)
         self.refresh_scopes()
         if target_id:
             if next_connection:
-                next_connection.mark_topics_shared([board_uuid])
+                next_connection.mark_topics_shared([topic_uuid])
         return SessionResult("ok", value=target_id or "")
 
     @_manager_locked
-    def assign_boards_target(self, board_uuids: list[str],
+    def assign_topics_target(self, topic_uuids: list[str],
                              target_id: str | None) -> SessionResult:
-        normalized = list(dict.fromkeys(str(item) for item in board_uuids if item))
+        normalized = list(dict.fromkeys(str(item) for item in topic_uuids if item))
         if not normalized:
-            return SessionResult("error", reason="choose at least one board")
+            return SessionResult("error", reason="choose at least one topic")
         if target_id and target_id not in self._target_registry():
             return SessionResult("error", reason="relay target not found")
         # Validate the complete request before changing any mapping or relay
-        # state. A bad board late in a multi-board token must not leave the
-        # earlier boards silently reassigned.
-        for board_uuid in normalized:
-            board = self.session.get_node(board_uuid)
-            if not board or board.data.get("type") != "kanban_board":
-                return SessionResult("error", reason=f"board not found: {board_uuid}")
-        for board_uuid in normalized:
-            result = self.assign_board_target(board_uuid, target_id)
+        # state. A bad topic late in a multi-topic token must not leave the
+        # earlier topics silently reassigned.
+        for topic_uuid in normalized:
+            topic = self.session.get_node(topic_uuid)
+            if not topic or not self.session.shared_topics.supports(topic):
+                return SessionResult(
+                    "error", reason=f"application topic not found: {topic_uuid}",
+                )
+        for topic_uuid in normalized:
+            result = self.assign_topic_target(topic_uuid, target_id)
             if result.status != "ok":
                 return result
         return SessionResult("ok", value=normalized)
 
     @_manager_locked
-    def target_for_board(self, board_uuid: str) -> str | None:
-        return self._board_target_map().get(board_uuid)
+    def target_for_topic(self, topic_uuid: str) -> str | None:
+        return self._topic_target_map().get(topic_uuid)
 
     def test_target(self, target_id: str) -> SessionResult:
         descriptor = self.target_descriptor(target_id)
@@ -1789,9 +1766,9 @@ class RelayManager:
         storage = RelayLogic._storage_from_descriptor(descriptor)
         fingerprint = _relay_fingerprint(storage) if storage else None
         connection = self.connections.get(fingerprint) if fingerprint else None
-        mapping = self._board_target_map()
-        for board_uuid in [uuid for uuid, assigned in mapping.items() if assigned == target_id]:
-            mapping.pop(board_uuid, None)
+        mapping = self._topic_target_map()
+        for topic_uuid in [uuid for uuid, assigned in mapping.items() if assigned == target_id]:
+            mapping.pop(topic_uuid, None)
         registry.pop(target_id)
         remaining_same_connection = any(
             _relay_fingerprint(
@@ -1834,7 +1811,7 @@ class RelayManager:
 
     @property
     def storage(self):
-        # Back-compat shim for the single-storage readers (kanban liveness):
+        # Back-compat shim for single-storage diagnostic readers:
         # the primary connection's storage.
         return self.primary.storage
 
@@ -1945,10 +1922,10 @@ def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
         runtime.notify_change("relay-target")
         return JSONResponse({"status": "ok", "target_id": result.value})
 
-    async def api_assign_board(request: Request):
+    async def api_assign_topic(request: Request):
         data = await request.json()
-        result = logic.assign_board_target(
-            data.get("board_uuid", ""), data.get("target_id") or None,
+        result = logic.assign_topic_target(
+            data.get("topic_uuid", ""), data.get("target_id") or None,
         )
         if result.status != "ok":
             return JSONResponse({"status": "error", "reason": result.reason}, status_code=409)
@@ -1962,5 +1939,5 @@ def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
         Route("/api/relay/targets", api_targets, methods=["GET", "POST"]),
         Route("/api/relay/targets/test", api_test_target, methods=["POST"]),
         Route("/api/relay/targets/delete", api_delete_target, methods=["POST"]),
-        Route("/api/relay/boards/assign", api_assign_board, methods=["POST"]),
+        Route("/api/relay/topics/assign", api_assign_topic, methods=["POST"]),
     ]

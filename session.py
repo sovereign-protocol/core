@@ -42,6 +42,7 @@ from functools import wraps
 from typing import Any, Callable
 
 from protocol import PRSPNode, ProtocolState, collect_subtree_uuids, stable_hash
+from topic_registry import SharedTopicRegistry
 from trace_log import TraceLogger
 
 
@@ -168,6 +169,9 @@ class Session:
         self.peer_observed_node_revisions: dict[str, dict[str, str]] = {}
         self.active_topic_uuids: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
+        # Runtime-only application hooks used by channels to enumerate and
+        # mount shared topic roots without importing application modules.
+        self.shared_topics = SharedTopicRegistry()
         # Read-only observation: addresses/topics we poll for their cached
         # perspective only. Deliberately kept separate from
         # members/peer_topic_sets - an observed address is never a peer, so
