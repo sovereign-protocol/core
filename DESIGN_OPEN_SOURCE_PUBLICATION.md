@@ -95,7 +95,8 @@ public announcement. P2 may follow publicly.
 #### Architecture and licenses
 
 - [ ] Architecture R0–R7 and the R8 repository-split rehearsal completed.
-- [ ] Two repositories pass clean-install integration tests.
+- [ ] Core, S-Kanban, and Personal Cockpit repositories pass clean-install and
+      cross-repository integration tests.
 - [ ] Core contains no application imports, names, or node-type assumptions.
 - [ ] Licenses and inbound contribution policy approved.
 - [ ] Dependency/license inventory completed.
@@ -351,22 +352,23 @@ Repository-specific labels can be added after real usage shows a need.
   phone, organisation, roles, personas, contact cards, per-application
   visibility). Core keeps only the minimal profile; S-Identity is consumed
   through A4 facades under the A5 rule and must degrade gracefully when absent.
-- **Personal Cockpit as its own repository**, once the facade contract and the
-  application facade/API version domain exist.
+- Additional Personal Cockpit source adapters over published application facades.
 
 ## 11. Launch sequence
 
 1. Create private/local split repositories.
 2. Complete license/security/reproducibility gates.
 3. Create GitHub organization or final owner account.
-4. Push both repositories privately for one release rehearsal if desired.
+4. Push all three repositories privately for one release rehearsal if desired.
 5. Enable branch/security settings and CI.
 6. Make Sovereign Core public first.
 7. Publish its `0.1.0` source/wheel artifact.
 8. Make S-Kanban public against that exact Core release.
 9. Tag S-Kanban `0.1.0-alpha.1`.
-10. Publish demo and invitation to contributors.
-11. Open a small number of curated issues; avoid an unprioritized backlog dump.
+10. Make Personal Cockpit public against its declared Core and application-facade
+    compatibility ranges.
+11. Publish demo and invitation to contributors.
+12. Open a small number of curated issues; avoid an unprioritized backlog dump.
 
 ## 12. Publication decisions
 

@@ -54,16 +54,20 @@ Contains:
 
 License: `Apache-2.0`.
 
+### `sovereign-protocol/personal-cockpit`
+
+Purpose: standalone cross-application aggregation app.
+
+Contains Personal Cockpit logic, controllers, assets, and optional adapters over
+versioned public application facades. It must start coherently when any source
+application is absent or inactive.
+
+License: `Apache-2.0`.
+
 ### Later repositories
 
 - `sovereign-protocol/s-agreement` — create only when the conformance skeleton becomes a
   real product.
-- `sovereign-protocol/personal-cockpit` — standalone cross-application aggregation app.
-  **Decided for 0.1: it ships inside the `s-kanban` repository**, keeping its
-  current direct `KanbanLogic` import. Both are Apache-2.0 in one repository, so
-  no license boundary is crossed and the Core/Kanban split stays mechanical. It
-  becomes its own repository only once the A4 facade contract and the application
-  facade/API version domain exist.
 - A reusable profile or UI package — only after ownership decisions in the
   architecture design.
 

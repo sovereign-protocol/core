@@ -29,7 +29,7 @@ Documents:
 | A1 | Shared human profile data? | Core owns one minimal public profile: stable identity, display name, optional avatar; app-specific/contact data stays in apps | **ACCEPTED — see B1 resolution below** |
 | A2 | Manual app ownership? | Keep in Core as the non-stable diagnostic/example “Protocol Explorer” | **ACCEPTED** |
 | A3 | Shared browser assets? | Core owns the generic host shell; every application owns its actual UI/assets; no separate UI package yet | **ACCEPTED** |
-| A4 | Personal Cockpit source integration? | Personal Cockpit adapters consume other applications’ public facades through generic host lookup; Core and source apps remain cockpit-neutral | **ACCEPTED AS TARGET — DEFERRED for 0.1**: Personal Cockpit ships inside the `s-kanban` repository and may keep its direct Kanban import until it becomes its own repository |
+| A4 | Personal Cockpit source integration? | Personal Cockpit adapters consume other applications’ public facades through generic host lookup; Core and source apps remain cockpit-neutral | **ACCEPTED — REQUIRED BEFORE R8**: it may remain in the private monorepo during refactoring, but its direct Kanban import must be removed before repository separation |
 | A5 | May an application depend on another application? | Only optional, late-bound, consumer-side facade dependencies. Mandatory app→app dependencies are disallowed during `0.x` | **ACCEPTED** |
 
 Implementation must not start before this section is resolved, except for

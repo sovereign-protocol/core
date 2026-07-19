@@ -1,6 +1,6 @@
 # Public architecture refactor
 
-Status: **DESIGN FOR REVIEW — no implementation authorised**
+Status: **APPROVED FOR IMPLEMENTATION — reviewed corrections incorporated**
 
 This document defines the bounded architectural refactor to complete before
 publishing Sovereign Core and S-Kanban. It is intentionally driven by two real
@@ -261,20 +261,23 @@ Required behavior:
 ### Callback threading contract
 
 The registration callbacks are invoked from channel worker threads, not only
-from request handlers: the mailbox poll thread calls `list_topics` through
-`SharedTopicRegistry.local_topic_uuids()` on every publish cycle. The registry
-deliberately calls application code **outside** its own lock to avoid lock
-inversion, so the contract must state:
+from request handlers: the mailbox poll thread requests registered topics on
+every publish cycle. The registry copies handlers and releases its own lock
+before invocation. Session then invokes callbacks while holding its reentrant
+Session lock, so application tree reads observe one atomic protocol state without
+a registry/session lock inversion. The contract states:
 
 - Callbacks may run concurrently on channel worker threads and must be
   reentrant-safe.
 - Callbacks must not block on long I/O; they are on the publish path.
-- A callback that walks the protocol tree performs a *sequence* of individually
-  locked reads through the read-only view, not one atomic snapshot, so it may
-  observe a tree that is being mutated concurrently. Callbacks must therefore be
-  tolerant of a partially-updated view and must not assume cross-node
-  consistency within one call.
+- Session provides atomicity for protocol-tree reads during one callback. A
+  callback must not release that protection by starting asynchronous work against
+  mutable Session state.
 - Callbacks must not call back into registration/unregistration.
+
+The current direct `SharedTopicRegistry.local_topic_uuids()` channel call is an
+R3 implementation detail to replace with a Session-owned wrapper that supplies
+this locking guarantee.
 
 ### Lifecycle decision
 
@@ -490,23 +493,18 @@ installed/active sources such as Kanban, Agreement, and future applications.
 It remains entirely above Core. Core must not gain dashboard concepts or source-
 specific summary schemas.
 
-**ACCEPTED A4 (target) — DEFERRED for 0.1.** ApplicationHost offers generic
+**ACCEPTED A4 — REQUIRED BEFORE R8.** ApplicationHost offers generic
 lookup of active applications' public facades. Personal Cockpit owns adapters
 that consume those facades and produce cockpit entries, never source-app
 internals or raw protocol trees. Source applications and Core know nothing about
 Personal Cockpit. Missing or inactive sources simply provide no cockpit data.
 
-**0.1 decision:** Personal Cockpit **ships inside the `s-kanban` repository** and
-may keep its current direct `KanbanLogic` import until it becomes its own
-repository. Rationale: `boardofboards_logic.py` uses seven KanbanLogic methods
-(`boards`, `cards`, `columns`, `users`, `user_profile`, `transition_events`,
-`transition_by_node`); building the facade to cover them is real work that is not
-required for the Core/Kanban split, and both files are Apache-2.0 in the same
-repository, so no license boundary is crossed. A4 and the facade-version domain
-become prerequisites only when Personal Cockpit moves to its own repository.
-
-This keeps R8 mechanical: the split is Core versus everything else, and Personal
-Cockpit travels with Kanban.
+During the private monorepo phases, the existing file may retain its direct
+`KanbanLogic` import until the public facade contract exists. Before R8, that
+import must be replaced by an optional, version-checked Kanban facade obtained
+through generic host lookup. Personal Cockpit then moves mechanically to its own
+repository as accepted in R2. The seven methods it currently consumes define the
+initial facade coverage to design and test.
 
 ### S-Agreement conformance application
 
@@ -614,7 +612,7 @@ No encryption change is part of this refactor.
 | `trace_view.py` | Core development tool | Decide whether shipped or example-only |
 | `app_server.py` | Core host | Decompose runtime, persistence, core controllers, lifecycle |
 | `kanban_logic.py` | S-Kanban | Separate logic from controllers/routes; **surrender the profile routes and profile-topic accept path to Core (R3a)** |
-| `boardofboards_logic.py` | Personal Cockpit app, **inside the `s-kanban` repository for 0.1** | Rename during extraction. Direct `KanbanLogic` import is **tolerated for 0.1** (A4 deferred); facades/adapters required only when it becomes its own repository |
+| `boardofboards_logic.py` | Personal Cockpit app | Rename during extraction; replace direct `KanbanLogic` import with optional, version-checked public facade before R8 |
 | `kanban.html/.css` | S-Kanban | Move as application assets |
 | `boardofboards.html/.css` | Personal Cockpit app | Rename and move as standalone application assets |
 | `manual_logic/html/css` | Core Protocol Explorer | Rename during extraction; diagnostic/example, non-stable API |
@@ -726,6 +724,9 @@ Exit: application logic tests require no Starlette request/response objects.
 - Add channel contract tests.
 - Add package build/install smoke tests.
 - Document the supported public API; mark internals private.
+- Define and test the application facade/API version contract.
+- Replace Personal Cockpit's direct Kanban import with an optional Kanban facade
+  lookup and verify graceful behavior when Kanban is inactive.
 
 Exit: architectural violations fail CI.
 
@@ -744,7 +745,8 @@ Exit: two independent applications run on the same installed core.
 - Rehearse the mandatory publication checks in
   `DESIGN_OPEN_SOURCE_PUBLICATION.md`.
 
-Exit: both repositories can be published without history rewriting afterward.
+Exit: Core, S-Kanban, and Personal Cockpit repositories can be published without
+history rewriting afterward.
 
 ## 15. Verification matrix
 
@@ -794,8 +796,7 @@ Exit: both repositories can be published without history rewriting afterward.
       channel; either register a generic explorer root type in R3 or narrow the
       claim to HTTP-only inspection.
 - [x] A3: Core host shell versus application-owned domain UI.
-- [x] A4: Personal Cockpit adapters over public application facades —
-      **target accepted, deferred for 0.1**; Personal Cockpit ships inside the
-      `s-kanban` repository and may keep its direct Kanban import (§10).
+- [x] A4: Personal Cockpit adapters over public application facades; separation
+      and removal of the direct Kanban import are required before R8 (§10).
 - [x] A5: application-to-application dependencies are optional, late-bound
       facade lookups only; mandatory app→app dependencies disallowed in `0.x`.
