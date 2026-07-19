@@ -86,6 +86,24 @@ class ApplicationHost:
         with self._lock:
             return dict(self._instances)
 
+    def application_summaries(self) -> list[dict]:
+        """Describe active applications for the shared host shell.
+
+        The shell builds navigation from this, so no application needs to
+        know another application's identifier or URL. Deactivating an
+        application removes its entry instead of breaking a hardcoded link.
+        """
+        primary = self.primary_application_id
+        return [
+            {
+                "application_id": instance.manifest.application_id,
+                "display_name": instance.manifest.display_name,
+                "asset_prefix": instance.manifest.asset_prefix,
+                "primary": instance.manifest.application_id == primary,
+            }
+            for instance in self.instances.values()
+        ]
+
     @property
     def primary_instance(self) -> ApplicationInstance | None:
         with self._lock:

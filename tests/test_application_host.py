@@ -100,6 +100,39 @@ class ApplicationHostTests(unittest.TestCase):
             host.deactivate("notes")
             self.assertIsNone(host.services.facades.find("notes", 2))
 
+    def test_application_summaries_drive_shell_navigation(self):
+        session = Session("http://a")
+        notes = _application_module("notes")
+        tasks = _application_module("tasks")
+        services = _services(session)
+        with patch.dict(
+            sys.modules, {"test_notes": notes, "test_tasks": tasks},
+        ):
+            host = ApplicationHost(services, ["test_notes", "test_tasks"])
+
+            summaries = host.application_summaries()
+            self.assertEqual(
+                [item["application_id"] for item in summaries], ["notes", "tasks"],
+            )
+            self.assertEqual(
+                [item["asset_prefix"] for item in summaries],
+                ["/apps/notes", "/apps/tasks"],
+            )
+            # The shell needs to know which application "/" will serve. Note
+            # primary is resolved from the constructor's specs only, so an
+            # application activated later is never promoted to primary.
+            self.assertEqual(
+                [item["primary"] for item in summaries], [True, False],
+            )
+
+            # Deactivating removes a navigation entry rather than leaving a
+            # link that would 404.
+            host.deactivate("notes")
+            self.assertEqual(
+                [item["application_id"] for item in host.application_summaries()],
+                ["tasks"],
+            )
+
     def test_activate_and_deactivate_remove_runtime_surface_but_keep_data(self):
         session = Session("http://a")
         topic = session.create_child(

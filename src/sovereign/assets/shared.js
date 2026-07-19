@@ -183,3 +183,362 @@ function transitionLabel(info) {
   const label = labels[info.type] || "Difference";
   return details ? `${label}\n${details}` : label;
 }
+
+/*
+  Sovereign host shell - the collaboration surface every application shares.
+
+  Core owns this because everything in it is a Core concept: identities,
+  peers, channels, connect tokens, and mailbox targets. An application that
+  built its own would be reimplementing Core's vocabulary, and the copies
+  would drift - which is exactly how a renamed token field broke pasting in
+  two applications at once.
+
+  Navigation is host-driven. The shell asks GET /api/core/applications, so
+  no application ever names another application's identifier or URL, and
+  deactivating one removes a link instead of breaking it.
+
+  Mount with SovereignShell.mount({...}); the shell injects its own dialogs,
+  so a page needs no markup contract beyond the container it passes in.
+*/
+const SovereignShell = {
+  _applications: null,
+  _dialogs: false,
+  _options: {},
+
+  async applications() {
+    if (this._applications) return this._applications;
+    try {
+      const response = await fetch("/api/core/applications");
+      const payload = await response.json();
+      this._applications = payload.applications || [];
+    } catch (error) {
+      this._applications = [];
+    }
+    return this._applications;
+  },
+
+  async _post(path, body) {
+    const response = await fetch(path, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body || {}),
+    });
+    const value = await response.json().catch(() => ({}));
+    if (!response.ok) throw new Error(value.reason || "Request failed");
+    return value;
+  },
+
+  // options: { container, applicationId, topicUuid(), state(), onChanged() }
+  // state() returns { network, channel_targets, channel_target_id } so the
+  // shell never reaches into an application's own payload shape.
+  async mount(options) {
+    this._options = options;
+    const container = options.container;
+    container.classList.add("shell-bar");
+    container.replaceChildren();
+
+    const nav = document.createElement("nav");
+    nav.className = "shell-nav";
+    for (const app of await this.applications()) {
+      const link = document.createElement("a");
+      link.className = "shell-nav-link";
+      link.href = app.asset_prefix;
+      link.textContent = app.display_name;
+      if (app.application_id === options.applicationId) {
+        link.classList.add("current");
+        link.setAttribute("aria-current", "page");
+      }
+      nav.append(link);
+    }
+    container.append(nav);
+
+    const actions = document.createElement("div");
+    actions.className = "shell-actions";
+    const relay = document.createElement("button");
+    relay.type = "button";
+    relay.className = "shell-relay-btn";
+    relay.textContent = "Relay targets";
+    relay.onclick = () => this.openRelayTargets();
+    actions.append(relay);
+
+    const connection = document.createElement("button");
+    connection.type = "button";
+    connection.id = "shellConnectionBtn";
+    connection.className = "peer-cluster local";
+    connection.textContent = "local";
+    connection.onclick = () => this.openConnectionPanel();
+    actions.append(connection);
+    container.append(actions);
+
+    this._ensureDialogs();
+    this.refresh();
+  },
+
+  refresh() {
+    const button = document.getElementById("shellConnectionBtn");
+    const state = this._options.state ? this._options.state() : {};
+    if (!button || !state) return;
+    const peers = Object.entries((state.network && state.network.peers) || {});
+    button.replaceChildren();
+    button.className = peers.length ? "peer-cluster" : "peer-cluster local";
+    if (!peers.length) {
+      button.textContent = "local";
+      button.title = "No peers on this topic";
+      return;
+    }
+    for (const entry of peers.slice(0, 4)) {
+      const addr = entry[0];
+      const info = entry[1] || {};
+      const avatar = document.createElement("span");
+      const online = !info.status || info.status.state !== "offline";
+      avatar.className = "header-avatar " + (online ? "status-online" : "status-offline");
+      avatar.textContent = (addr.replace(/^relay:/, "").slice(0, 2) || "?").toUpperCase();
+      avatar.title = info.channel ? addr + " (" + info.channel + ")" : addr;
+      button.append(avatar);
+    }
+    if (peers.length > 4) {
+      const more = document.createElement("span");
+      more.className = "header-avatar more";
+      more.textContent = "+" + (peers.length - 4);
+      button.append(more);
+    }
+    button.title = peers
+      .map((entry) => entry[0] + (entry[1] && entry[1].channel ? " [" + entry[1].channel + "]" : ""))
+      .join("\n");
+  },
+
+  _ensureDialogs() {
+    if (this._dialogs) return;
+    const host = document.createElement("div");
+    host.innerHTML = [
+      '<dialog id="shellConnectionModal" class="shell-dialog">',
+      '<form method="dialog" class="shell-panel">',
+      "<h2>Connection</h2>",
+      '<label for="shellTargetSelect">Relay target for this topic</label>',
+      '<select id="shellTargetSelect"></select>',
+      '<div class="shell-row"><button type="button" id="shellCopyTokenBtn">Copy share token</button></div>',
+      '<label for="shellTokenInput">Paste a share token</label>',
+      '<div class="shell-row"><input id="shellTokenInput" placeholder="Paste a share token"><button type="button" id="shellConnectBtn">Connect</button></div>',
+      '<p id="shellConnectionNote" class="shell-note"></p>',
+      '<menu><button type="button" id="shellConnectionCloseBtn">Close</button></menu>',
+      "</form></dialog>",
+      '<dialog id="shellTargetsModal" class="shell-dialog">',
+      '<form method="dialog" class="shell-panel">',
+      "<h2>Relay targets</h2>",
+      '<div id="shellTargetList" class="shell-target-list"></div>',
+      '<fieldset class="shell-target-form"><legend>Add an SFTP target</legend>',
+      '<input id="shellTargetName" placeholder="Name">',
+      '<input id="shellTargetHost" placeholder="Host">',
+      '<input id="shellTargetPort" type="number" value="22" min="1" max="65535">',
+      '<input id="shellTargetUser" placeholder="Username">',
+      '<input id="shellTargetRoot" placeholder="Remote path" value="/">',
+      '<button type="button" id="shellAddTargetBtn">Add target</button></fieldset>',
+      '<p id="shellTargetsNote" class="shell-note"></p>',
+      '<menu><button type="button" id="shellTargetsCloseBtn">Close</button></menu>',
+      "</form></dialog>",
+    ].join("");
+    document.body.append(...host.children);
+    this._dialogs = true;
+
+    document.getElementById("shellConnectionCloseBtn").onclick = () =>
+      document.getElementById("shellConnectionModal").close();
+    document.getElementById("shellTargetsCloseBtn").onclick = () =>
+      document.getElementById("shellTargetsModal").close();
+    document.getElementById("shellTargetSelect").onchange = (event) =>
+      this._assignTarget(event.target.value);
+    document.getElementById("shellCopyTokenBtn").onclick = () => this._copyToken();
+    document.getElementById("shellConnectBtn").onclick = () => this._connect();
+    document.getElementById("shellAddTargetBtn").onclick = () => this._addTarget();
+  },
+
+  _note(id, message) {
+    document.getElementById(id).textContent = message;
+  },
+
+  _topic() {
+    return this._options.topicUuid ? this._options.topicUuid() : "";
+  },
+
+  openConnectionPanel() {
+    this._ensureDialogs();
+    const state = this._options.state ? this._options.state() : {};
+    const select = document.getElementById("shellTargetSelect");
+    const wanted = [["", "Not assigned"]];
+    for (const item of state.channel_targets || []) wanted.push([item.id, item.name]);
+    select.replaceChildren();
+    for (const pair of wanted) {
+      const option = document.createElement("option");
+      option.value = pair[0];
+      option.textContent = pair[1];
+      select.append(option);
+    }
+    select.value = state.channel_target_id || "";
+    const topic = this._topic();
+    select.disabled = !topic;
+    document.getElementById("shellCopyTokenBtn").disabled = !topic || !select.value;
+    this._note(
+      "shellConnectionNote",
+      topic ? "" : "Select or create a topic before sharing it.",
+    );
+    document.getElementById("shellConnectionModal").showModal();
+  },
+
+  async _assignTarget(targetId) {
+    const topic = this._topic();
+    if (!topic) return;
+    try {
+      await this._post("/api/channels/mailbox/topics/assign", {
+        topic_uuid: topic,
+        target_id: targetId || null,
+      });
+      document.getElementById("shellCopyTokenBtn").disabled = !targetId;
+      this._note(
+        "shellConnectionNote",
+        targetId ? "Relay target assigned." : "Relay target removed.",
+      );
+      await this._changed();
+    } catch (error) {
+      this._note("shellConnectionNote", error.message);
+    }
+  },
+
+  async _copyToken() {
+    const topic = this._topic();
+    const targetId = document.getElementById("shellTargetSelect").value;
+    if (!topic) return;
+    try {
+      const token = await this._post("/api/connect_token", {
+        topic_uuids: [topic],
+        channel_options: targetId ? { mailbox: { target_id: targetId } } : {},
+      });
+      await navigator.clipboard.writeText(btoa(JSON.stringify(token)));
+      this._note("shellConnectionNote", "Token copied to the clipboard.");
+    } catch (error) {
+      this._note("shellConnectionNote", error.message);
+    }
+  },
+
+  async _connect() {
+    const field = document.getElementById("shellTokenInput");
+    let token;
+    try {
+      token = JSON.parse(atob(field.value.trim()));
+    } catch (error) {
+      this._note("shellConnectionNote", "That is not a share token.");
+      return;
+    }
+    // Core serializes token_version; the channel descriptor carries its own
+    // descriptor_version. Testing the wrong one rejects every valid token.
+    if (
+      token.token_version !== 1 ||
+      !Array.isArray(token.topic_uuids) ||
+      !token.topic_uuids.length
+    ) {
+      this._note("shellConnectionNote", "Unrecognized token version.");
+      return;
+    }
+    try {
+      await this._post("/api/connect", { token });
+      field.value = "";
+      this._note("shellConnectionNote", "Connected.");
+      await this._changed();
+    } catch (error) {
+      this._note("shellConnectionNote", error.message);
+    }
+  },
+
+  async openRelayTargets() {
+    this._ensureDialogs();
+    await this._renderTargets();
+    this._note("shellTargetsNote", "");
+    document.getElementById("shellTargetsModal").showModal();
+  },
+
+  async _renderTargets() {
+    const list = document.getElementById("shellTargetList");
+    list.replaceChildren();
+    let targets = [];
+    try {
+      const response = await fetch("/api/channels/mailbox/targets");
+      targets = (await response.json()).targets || [];
+    } catch (error) {
+      this._note("shellTargetsNote", "Could not read relay targets.");
+      return;
+    }
+    if (!targets.length) {
+      const empty = document.createElement("p");
+      empty.className = "shell-note";
+      empty.textContent = "No relay targets yet.";
+      list.append(empty);
+      return;
+    }
+    for (const target of targets) {
+      const row = document.createElement("div");
+      row.className = "shell-target-row";
+      const name = document.createElement("span");
+      name.textContent = target.name;
+      const where = document.createElement("span");
+      where.className = "shell-note";
+      where.textContent = target.host ? target.host + ":" + target.port : target.root;
+      const test = document.createElement("button");
+      test.type = "button";
+      test.textContent = "Test";
+      test.onclick = async () => {
+        this._note("shellTargetsNote", "Testing " + target.name + "...");
+        try {
+          await this._post("/api/channels/mailbox/targets/test", { target_id: target.id });
+          this._note("shellTargetsNote", target.name + " is reachable.");
+        } catch (error) {
+          this._note("shellTargetsNote", target.name + ": " + error.message);
+        }
+      };
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "danger";
+      remove.textContent = "Delete";
+      remove.onclick = async () => {
+        try {
+          await this._post("/api/channels/mailbox/targets/delete", { target_id: target.id });
+          await this._renderTargets();
+          this._note("shellTargetsNote", target.name + " deleted.");
+          await this._changed();
+        } catch (error) {
+          this._note("shellTargetsNote", error.message);
+        }
+      };
+      row.append(name, where, test, remove);
+      list.append(row);
+    }
+  },
+
+  async _addTarget() {
+    const values = {
+      name: document.getElementById("shellTargetName").value.trim(),
+      backend: "sftp",
+      host: document.getElementById("shellTargetHost").value.trim(),
+      port: Number(document.getElementById("shellTargetPort").value) || 22,
+      username: document.getElementById("shellTargetUser").value.trim(),
+      root: document.getElementById("shellTargetRoot").value.trim() || "/",
+    };
+    if (!values.name || !values.host || !values.username) {
+      this._note("shellTargetsNote", "Name, host, and username are required.");
+      return;
+    }
+    this._note("shellTargetsNote", "Verifying the target...");
+    try {
+      await this._post("/api/channels/mailbox/targets", values);
+      for (const id of ["shellTargetName", "shellTargetHost", "shellTargetUser"]) {
+        document.getElementById(id).value = "";
+      }
+      await this._renderTargets();
+      this._note("shellTargetsNote", values.name + " added.");
+      await this._changed();
+    } catch (error) {
+      this._note("shellTargetsNote", error.message);
+    }
+  },
+
+  async _changed() {
+    if (this._options.onChanged) await this._options.onChanged();
+  },
+};

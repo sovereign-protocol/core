@@ -157,3 +157,118 @@ dialog menu .danger:not(:last-child) {
   background: rgba(98, 14, 14, 0.92);
   color: #ff9090;
 }
+
+/* Sovereign host shell - navigation, connection, and relay targets.
+   Colour-neutral on purpose: each application's own stylesheet sets the
+   surrounding palette, and the shell inherits it. */
+.shell-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+.shell-nav {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+.shell-nav-link {
+  padding: 5px 10px;
+  border-radius: 6px;
+  text-decoration: none;
+  color: inherit;
+  opacity: 0.7;
+  font-size: 13px;
+}
+.shell-nav-link:hover {
+  opacity: 1;
+  background: rgba(127, 127, 127, 0.18);
+}
+.shell-nav-link.current {
+  opacity: 1;
+  font-weight: 600;
+  background: rgba(127, 127, 127, 0.24);
+}
+.shell-actions {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.shell-relay-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+}
+.shell-dialog {
+  border: none;
+  border-radius: 10px;
+  padding: 0;
+  max-width: 520px;
+  width: calc(100vw - 32px);
+}
+.shell-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.45);
+}
+.shell-panel {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 20px 22px;
+}
+.shell-panel h2 {
+  margin: 0 0 4px;
+  font-size: 17px;
+}
+.shell-panel label {
+  font-size: 12px;
+  opacity: 0.75;
+}
+.shell-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+}
+.shell-row input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.shell-note {
+  margin: 0;
+  font-size: 12px;
+  opacity: 0.75;
+  min-height: 1em;
+}
+.shell-target-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.shell-target-row {
+  display: grid;
+  grid-template-columns: 1fr auto auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.shell-target-form {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  border-radius: 8px;
+  padding: 12px;
+}
+.shell-target-form legend {
+  font-size: 12px;
+  opacity: 0.75;
+  padding: 0 4px;
+}
+.shell-target-form input {
+  min-width: 0;
+}
+.shell-panel menu {
+  display: flex;
+  justify-content: flex-end;
+  margin: 4px 0 0;
+  padding: 0;
+}

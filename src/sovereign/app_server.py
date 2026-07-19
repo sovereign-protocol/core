@@ -579,6 +579,12 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             ]
         return JSONResponse(payload)
 
+    async def api_core_applications(request: Request):
+        return JSONResponse({
+            "status": "ok",
+            "applications": runtime.host.application_summaries() if runtime.host else [],
+        })
+
     async def api_core_profile(request: Request):
         if request.method == "GET":
             return JSONResponse({"status": "ok", **runtime.profile.view()})
@@ -910,6 +916,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         Route("/shared.js", serve_shared_js),
         Route("/api/protocol", api_protocol),
         Route("/api/network", api_network),
+        Route("/api/core/applications", api_core_applications),
         Route("/api/core/profile", api_core_profile, methods=["GET", "POST"]),
         Route(
             "/api/core/profile/avatar",
