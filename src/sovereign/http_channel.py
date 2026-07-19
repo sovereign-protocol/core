@@ -78,6 +78,9 @@ class DirectHttpChannel:
     def execute_effects(self, effects):
         return self.adapter.execute_effects(effects)
 
+    def close(self) -> None:
+        """Direct HTTP owns no persistent connection resources."""
+
     def join_discussion(self, address, topic_uuid=None, topic_uuids=None):
         return self.adapter.join_discussion(address, topic_uuid, topic_uuids)
 

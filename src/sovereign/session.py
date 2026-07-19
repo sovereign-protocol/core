@@ -549,7 +549,7 @@ class Session:
         # add_peer - that would also add them to self.members, which
         # pending_sync_effects/sync_effects iterate to decide who to push
         # real HTTP effects to, and a relay identity isn't HTTP-reachable at
-        # that address. But kanban_logic's auto-adopt gates candidates on
+        # that address. Application auto-adopt policies gate candidates on
         # peer_topic_sets (_peer_discusses_node) to know a cached peer
         # perspective actually applies to a given topic - without this, a
         # relay-sourced cache update would be silently invisible to
@@ -602,7 +602,7 @@ class Session:
         # worth telling other peers about" - peer_topic_sets alone isn't
         # enough evidence of that. A relay pseudo-address (e.g. "relay:B")
         # also lives in peer_topic_sets (note_indirect_peer_topic - deliberate,
-        # so kanban's auto-adopt/eligibility checks still recognize it) but
+        # so application auto-adopt/eligibility checks still recognize it) but
         # was never registered via add_peer specifically to keep it out of
         # self.members and everything self.members feeds (pending_sync_effects,
         # mesh-propagation via handle_join/join_discussion's own member

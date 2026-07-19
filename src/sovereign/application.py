@@ -6,7 +6,7 @@ import math
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping
+from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
 
 from .topic_registry import ApplicationRegistration
 
@@ -15,6 +15,43 @@ if TYPE_CHECKING:
 
 
 _APPLICATION_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
+
+
+class IncompatibleApplicationFacade(ValueError):
+    """Raised when an active application's public facade has another version."""
+
+
+class ApplicationFacadeLookup(Protocol):
+    """Read-only, late-bound lookup supplied to application consumers."""
+
+    def find(self, application_id: str, facade_api_version: int) -> Any | None: ...
+
+
+@dataclass(frozen=True)
+class ApplicationFacade:
+    """One application's optional, explicitly versioned public API."""
+
+    application_id: str
+    facade_api_version: int
+    api: Any
+
+    def __post_init__(self) -> None:
+        if not _APPLICATION_ID_RE.fullmatch(self.application_id):
+            raise ValueError(
+                "facade application_id must use lowercase letters, digits, and hyphens"
+            )
+        if self.facade_api_version < 1:
+            raise ValueError("facade_api_version must be positive")
+        if self.api is None:
+            raise ValueError("facade api is required")
+
+
+class _NoApplicationFacades:
+    def find(self, application_id: str, facade_api_version: int) -> None:
+        return None
+
+
+_NO_APPLICATION_FACADES = _NoApplicationFacades()
 
 
 @dataclass(frozen=True)
@@ -57,6 +94,7 @@ class ApplicationServices:
     trace: Any
     notify_change: Callable[[str], None]
     collect_local_blobs: Callable[[], list[str]]
+    facades: ApplicationFacadeLookup = _NO_APPLICATION_FACADES
     settings: Mapping[str, Any] = MappingProxyType({})
 
     def with_settings(self, settings: Mapping[str, Any] | None) -> "ApplicationServices":
@@ -70,6 +108,7 @@ class ApplicationInstance:
     registration: ApplicationRegistration | None
     controllers: tuple[Any, ...] = ()
     close_callback: Callable[[], None] | None = None
+    facade: ApplicationFacade | None = None
 
     def close(self) -> None:
         if self.close_callback:

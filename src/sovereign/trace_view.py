@@ -8,7 +8,7 @@ from pathlib import Path
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Filter S-Kanban trace JSONL files by event text.",
+        description="Filter Sovereign Core trace JSONL files by event text.",
     )
     parser.add_argument("files", nargs="+")
     parser.add_argument("--contains", "-c", action="append", default=[])
@@ -42,7 +42,7 @@ def format_record(record: dict) -> str:
     for key in (
         "peer_addr",
         "target",
-        "board_uuid",
+        "topic_uuid",
         "node_uuid",
         "changed_uuid",
         "event_type",

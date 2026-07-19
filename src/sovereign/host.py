@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib
 import threading
+from dataclasses import replace
 from importlib.resources import files
 from typing import Any, Iterable
 
@@ -11,8 +12,41 @@ from starlette.responses import HTMLResponse, Response
 from starlette.routing import Route
 
 from .application import (
-    ApplicationInstance, ApplicationManifest, ApplicationServices, ApplicationSpec,
+    ApplicationFacade, ApplicationInstance, ApplicationManifest,
+    ApplicationServices, ApplicationSpec, IncompatibleApplicationFacade,
 )
+
+
+class _ApplicationFacadeRegistry:
+    """Host-owned registry; applications receive only its lookup surface."""
+
+    def __init__(self) -> None:
+        self._facades: dict[str, ApplicationFacade] = {}
+        self._lock = threading.RLock()
+
+    def register(self, facade: ApplicationFacade) -> None:
+        with self._lock:
+            if facade.application_id in self._facades:
+                raise ValueError(
+                    f"facade for {facade.application_id!r} is already active"
+                )
+            self._facades[facade.application_id] = facade
+
+    def unregister(self, application_id: str) -> None:
+        with self._lock:
+            self._facades.pop(application_id, None)
+
+    def find(self, application_id: str, facade_api_version: int) -> Any | None:
+        with self._lock:
+            facade = self._facades.get(application_id)
+        if facade is None:
+            return None
+        if facade.facade_api_version != facade_api_version:
+            raise IncompatibleApplicationFacade(
+                f"application {application_id!r} exposes facade API "
+                f"{facade.facade_api_version}, expected {facade_api_version}"
+            )
+        return facade.api
 
 
 class ApplicationHost:
@@ -24,7 +58,8 @@ class ApplicationHost:
         specs: Iterable[str | dict] = (),
         primary_application_id: str | None = None,
     ):
-        self.services = services
+        self._facades = _ApplicationFacadeRegistry()
+        self.services = replace(services, facades=self._facades)
         self.primary_application_id = primary_application_id
         self._instances: dict[str, ApplicationInstance] = {}
         self._modules: dict[str, str] = {}
@@ -92,6 +127,7 @@ class ApplicationHost:
                 f"application {manifest.application_id!r} instance manifest mismatch"
             )
         registered = False
+        facade_registered = False
         try:
             routes = tuple(instance.controllers) + self._asset_routes(manifest)
             self._validate_routes(manifest, routes)
@@ -101,6 +137,11 @@ class ApplicationHost:
                 self.services.session.register_application(instance.registration)
                 registered = True
                 self.services.session.mount_cached_topics(manifest.application_id)
+            if instance.facade:
+                if instance.facade.application_id != manifest.application_id:
+                    raise ValueError("application facade id does not match manifest")
+                self._facades.register(instance.facade)
+                facade_registered = True
             with self._lock:
                 self._instances[manifest.application_id] = instance
                 self._modules[manifest.application_id] = spec.module
@@ -110,6 +151,8 @@ class ApplicationHost:
                 if self._starlette_app is not None:
                     self._starlette_app.router.routes.extend(routes)
         except Exception:
+            if facade_registered:
+                self._facades.unregister(manifest.application_id)
             if registered:
                 self.services.session.unregister_application(manifest.application_id)
             instance.close()
@@ -141,6 +184,7 @@ class ApplicationHost:
                 self.primary_application_id = next(iter(self._instances), None)
         if instance.registration:
             self.services.session.unregister_application(application_id)
+        self._facades.unregister(application_id)
         instance.close()
 
     def close(self) -> None:

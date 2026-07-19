@@ -860,6 +860,31 @@ Verification: **427 tests passed**.
 
 Exit: architectural violations fail CI.
 
+**Implemented R6 record:**
+
+- Core owns a late-bound facade registry. `ApplicationFacade` carries an
+  application-owned `facade_api_version`; lookup returns `None` for an inactive
+  producer and rejects an incompatible active version explicitly.
+- S-Kanban exposes facade API 1 for its seven read/query operations. Personal
+  Cockpit consumes it without importing or depending on S-Kanban, and remains
+  usable when Kanban is inactive. Its legacy launcher activates both apps.
+- The application launch catalog moved out of Core into the application
+  launcher. Core contains no Kanban or Personal Cockpit knowledge.
+- `PUBLIC_API.md` and `sovereign.__all__` define the supported `0.x` surface.
+  Shipped applications import Core only through that public root.
+- AST tests reject forbidden Core/app/Session/storage dependency directions and
+  private Core imports. Runtime tests enforce the HTTP and mailbox contracts.
+- All three wheels are built in temporary directories, installed without
+  dependencies into a new isolated virtual environment, and imported with
+  packaged assets verified. Stale generated application build trees were
+  removed.
+- CI runs the full suite on Python 3.10 and 3.14, making the declared floor an
+  executable contract.
+- A clean PyInstaller build from `S-Kanban.spec` completed in temporary output
+  directories and the frozen executable reached its command-line entry point.
+
+Verification: **440 tests passed**, including the isolated wheel-install smoke.
+
 ### R7 — prove with minimal S-Agreement
 
 - Implement the conformance application described above.
@@ -899,14 +924,19 @@ above.
 | F1 | Applications read private channel services from host config | R4 injects only `ApplicationServices.channel_manager`; legacy `_relay_manager`/`_channel_manager` config lookup is removed and guarded by `test_package_layout.py` |
 | S3f | Protocol Explorer had no mailbox topic handler despite an overly broad lifecycle claim | A2 was narrowed explicitly: Protocol Explorer is a local/HTTP diagnostic; mailbox conformance belongs to real applications, beginning with S-Agreement |
 
+### Closed by R6
+
+| ID | Finding | How it was closed |
+|---|---|---|
+| F2 | The Python `>=3.10` floor was not executed | CI now runs Python 3.10 and 3.14 |
+| F3 | Clean wheel installation was not proven | `test_package_build.py` installs all three wheels in a new isolated venv |
+| F4 | Ignored build trees contained stale routes | Generated application build trees were removed; smoke builds use temporary directories |
+| F5 | Personal Cockpit imported S-Kanban internals | Optional version-checked facade lookup; no package/import dependency remains |
+
 ### Open
 
 | ID | Sev | Finding | Evidence | Target |
 |---|---|---|---|---|
-| F2 | Medium | The `>=3.10` floor is declared in all three distributions but never executed; the suite only ever runs on the development interpreter. Verified *plausible*: a search for `Self`, `tomllib`, `TaskGroup`, `ExceptionGroup`, `datetime.UTC`, `itertools.batched`, `@override` and `StrEnum` across shipped code found none — but plausible is not tested | all three `pyproject.toml` | CI — pull earlier than R8; drift accumulates silently and the first contributor on 3.10 discovers it |
-| F3 | Medium | R2's exit criterion is half-proven. `tests/test_package_layout.py` verifies the *editable* install (versions, asset resources, src roots, old flat modules unimportable). A clean install into an empty environment cannot be tested from inside that environment | R2 exit text vs `tests/test_package_layout.py` | R2 exit note or CI — add a subprocess venv smoke test, or mark the exit partial |
-| F4 | Low | Stale build artifacts hold superseded routes: an old `logic.py`/`kanban.html` still registering `/api/kanban/profile{,/avatar}`. Untracked and correctly ignored, so not a publication risk, but they pollute grep-based review and could be swept into a careless `sdist` | `applications/s-kanban/build/lib/` | Housekeeping — delete; consider a clean step before packaging |
-| F5 | Low | Personal Cockpit still imports Kanban internals directly. This is the accepted A4-deferred state, not a defect | `personal_cockpit/logic.py`, `from s_kanban.logic import KanbanLogic`; it consumes seven methods — `boards`, `cards`, `columns`, `users`, `user_profile`, `transition_events`, `transition_by_node`, which define the initial facade coverage | R8 — must become an optional, version-checked facade before repository separation |
 | S-6 | Medium | `reconcile_peer_changes` walks events uuid-sorted rather than parents-first, so a brand-new container and its children can fail to adopt in one pass | `ARCHITECTURE_REVIEW.md` S-6; consequence documented inline in the Kanban auto-adopt eligibility comment | R7 — the Agreement proof must test three-level nested adoption (§10); if it fails, S-6 becomes R7 scope |
 
 ## 15. Verification matrix

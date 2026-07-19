@@ -90,27 +90,13 @@ DEFAULT_CONFIG = {
     "applications": None,
     "primary_application_id": None,
 }
-LEGACY_APPLICATION_ALIASES = {
-    "kanban": {
-        "app_module": "s_kanban.application",
-        "application_id": "kanban",
-        "asset_package": "s_kanban.assets",
-        "ui_file": "kanban.html",
-        "css_file": "kanban.css",
-    },
+CORE_APPLICATION_ALIASES = {
     "manual": {
         "app_module": "sovereign.protocol_explorer_application",
         "application_id": "protocol-explorer",
         "asset_package": "sovereign.assets",
         "ui_file": "manual.html",
         "css_file": "manual.css",
-    },
-    "boardofboards": {
-        "app_module": "personal_cockpit.application",
-        "application_id": "personal-cockpit",
-        "asset_package": "personal_cockpit.assets",
-        "ui_file": "boardofboards.html",
-        "css_file": "boardofboards.css",
     },
 }
 
@@ -177,11 +163,17 @@ def parse_target(target: str) -> tuple[int, str | None]:
     return int(port_text), app_name
 
 
-def app_default_config(app_name: str) -> dict:
-    known = LEGACY_APPLICATION_ALIASES.get(app_name)
+def app_default_config(
+    app_name: str, application_aliases: dict[str, dict] | None = None,
+) -> dict:
+    aliases = dict(CORE_APPLICATION_ALIASES)
+    aliases.update(application_aliases or {})
+    known = aliases.get(app_name)
     if known:
         config = dict(known)
-        config["applications"] = [{"module": known["app_module"]}]
+        config["applications"] = list(
+            known.get("applications") or [{"module": known["app_module"]}]
+        )
         config["primary_application_id"] = known["application_id"]
         return config
     return {
@@ -192,10 +184,11 @@ def app_default_config(app_name: str) -> dict:
 
 
 def load_config(config_path: str | None = None,
-                app_name: str | None = None) -> dict:
+                app_name: str | None = None,
+                application_aliases: dict[str, dict] | None = None) -> dict:
     config = dict(DEFAULT_CONFIG)
     if app_name:
-        config.update(app_default_config(app_name))
+        config.update(app_default_config(app_name, application_aliases))
     if not config_path and app_name:
         app_config_path = Path.cwd() / f"{app_name}_config.json"
         config_path = str(app_config_path) if app_config_path.exists() else None
@@ -389,7 +382,7 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
     # went through add_peer, not e.g. Session.note_indirect_peer_topic) get
     # restored via add_peer_topics/set_peer_fetch_topics - those calls are
     # what repopulate session.members. A relay pseudo-address legitimately
-    # has its own peer_topic_sets entry (by design - kanban's eligibility
+    # has its own peer_topic_sets entry (by design - application eligibility
     # checks need it) without ever having been a real member; restoring it
     # through the member-registering path would re-leak it into
     # session.members on every single restart, independent of whatever
@@ -1183,13 +1176,18 @@ async def channel_poll_loop(runtime: AppRuntime) -> None:
         await channel_poll_tick(runtime, due_only=not woke_for_change)
 
 
-def main(argv: list[str] | None = None) -> None:
+def main(
+    argv: list[str] | None = None,
+    application_aliases: dict[str, dict] | None = None,
+) -> None:
     argv = list(sys.argv[1:] if argv is None else argv)
     if len(argv) not in (1, 2):
         print("Usage: python app_server.py <port[:app]> [config.json]")
         raise SystemExit(1)
     port, app_name = parse_target(argv[0])
-    config = load_config(argv[1] if len(argv) == 2 else None, app_name)
+    config = load_config(
+        argv[1] if len(argv) == 2 else None, app_name, application_aliases,
+    )
     runtime = create_runtime(port, config)
     app = build_app(runtime)
     print(f"SI node: {runtime.address}")

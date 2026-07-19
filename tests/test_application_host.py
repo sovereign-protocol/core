@@ -6,6 +6,7 @@ from unittest.mock import patch
 from starlette.routing import Route
 
 from sovereign.application import (
+    ApplicationFacade,
     ApplicationInstance,
     ApplicationManifest,
     ApplicationServices,
@@ -38,6 +39,8 @@ def _application_module(
     root_type=None,
     route_path=None,
     on_close=None,
+    facade_api_version=None,
+    facade_api=None,
 ):
     manifest = ApplicationManifest(application_id, application_id, 1)
     module = types.ModuleType(f"test_{application_id}")
@@ -65,6 +68,14 @@ def _application_module(
             registration,
             controllers,
             close_callback=on_close,
+            facade=(
+                ApplicationFacade(
+                    application_id,
+                    facade_api_version,
+                    facade_api,
+                )
+                if facade_api_version is not None else None
+            ),
         )
 
     module.create_application = create_application
@@ -72,6 +83,23 @@ def _application_module(
 
 
 class ApplicationHostTests(unittest.TestCase):
+    def test_facade_lookup_is_late_bound_versioned_and_removed_on_deactivate(self):
+        session = Session("http://a")
+        api = object()
+        module = _application_module(
+            "notes", facade_api_version=2, facade_api=api,
+        )
+        services = _services(session)
+        with patch.dict(sys.modules, {"test_notes": module}):
+            host = ApplicationHost(services)
+            self.assertIsNone(host.services.facades.find("notes", 2))
+            host.activate("test_notes")
+            self.assertIs(host.services.facades.find("notes", 2), api)
+            with self.assertRaisesRegex(ValueError, "expected 1"):
+                host.services.facades.find("notes", 1)
+            host.deactivate("notes")
+            self.assertIsNone(host.services.facades.find("notes", 2))
+
     def test_activate_and_deactivate_remove_runtime_surface_but_keep_data(self):
         session = Session("http://a")
         topic = session.create_child(

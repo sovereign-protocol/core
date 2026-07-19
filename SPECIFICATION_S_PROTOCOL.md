@@ -16,8 +16,8 @@ The following versions are independent and must not share a wire field:
 | Connect token | `token_version: 1` | implemented |
 | Channel descriptor | `descriptor_version: 1` | implemented |
 | Core public-profile schema | `profile_schema_version: 1` | implemented |
-| Application data schema | owned and versioned by each application | reserved for R3/R4 |
-| Application facade/API | owned and versioned by each application facade | reserved for R6 |
+| Application data schema | owned and versioned by each application | implemented |
+| Application facade/API | `facade_api_version`, owned by each facade | implemented |
 
 ## Canonical hash input
 

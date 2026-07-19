@@ -1,10 +1,13 @@
 import unittest
 
 from sovereign.channel import (
+    Channel,
     ChannelAcceptance,
     ChannelManager,
     ChannelResult,
+    EffectDeliveryChannel,
     Invitation,
+    PollingChannel,
 )
 from sovereign.http_channel import DirectHttpChannel
 from sovereign.mailbox_channel import MailboxChannel
@@ -62,6 +65,19 @@ class _PollingChannel(_Channel):
 
 
 class ChannelManagerTests(unittest.TestCase):
+    def test_concrete_channels_satisfy_declared_capability_contracts(self):
+        direct = DirectHttpChannel("http://a", object())
+        mailbox = MailboxChannel(type("Manager", (), {
+            "all_connections": lambda self: [],
+        })())
+
+        self.assertIsInstance(direct, Channel)
+        self.assertIsInstance(direct, EffectDeliveryChannel)
+        self.assertNotIsInstance(direct, PollingChannel)
+        self.assertIsInstance(mailbox, Channel)
+        self.assertIsInstance(mailbox, PollingChannel)
+        self.assertNotIsInstance(mailbox, EffectDeliveryChannel)
+
     def test_compose_token_uses_registered_offers_and_identity(self):
         session = Session("http://a")
         manager = ChannelManager(session)

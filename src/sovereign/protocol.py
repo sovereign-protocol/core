@@ -293,7 +293,7 @@ class ProtocolState:
         # (content/state hashes sort their children), so it never syncs -
         # it only affects this local list's order. An app that wants order
         # to replicate must carry it in node data and sort on read, the way
-        # kanban's `data.order` + _place_in_order does. Passing `index`
+        # an application's own ordering field can do. Passing `index`
         # alone will silently look right locally and wrong on every peer.
         ok = self._move_child_impl(
             source_uuid, destination_uuid, index, revision_origin,

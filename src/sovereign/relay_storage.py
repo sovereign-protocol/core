@@ -112,7 +112,7 @@ class LocalFolderRelayStorage:
     def verify_access(self) -> None:
         """Verify that the configured relay root is writable."""
         self.root.mkdir(parents=True, exist_ok=True)
-        probe = self.root / f".s-kanban-probe-{os.getpid()}-{uuid_mod.uuid4().hex}"
+        probe = self.root / f".sovereign-probe-{os.getpid()}-{uuid_mod.uuid4().hex}"
         try:
             probe.write_bytes(b"")
         finally:
@@ -233,7 +233,7 @@ class LocalFolderRelayStorage:
     def timing_probe(self) -> tuple[float | None, float]:
         """Return server mtime plus one metadata-request roundtrip."""
         self.root.mkdir(parents=True, exist_ok=True)
-        probe = self.root / f".s-kanban-timing-{os.getpid()}-{uuid_mod.uuid4().hex}"
+        probe = self.root / f".sovereign-timing-{os.getpid()}-{uuid_mod.uuid4().hex}"
         try:
             probe.write_bytes(b"")
             started = time.monotonic()
@@ -339,7 +339,7 @@ class SftpRelayStorage:
         """Authenticate and verify write access without leaving relay data."""
         probe = posixpath.join(
             self.root,
-            f".s-kanban-probe-{os.getpid()}-{uuid_mod.uuid4().hex}",
+            f".sovereign-probe-{os.getpid()}-{uuid_mod.uuid4().hex}",
         )
 
         def operation(sftp):
@@ -519,7 +519,7 @@ class SftpRelayStorage:
         """Measure one SFTP request and remove the clock probe afterwards."""
         probe = posixpath.join(
             self.root,
-            f".s-kanban-timing-{os.getpid()}-{uuid_mod.uuid4().hex}",
+            f".sovereign-timing-{os.getpid()}-{uuid_mod.uuid4().hex}",
         )
 
         def operation(sftp):
