@@ -319,6 +319,7 @@ const SovereignShell = {
       '<div class="shell-row"><button type="button" id="shellCopyTokenBtn">Copy share token</button></div>',
       '<label for="shellTokenInput">Paste a share token</label>',
       '<div class="shell-row"><input id="shellTokenInput" placeholder="Paste a share token"><button type="button" id="shellConnectBtn">Connect</button></div>',
+      '<div id="shellConnectionExtras" class="shell-row"></div>',
       '<p id="shellConnectionNote" class="shell-note"></p>',
       '<menu><button type="button" id="shellConnectionCloseBtn">Close</button></menu>',
       "</form></dialog>",
@@ -326,13 +327,21 @@ const SovereignShell = {
       '<form method="dialog" class="shell-panel">',
       "<h2>Relay targets</h2>",
       '<div id="shellTargetList" class="shell-target-list"></div>',
-      '<fieldset class="shell-target-form"><legend>Add an SFTP target</legend>',
+      '<fieldset class="shell-target-form">',
+      '<legend id="shellTargetFormTitle">Add an SFTP target</legend>',
       '<input id="shellTargetName" placeholder="Name">',
       '<input id="shellTargetHost" placeholder="Host">',
       '<input id="shellTargetPort" type="number" value="22" min="1" max="65535">',
       '<input id="shellTargetUser" placeholder="Username">',
+      '<input id="shellTargetPassword" type="password" placeholder="Password (optional)">',
       '<input id="shellTargetRoot" placeholder="Remote path" value="/">',
-      '<button type="button" id="shellAddTargetBtn">Add target</button></fieldset>',
+      '<input id="shellTargetPoll" type="number" value="3" min="1" max="300" title="Poll every (seconds)">',
+      '<div class="shell-row">',
+      '<button type="button" id="shellAddTargetBtn">Test &amp; save</button>',
+      '<button type="button" id="shellCancelTargetBtn" hidden>Cancel edit</button>',
+      "</div>",
+      '<p class="shell-note">Leave the password blank to use key authentication or your SSH agent. A password entered here is stored in this client&#39;s local session data.</p>',
+      "</fieldset>",
       '<p id="shellTargetsNote" class="shell-note"></p>',
       '<menu><button type="button" id="shellTargetsCloseBtn">Close</button></menu>',
       "</form></dialog>",
@@ -348,20 +357,76 @@ const SovereignShell = {
       this._assignTarget(event.target.value);
     document.getElementById("shellCopyTokenBtn").onclick = () => this._copyToken();
     document.getElementById("shellConnectBtn").onclick = () => this._connect();
-    document.getElementById("shellAddTargetBtn").onclick = () => this._addTarget();
+    document.getElementById("shellAddTargetBtn").onclick = () => this._saveTarget();
+    document.getElementById("shellCancelTargetBtn").onclick = () => this._resetTargetForm();
+  },
+
+  _editingTargetId: "",
+
+  _resetTargetForm() {
+    this._editingTargetId = "";
+    document.getElementById("shellTargetFormTitle").textContent = "Add an SFTP target";
+    document.getElementById("shellCancelTargetBtn").hidden = true;
+    const values = {
+      shellTargetName: "", shellTargetHost: "", shellTargetPort: "22",
+      shellTargetUser: "", shellTargetPassword: "", shellTargetRoot: "/",
+      shellTargetPoll: "3",
+    };
+    for (const id of Object.keys(values)) {
+      document.getElementById(id).value = values[id];
+    }
+  },
+
+  _loadTargetIntoForm(target) {
+    this._editingTargetId = target.id;
+    document.getElementById("shellTargetFormTitle").textContent =
+      "Edit " + target.name;
+    document.getElementById("shellCancelTargetBtn").hidden = false;
+    document.getElementById("shellTargetName").value = target.name || "";
+    document.getElementById("shellTargetHost").value = target.host || "";
+    document.getElementById("shellTargetPort").value = target.port || 22;
+    document.getElementById("shellTargetUser").value = target.username || "";
+    // The stored password is never sent back to the browser. Leaving this
+    // blank keeps whatever is already saved; typing replaces it.
+    document.getElementById("shellTargetPassword").value = "";
+    document.getElementById("shellTargetRoot").value = target.root || "/";
+    document.getElementById("shellTargetPoll").value =
+      target.poll_interval_seconds || 3;
   },
 
   _note(id, message) {
     document.getElementById(id).textContent = message;
   },
 
+  _panelTopic: "",
+
   _topic() {
+    if (this._panelTopic) return this._panelTopic;
     return this._options.topicUuid ? this._options.topicUuid() : "";
   },
 
-  openConnectionPanel() {
+  // topicUuid overrides the mounted default, so a multi-topic view such as a
+  // board overview can share one specific topic. extras carries actions the
+  // shell has no business knowing about - "stop discussing" belongs to the
+  // application that owns the topic type, not to Core.
+  openConnectionPanel(panel) {
+    const request = panel || {};
     this._ensureDialogs();
+    this._panelTopic = request.topicUuid || "";
     const state = this._options.state ? this._options.state() : {};
+    const extraRow = document.getElementById("shellConnectionExtras");
+    extraRow.replaceChildren();
+    for (const extra of request.extras || []) {
+      const button = document.createElement("button");
+      button.type = "button";
+      if (extra.className) button.className = extra.className;
+      button.textContent = extra.label;
+      button.onclick = () => {
+        document.getElementById("shellConnectionModal").close();
+        extra.onClick();
+      };
+      extraRow.append(button);
+    }
     const select = document.getElementById("shellTargetSelect");
     const wanted = [["", "Not assigned"]];
     for (const item of state.channel_targets || []) wanted.push([item.id, item.name]);
@@ -372,7 +437,8 @@ const SovereignShell = {
       option.textContent = pair[1];
       select.append(option);
     }
-    select.value = state.channel_target_id || "";
+    select.value = (request.topicUuid
+      ? request.targetId : state.channel_target_id) || "";
     const topic = this._topic();
     select.disabled = !topic;
     document.getElementById("shellCopyTokenBtn").disabled = !topic || !select.value;
@@ -479,7 +545,20 @@ const SovereignShell = {
       name.textContent = target.name;
       const where = document.createElement("span");
       where.className = "shell-note";
-      where.textContent = target.host ? target.host + ":" + target.port : target.root;
+      const location = target.host
+        ? target.username + "@" + target.host + ":" + target.port + target.root
+        : target.root;
+      const timing = target.timing || {};
+      const timingText = timing.roundtrip_ms == null
+        ? "timing pending"
+        : "RTT " + Math.round(timing.roundtrip_ms) + " ms, relay "
+          + Math.round(timing.relay_cycle_ms || 0) + " ms";
+      where.textContent = location + " - " + timingText;
+      if (timing.server_clock_offset_ms != null) {
+        where.title = "Relay clock offset "
+          + Math.round(timing.server_clock_offset_ms) + " ms (+/- "
+          + Math.round(timing.clock_uncertainty_ms || 0) + " ms)";
+      }
       const test = document.createElement("button");
       test.type = "button";
       test.textContent = "Test";
@@ -491,6 +570,19 @@ const SovereignShell = {
         } catch (error) {
           this._note("shellTargetsNote", target.name + ": " + error.message);
         }
+      };
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.textContent = "Edit";
+      // The form describes an SFTP target. A local-folder target has no
+      // host, so offering Edit would round-trip it through an SFTP payload
+      // and reject it for a missing host.
+      edit.disabled = !target.host;
+      edit.title = target.host
+        ? "Edit this target" : "Only SFTP targets are editable here";
+      edit.onclick = () => {
+        this._loadTargetIntoForm(target);
+        this._note("shellTargetsNote", "Editing " + target.name + ".");
       };
       const remove = document.createElement("button");
       remove.type = "button";
@@ -506,12 +598,13 @@ const SovereignShell = {
           this._note("shellTargetsNote", error.message);
         }
       };
-      row.append(name, where, test, remove);
+      row.append(name, where, test, edit, remove);
       list.append(row);
     }
   },
 
-  async _addTarget() {
+  async _saveTarget() {
+    const password = document.getElementById("shellTargetPassword").value;
     const values = {
       name: document.getElementById("shellTargetName").value.trim(),
       backend: "sftp",
@@ -519,19 +612,26 @@ const SovereignShell = {
       port: Number(document.getElementById("shellTargetPort").value) || 22,
       username: document.getElementById("shellTargetUser").value.trim(),
       root: document.getElementById("shellTargetRoot").value.trim() || "/",
+      poll_interval_seconds:
+        Number(document.getElementById("shellTargetPoll").value) || 3,
     };
+    // Only send a password when one was typed, so saving an edit without
+    // retyping it keeps the stored secret instead of blanking it.
+    if (password) values.password = password;
+    if (this._editingTargetId) values.target_id = this._editingTargetId;
     if (!values.name || !values.host || !values.username) {
       this._note("shellTargetsNote", "Name, host, and username are required.");
       return;
     }
+    const editing = Boolean(this._editingTargetId);
     this._note("shellTargetsNote", "Verifying the target...");
     try {
       await this._post("/api/channels/mailbox/targets", values);
-      for (const id of ["shellTargetName", "shellTargetHost", "shellTargetUser"]) {
-        document.getElementById(id).value = "";
-      }
+      this._resetTargetForm();
       await this._renderTargets();
-      this._note("shellTargetsNote", values.name + " added.");
+      this._note(
+        "shellTargetsNote", values.name + (editing ? " saved." : " added."),
+      );
       await this._changed();
     } catch (error) {
       this._note("shellTargetsNote", error.message);

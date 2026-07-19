@@ -246,7 +246,7 @@ dialog menu .danger:not(:last-child) {
 }
 .shell-target-row {
   display: grid;
-  grid-template-columns: 1fr auto auto auto;
+  grid-template-columns: 1fr auto auto auto auto;
   gap: 8px;
   align-items: center;
 }
