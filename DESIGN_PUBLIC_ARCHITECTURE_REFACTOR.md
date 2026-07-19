@@ -939,6 +939,65 @@ and a clean frozen-launcher build/entry-point smoke on Windows.
 Exit: Core, S-Kanban, and Personal Cockpit repositories can be published without
 history rewriting afterward.
 
+#### Tooling
+
+Two local-only commands. Neither creates nor pushes a public repository, and the
+rehearsal strips the clone's remote so an accidental `git push` has no target.
+
+| Command | Does |
+|---|---|
+| `tools/rehearse_repository_split.py <out> --filter-repo <path>` | Clones, runs `git-filter-repo` per repository plan, applies path renames, swaps in each release `pyproject.toml`, and writes `LICENSE` plus `LICENSES/` from digest-pinned official texts |
+| `tools/verify_repository_split.py <out>` | Checks required files, clean tree, absent remotes, scans **every** commit for forbidden paths and secret patterns, builds four wheels, asserts packaged license payloads, installs pinned and editable, and runs each repository's tests |
+
+Published-repository scaffolding lives in `release/repositories/<name>/` and is
+filtered into place; `release-pyproject.toml` becomes the repository's real
+`pyproject.toml` during the split.
+
+The split produces **four** distributions, not three: S-Agreement travels inside
+Core as `examples/s-agreement/`, per the licensing plan's "minimal non-product
+example applications" clause, and therefore carries Core's LGPL rather than an
+application Apache-2.0 license.
+
+#### What the rehearsal proves, and what it cannot
+
+Automated: file presence, remote absence, whole-history path and secret scanning,
+four-wheel build, packaged license payloads, pinned **and** editable cross-repository
+installation, and each repository's tests in isolation.
+
+Not automated — these remain human gates and must not be inferred from a passing
+rehearsal:
+
+- **G5 legal review.** One review of the code/documentation/contribution license
+  package before public contribution; a second focused review before any frozen
+  executable. A green rehearsal is evidence for that review, not a substitute.
+- **G2 name availability.** Repository, distribution, domain, and trademark
+  checks for `sovereign-core`, `s-kanban`, `personal-cockpit`.
+- **Credential rotation.** The scanner proves no secret is *present*; it cannot
+  prove no credential ever needs rotating.
+- **O1 lead-application choice**, still provisional.
+- **Dependency licence audit** (`DESIGN_REPOSITORY_LICENSING.md` §9). The
+  inventory exists at `release/repositories/core/dependency-inventory.json`;
+  confirming it is complete and accurate is a human step.
+
+#### Evidence
+
+`verify_repository_split.py` writes `R8_VERIFICATION.json` into the rehearsal
+output directory. Record the run here before ticking the R8 publication gate.
+
+- **Status: PENDING an independently reproduced run.**
+- Codex reported a full passing rehearsal (four wheels, pinned and editable
+  integration, all split-repository tests, license payloads present, history
+  scans passed, no remotes) on 2026-07-19. That result is **recorded as reported
+  and not independently reproduced** — a review run failed at the license fetch,
+  which is why the User-Agent fix below exists. Treat the claim as unverified
+  until a clean-machine run is pasted in.
+- Reproducibility defect, fixed: the license hosts reject urllib's default
+  User-Agent with `HTTP 403`, so a clean-machine rehearsal could not fetch the
+  official texts and only succeeded with a pre-populated `--license-cache` that
+  is not in the repository. `download_verified` now sends a tool User-Agent and
+  writes the cache after the digest matches, so the first run populates it and
+  later runs can work offline.
+
 ## 14.1 Review follow-ups
 
 Findings from the implementation reviews, recorded so they survive independently

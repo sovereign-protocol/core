@@ -95,8 +95,16 @@ public announcement. P2 may follow publicly.
 #### Architecture and licenses
 
 - [ ] Architecture R0–R7 and the R8 repository-split rehearsal completed.
+      R0–R7 are done. The R8 tooling and release scaffolding exist
+      (`tools/rehearse_repository_split.py`, `tools/verify_repository_split.py`,
+      `release/repositories/`); the rehearsal result itself is **pending an
+      independently reproduced run** — record it under "R8 — Evidence" in
+      `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` §14 before ticking this box.
 - [ ] Core, S-Kanban, and Personal Cockpit repositories pass clean-install and
-      cross-repository integration tests.
+      cross-repository integration tests. Automated by
+      `verify_repository_split.py` across four distributions — Core,
+      `examples/s-agreement` inside Core, S-Kanban, Personal Cockpit — against
+      both pinned wheels and editable installs.
 - [ ] Core contains no application imports, names, or node-type assumptions.
 - [ ] Licenses and inbound contribution policy approved.
 - [ ] Dependency/license inventory completed.
