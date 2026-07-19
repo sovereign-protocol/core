@@ -69,6 +69,8 @@ import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
 
+from blob_store import blob_hex, blob_id_for
+
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
@@ -81,7 +83,7 @@ class LocalFolderRelayStorage:
         self.root = Path(root)
 
     def write_snapshot(self, topic_uuid: str, peer_id: str, state_hash: str,
-                       payload: dict) -> None:
+                       payload: dict, blob_ids: set[str] | None = None) -> None:
         peer_dir = self._peer_dir(topic_uuid, peer_id)
         snapshots_dir = peer_dir / "snapshots"
         snapshots_dir.mkdir(parents=True, exist_ok=True)
@@ -94,6 +96,8 @@ class LocalFolderRelayStorage:
             "updated_at": now_iso(),
             "snapshot": f"snapshots/{state_hash}.json",
             "observed": payload.get("_relay_observed", {}),
+            "blobs": sorted(blob_ids or set()),
+            "previous_blobs": sorted(previous.get("blobs") or []),
         }
         self._write_json(peer_dir / "head.json", head)
         # GC superseded snapshots (review R-4): keep the new one plus the
@@ -113,6 +117,81 @@ class LocalFolderRelayStorage:
             probe.write_bytes(b"")
         finally:
             probe.unlink(missing_ok=True)
+
+    def write_blob(self, blob_id: str, data: bytes) -> None:
+        if blob_id_for(data) != blob_id:
+            raise ValueError("blob hash mismatch")
+        digest = blob_hex(blob_id)
+        path = self.root / "blobs" / digest[:2] / digest
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if path.is_file():
+            if self.read_blob(blob_id) is None:
+                raise ValueError("relay blob is corrupt")
+            return
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.{uuid_mod.uuid4().hex}.tmp")
+        try:
+            tmp.write_bytes(data)
+            os.replace(tmp, path)
+        finally:
+            tmp.unlink(missing_ok=True)
+
+    def read_blob(self, blob_id: str) -> bytes | None:
+        digest = blob_hex(blob_id)
+        path = self.root / "blobs" / digest[:2] / digest
+        if not path.is_file():
+            return None
+        data = path.read_bytes()
+        return data if blob_id_for(data) == blob_id else None
+
+    def has_blob(self, blob_id: str) -> bool:
+        return self.read_blob(blob_id) is not None
+
+    def list_blob_ids(self) -> list[str]:
+        root = self.root / "blobs"
+        if not root.is_dir():
+            return []
+        found = []
+        for shard in root.iterdir():
+            if not shard.is_dir():
+                continue
+            for path in shard.iterdir():
+                blob_id = f"sha256:{path.name}"
+                try:
+                    blob_hex(blob_id)
+                except ValueError:
+                    continue
+                if path.is_file():
+                    found.append(blob_id)
+        return sorted(found)
+
+    def write_blob_lease(self, blob_id: str, peer_id: str, payload: dict) -> None:
+        digest = blob_hex(blob_id)
+        self._write_json(
+            self.root / "blob_leases" / digest / f"{peer_id}.json", payload,
+        )
+
+    def delete_blob_lease(self, blob_id: str, peer_id: str) -> None:
+        digest = blob_hex(blob_id)
+        path = self.root / "blob_leases" / digest / f"{peer_id}.json"
+        path.unlink(missing_ok=True)
+
+    def list_blob_leases(self) -> dict[str, list[dict]]:
+        root = self.root / "blob_leases"
+        out: dict[str, list[dict]] = {}
+        if not root.is_dir():
+            return out
+        for directory in root.iterdir():
+            blob_id = f"sha256:{directory.name}"
+            try:
+                blob_hex(blob_id)
+            except ValueError:
+                continue
+            if directory.is_dir():
+                out[blob_id] = [
+                    value for path in directory.glob("*.json")
+                    if (value := self._read_json(path)) is not None
+                ]
+        return out
 
     def read_head(self, topic_uuid: str, peer_id: str) -> dict | None:
         return self._read_json(self._peer_dir(topic_uuid, peer_id) / "head.json")
@@ -215,7 +294,7 @@ class SftpRelayStorage:
         self._operation_lock = threading.RLock()
 
     def write_snapshot(self, topic_uuid: str, peer_id: str, state_hash: str,
-                       payload: dict) -> None:
+                       payload: dict, blob_ids: set[str] | None = None) -> None:
         peer_dir = self._peer_dir(topic_uuid, peer_id)
         snapshots_dir = posixpath.join(peer_dir, "snapshots")
         previous = self._read_json(posixpath.join(peer_dir, "head.json")) or {}
@@ -227,6 +306,8 @@ class SftpRelayStorage:
             "updated_at": now_iso(),
             "snapshot": f"snapshots/{state_hash}.json",
             "observed": payload.get("_relay_observed", {}),
+            "blobs": sorted(blob_ids or set()),
+            "previous_blobs": sorted(previous.get("blobs") or []),
         }
         self._write_json(posixpath.join(peer_dir, "head.json"), head)
         self._gc_snapshots(
@@ -273,6 +354,120 @@ class SftpRelayStorage:
                     pass
 
         self._with_retry(operation)
+
+    def write_blob(self, blob_id: str, data: bytes) -> None:
+        if blob_id_for(data) != blob_id:
+            raise ValueError("blob hash mismatch")
+        digest = blob_hex(blob_id)
+        path = posixpath.join(self.root, "blobs", digest[:2], digest)
+        tmp_path = f"{path}.{uuid_mod.uuid4().hex}.tmp"
+
+        def operation(sftp):
+            self._mkdir_p(sftp, posixpath.dirname(path))
+            try:
+                with sftp.open(path, "rb") as handle:
+                    existing = handle.read()
+                if blob_id_for(existing) != blob_id:
+                    raise ValueError("relay blob is corrupt")
+                return
+            except FileNotFoundError:
+                pass
+            with sftp.open(tmp_path, "wb") as handle:
+                handle.write(data)
+            self._atomic_rename(sftp, tmp_path, path)
+
+        self._with_retry(operation)
+
+    def read_blob(self, blob_id: str) -> bytes | None:
+        digest = blob_hex(blob_id)
+        path = posixpath.join(self.root, "blobs", digest[:2], digest)
+
+        def operation(sftp):
+            try:
+                with sftp.open(path, "rb") as handle:
+                    data = handle.read()
+            except FileNotFoundError:
+                return None
+            return data if blob_id_for(data) == blob_id else None
+
+        return self._with_retry(operation)
+
+    def has_blob(self, blob_id: str) -> bool:
+        return self.read_blob(blob_id) is not None
+
+    def list_blob_ids(self) -> list[str]:
+        def operation(sftp):
+            root = posixpath.join(self.root, "blobs")
+            try:
+                shards = sftp.listdir_attr(root)
+            except FileNotFoundError:
+                return []
+            found = []
+            for shard in shards:
+                if not stat.S_ISDIR(shard.st_mode or 0):
+                    continue
+                try:
+                    entries = sftp.listdir_attr(posixpath.join(root, shard.filename))
+                except FileNotFoundError:
+                    continue
+                for entry in entries:
+                    if not stat.S_ISDIR(entry.st_mode or 0) and len(entry.filename) == 64:
+                        blob_id = f"sha256:{entry.filename}"
+                        try:
+                            blob_hex(blob_id)
+                        except ValueError:
+                            continue
+                        found.append(blob_id)
+            return sorted(found)
+
+        return self._with_retry(operation)
+
+    def write_blob_lease(self, blob_id: str, peer_id: str, payload: dict) -> None:
+        digest = blob_hex(blob_id)
+        self._write_json(
+            posixpath.join(self.root, "blob_leases", digest, f"{peer_id}.json"),
+            payload,
+        )
+
+    def delete_blob_lease(self, blob_id: str, peer_id: str) -> None:
+        digest = blob_hex(blob_id)
+        path = posixpath.join(self.root, "blob_leases", digest, f"{peer_id}.json")
+
+        def operation(sftp):
+            try:
+                sftp.remove(path)
+            except FileNotFoundError:
+                pass
+
+        self._with_retry(operation)
+
+    def list_blob_leases(self) -> dict[str, list[dict]]:
+        def operation(sftp):
+            root = posixpath.join(self.root, "blob_leases")
+            try:
+                directories = sftp.listdir_attr(root)
+            except FileNotFoundError:
+                return {}
+            out = {}
+            for directory in directories:
+                if not stat.S_ISDIR(directory.st_mode or 0):
+                    continue
+                blob_id = f"sha256:{directory.filename}"
+                try:
+                    blob_hex(blob_id)
+                except ValueError:
+                    continue
+                lease_dir = posixpath.join(root, directory.filename)
+                values = []
+                for entry in sftp.listdir_attr(lease_dir):
+                    if stat.S_ISDIR(entry.st_mode or 0):
+                        continue
+                    with sftp.open(posixpath.join(lease_dir, entry.filename), "rb") as handle:
+                        values.append(json.loads(handle.read().decode("utf-8")))
+                out[blob_id] = values
+            return out
+
+        return self._with_retry(operation)
 
     def read_head(self, topic_uuid: str, peer_id: str) -> dict | None:
         return self._read_json(posixpath.join(self._peer_dir(topic_uuid, peer_id), "head.json"))

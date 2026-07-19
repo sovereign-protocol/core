@@ -209,6 +209,7 @@ class Session:
                 "email": "",
                 "display_name": "",
                 "picture": "",
+                "attachments": [],
             },
             {},
         ).value
@@ -237,13 +238,16 @@ class Session:
         if "picture" not in data:
             data["picture"] = ""
             changed = True
+        if "attachments" not in data:
+            data["attachments"] = []
+            changed = True
         if changed:
             self.modify(node.uuid, data, node.weights)
             return self.get_node(node.uuid) or node
         return node
 
     @_session_locked
-    def set_identity(self, display_name: str, picture: str = "",
+    def set_identity(self, display_name: str, picture: str | None = None,
                      email: str | None = None) -> SessionResult:
         profile = self.identity
         data = dict(profile.data)
@@ -251,8 +255,9 @@ class Session:
             "type": "shared_user_profile",
             "name": "public_profile",
             "display_name": display_name or "",
-            "picture": picture or "",
         })
+        if picture is not None:
+            data["picture"] = picture or ""
         if email is not None:
             data["email"] = email
         return self.modify(profile.uuid, data, profile.weights)

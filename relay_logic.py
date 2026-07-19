@@ -108,6 +108,7 @@ from functools import wraps
 from pathlib import Path
 from typing import Any
 
+from blob_store import blob_hex, referenced_blob_ids
 from kanban_logic import KANBAN_APP_NAME, KanbanLogic
 from protocol import PRSPNode
 from session import Session, SessionResult
@@ -335,6 +336,13 @@ class RelayLogic:
         self._io_lock = threading.RLock()
         self._session_lock = session.lock
         self.kanban = KanbanLogic(session, config)
+        self.blob_store = config.get("_blob_store")
+        self._manager = None
+        try:
+            lease_seconds = float(config.get("relay_blob_lease_seconds", 300.0))
+        except (TypeError, ValueError):
+            lease_seconds = 300.0
+        self.blob_lease_seconds = max(30.0, lease_seconds)
         self.identity = config.get("relay_identity") or self.kanban.user_profile().uuid
         self.storage = self._build_storage(config)
         adopted_descriptor = None
@@ -842,7 +850,37 @@ class RelayLogic:
             if current_hash is None or payload is None:
                 continue
             payload["_relay_observed"] = observed
-            self.storage.write_snapshot(topic_uuid, self.identity, current_hash, payload)
+            blob_ids = referenced_blob_ids(payload.get("subtree"))
+            leased: list[str] = []
+            publish_ready = True
+            try:
+                for blob_id in sorted(blob_ids):
+                    if self.storage.has_blob(blob_id):
+                        continue
+                    data = self.blob_store.read_blob(blob_id) if self.blob_store else None
+                    if data is None:
+                        print(f"[relay] snapshot publish deferred: missing {blob_id}")
+                        publish_ready = False
+                        break
+                    self.storage.write_blob_lease(blob_id, self.identity, {
+                        "blob_id": blob_id,
+                        "peer": self.identity,
+                        "expires_at": (
+                            self.timing.server_now() or time.time()
+                        ) + self.blob_lease_seconds,
+                    })
+                    leased.append(blob_id)
+                    self.storage.write_blob(blob_id, data)
+                if not publish_ready:
+                    continue
+                # The head is the commit point: every referenced blob is
+                # durable before another client can discover the snapshot.
+                self.storage.write_snapshot(
+                    topic_uuid, self.identity, current_hash, payload, blob_ids=blob_ids,
+                )
+            finally:
+                for blob_id in leased:
+                    self.storage.delete_blob_lease(blob_id, self.identity)
             self._state["published"][topic_uuid] = current_hash
             self._state["published_observations"][topic_uuid] = observed_digest
             published.append(topic_uuid)
@@ -850,6 +888,60 @@ class RelayLogic:
             self._last_publish_server_time = self.timing.server_now()
             self._save_state()
         return published
+
+    @_relay_io_locked
+    def read_blob(self, blob_id: str) -> bytes | None:
+        if not self.storage:
+            return None
+        try:
+            blob_hex(blob_id)
+        except ValueError:
+            return None
+        return self.storage.read_blob(blob_id)
+
+    @_relay_io_locked
+    def blob_gc_report(self) -> dict:
+        """Complete relay mark scan; deliberately reports but does not delete."""
+        if not self.storage:
+            return {
+                "existing": [], "referenced": [], "leased": [],
+                "candidates": [], "collectible": [],
+            }
+        referenced: set[str] = set()
+        for topic_uuid in self.storage.list_topics():
+            for peer_id in self.storage.list_peers(topic_uuid):
+                head = self.storage.read_head(topic_uuid, peer_id) or {}
+                for field in ("blobs", "previous_blobs"):
+                    for blob_id in head.get(field) or []:
+                        try:
+                            blob_hex(blob_id)
+                        except ValueError:
+                            continue
+                        referenced.add(blob_id)
+        now = self.timing.server_now() or time.time()
+        leased = set()
+        for blob_id, leases in self.storage.list_blob_leases().items():
+            for item in leases:
+                try:
+                    live = float(item.get("expires_at") or 0) > now
+                except (AttributeError, TypeError, ValueError):
+                    live = False
+                if live:
+                    leased.add(blob_id)
+                    break
+        existing = set(self.storage.list_blob_ids())
+        unreferenced = existing - referenced - leased
+        previous = set(self._state.get("blob_gc_candidates", []))
+        collectible = unreferenced & previous
+        self._state["blob_gc_candidates"] = sorted(unreferenced)
+        self._save_state()
+        return {
+            "existing": sorted(existing),
+            "referenced": sorted(referenced),
+            "leased": sorted(leased),
+            "candidates": sorted(unreferenced - collectible),
+            "collectible": sorted(collectible),
+        }
 
     def _is_redundant_relay_peer(self, peer_addr: str) -> bool:
         # True once peer_addr's identity is *currently* reachable through
@@ -939,6 +1031,22 @@ class RelayLogic:
                 head = self.storage.read_head(topic_uuid, peer_id)
                 if not head:
                     continue
+                # Avatar blobs are small, so the MVP eagerly caches them.
+                # Besides making rendering immediate, this makes a client a
+                # safe bridge when it republishes the adopted profile through
+                # a different relay target. Larger future attachments can add
+                # a lazy policy without changing the manifest format.
+                if self.blob_store is not None:
+                    for blob_id in head.get("blobs") or []:
+                        try:
+                            blob_hex(blob_id)
+                        except ValueError:
+                            continue
+                        if self.blob_store.has_blob(blob_id):
+                            continue
+                        blob_data = self.storage.read_blob(blob_id)
+                        if blob_data is not None:
+                            self.blob_store.write_blob(blob_data)
                 observed_for_me = (head.get("observed") or {}).get(self.identity, {})
                 with self._session_lock:
                     observations_changed = self.session.record_peer_observations(
@@ -1157,6 +1265,7 @@ class RelayManager:
         # The implicit connection: built from the flat config (or a persisted
         # adopted-descriptor) exactly as before. Registered by fingerprint.
         self.primary = RelayLogic(session, config)
+        self.primary._manager = self
         self.primary._session_lock = self._session_lock
         self._primary_fingerprint = _relay_fingerprint(self.primary.storage)
         self.connections[self._primary_fingerprint] = self.primary
@@ -1321,6 +1430,8 @@ class RelayManager:
                 "app_module": self.config.get("app_module"),
                 "relay_identity": self.config.get("relay_identity") or self.session.identity.uuid,
                 "relay_poll_interval_seconds": record.get("poll_interval_seconds", 3),
+                "relay_blob_lease_seconds": self.config.get("relay_blob_lease_seconds", 300),
+                "_blob_store": self.config.get("_blob_store"),
             }
             state_directory = self.config.get("relay_state_directory")
             if state_directory:
@@ -1343,6 +1454,7 @@ class RelayManager:
                 })
             connection = RelayLogic(self.session, connection_config)
             connection._session_lock = self._session_lock
+            connection._manager = self
             self.connections[fingerprint] = connection
             return connection
 
@@ -1735,6 +1847,32 @@ class RelayManager:
             return conns[0].status_payload()
         return {"connections": [conn.status_payload() for conn in conns]}
 
+    def read_blob(self, blob_id: str, exclude: RelayLogic | None = None) -> bytes | None:
+        for connection in self.all_connections():
+            if connection is exclude:
+                continue
+            try:
+                data = connection.read_blob(blob_id)
+            except Exception:
+                continue
+            if data is not None:
+                return data
+        return None
+
+    def blob_gc_report(self) -> dict:
+        reports = []
+        for connection in self.all_connections():
+            try:
+                report = connection.blob_gc_report()
+                report["connection"] = _relay_fingerprint(connection.storage)
+                reports.append(report)
+            except Exception as exc:
+                reports.append({
+                    "connection": _relay_fingerprint(connection.storage),
+                    "error": str(exc),
+                })
+        return {"mode": "report-only", "connections": reports}
+
     def delete_topic(self, topic_uuid: str) -> SessionResult:
         for conn in self.all_connections():
             if topic_uuid in conn._state.get("published", {}) or topic_uuid in conn._state.get("applied", {}):
@@ -1766,6 +1904,9 @@ def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
         if result.status != "ok":
             return JSONResponse({"status": "error", "reason": result.reason}, status_code=400)
         return JSONResponse({"status": "ok", "topic_uuid": result.value})
+
+    async def api_relay_blob_gc(request: Request):
+        return JSONResponse(await asyncio.to_thread(logic.blob_gc_report))
 
     async def api_targets(request: Request):
         if request.method == "GET":
@@ -1817,6 +1958,7 @@ def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:
     return [
         Route("/api/relay/status", api_relay_status),
         Route("/api/relay/delete_topic", api_relay_delete_topic, methods=["POST"]),
+        Route("/api/relay/blob_gc", api_relay_blob_gc),
         Route("/api/relay/targets", api_targets, methods=["GET", "POST"]),
         Route("/api/relay/targets/test", api_test_target, methods=["POST"]),
         Route("/api/relay/targets/delete", api_delete_target, methods=["POST"]),
