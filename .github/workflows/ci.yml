@@ -1,0 +1,22 @@
+name: CI
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {os: windows-latest, python: "3.10", experimental: false}
+          - {os: windows-latest, python: "3.14", experimental: false}
+          - {os: ubuntu-latest, python: "3.14", experimental: true}
+    runs-on: ${{ matrix.os }}
+    continue-on-error: ${{ matrix.experimental }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "${{ matrix.python }}"}
+      - run: python -m pip install ".[test]" -e ./examples/s-agreement
+      - run: python -m pip check
+      - if: runner.os == 'Windows' && matrix.python == '3.14'
+        run: python tools/check_dependency_inventory.py
+      - run: python -m pytest -q

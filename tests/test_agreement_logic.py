@@ -3,13 +3,48 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import app_server
 from s_agreement.application import APPLICATION_MANIFEST
 from s_agreement.logic import AgreementLogic
 from sovereign import Session
+from sovereign import app_server
 from sovereign.relay_logic import RelayLogic
 
-from tests.test_kanban_new_logic import MemoryHttpClient
+
+class MemoryHttpClient:
+    def __init__(self, runtimes):
+        self.runtimes = runtimes
+
+    def get_json(self, url: str, timeout: float = 5) -> dict:
+        runtime, path = self._split(url)
+        if path.startswith("/p2p/subtree/"):
+            payload, status = runtime.adapter.p2p_subtree(path.rsplit("/", 1)[1])
+            if status != 200:
+                raise RuntimeError(payload.get("reason", "not found"))
+            return payload
+        raise RuntimeError(f"unexpected GET {path}")
+
+    def post_json(self, url: str, payload: dict,
+                  timeout: float = 5) -> dict:
+        runtime, path = self._split(url)
+        handlers = {
+            "/p2p/join": runtime.adapter.p2p_join,
+            "/p2p/sync_status": runtime.adapter.p2p_sync_status,
+            "/p2p/announce": runtime.adapter.p2p_announce,
+            "/p2p/leave": runtime.adapter.p2p_leave,
+        }
+        handler = handlers.get(path)
+        if not handler:
+            raise RuntimeError(f"unexpected POST {path}")
+        response, status = handler(payload)
+        if status != 200:
+            raise RuntimeError(response.get("reason", "request failed"))
+        return response
+
+    def _split(self, url: str):
+        for address in sorted(self.runtimes, key=len, reverse=True):
+            if url.startswith(address):
+                return self.runtimes[address], url[len(address):]
+        raise RuntimeError(f"unknown address in {url}")
 
 
 class AgreementLogicTests(unittest.TestCase):
@@ -174,7 +209,15 @@ class AgreementLogicTests(unittest.TestCase):
     @staticmethod
     def runtime(port: int):
         directory = tempfile.TemporaryDirectory()
-        config = app_server.load_config(None, "agreement")
+        config = app_server.load_config(None, "agreement", {
+            "agreement": {
+                "app_module": "s_agreement.application",
+                "application_id": "agreement",
+                "asset_package": "s_agreement.assets",
+                "ui_file": "agreement.html",
+                "css_file": "agreement.css",
+            },
+        })
         config["storage_file"] = str(Path(directory.name) / f"{port}.json")
         runtime = app_server.create_runtime(port, config)
         runtime._test_tmp = directory
