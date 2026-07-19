@@ -274,36 +274,61 @@ class HttpTransportAdapter:
             return {"status": "error", "reason": "topic_uuid is required"}
         try:
             peer_addr = peer_addr.rstrip("/")
-            adopted = []
+            fetched = []
             for topic_uuid in topic_uuids:
                 tree_payload = self.fetch_subtree(peer_addr, topic_uuid)
                 tree = self._decode_wire_subtree(tree_payload, peer_addr)
-                # The grafted tree and the cached peer copy must be distinct
-                # objects, or divergence checks between "our copy" and
-                # "their copy" would compare a node against itself. Copy
-                # before grafting: accept_topic_invitation re-parents `tree`
-                # into our own container, so a copy taken afterwards would
-                # hold our parent, not the peer's wire state. Decoding twice
-                # (the previous approach) also re-verified every hash for
-                # nothing.
+                fetched.append((tree, tree_payload.get("parent_uuid")))
+
+            # Core-owned topics accompany every relationship. The registry,
+            # not this transport, decides which handlers opt out of channel
+            # assignment scope.
+            core_topic_uuids = self.session.shared_topics.local_topic_uuids(())
+            response_topic_uuids = sorted({*topic_uuids, *core_topic_uuids})
+            for core_topic_uuid in core_topic_uuids:
+                self.session.start_discussion(core_topic_uuid)
+
+            adopted = []
+            grafted_topic_uuids = set()
+            for tree, parent_uuid in fetched:
                 cached_copy = copy.deepcopy(tree)
-                accepted = self.session.accept_topic_invitation(tree)
+                handler = self.session.shared_topics.handler_for(tree)
+                if (
+                    handler is None
+                    and self.session.shared_topics.has_assignment_scoped_handlers()
+                ):
+                    return {
+                        "status": "error",
+                        "reason": f"no active application accepts {tree.data.get('type')!r}",
+                    }
+                accepted = (
+                    handler.accept_invitation(tree)
+                    if handler else self.session.accept_topic_invitation(tree)
+                )
                 if accepted.status != "ok":
                     return {"status": "error", "reason": accepted.reason}
-                adopted.append(accepted.value)
+                if self.session.has_node(tree.uuid):
+                    grafted_topic_uuids.add(tree.uuid)
+                    adopted.append(tree.uuid)
                 self.session.apply_peer_subtree(
                     peer_addr,
                     cached_copy,
-                    tree_payload.get("parent_uuid"),
+                    parent_uuid,
                 )
 
             response = self.http.post_json(
                 self._url(peer_addr, "/p2p/join"),
                 {
                     "from_addr": self.session.address,
-                    "topic_uuid": topic_uuids[0],
-                    "topic_uuids": topic_uuids,
-                    "topic_members": self.session.topic_members_by_topic(topic_uuids),
+                    "topic_uuid": response_topic_uuids[0],
+                    "topic_uuids": response_topic_uuids,
+                    "pull_topic_uuids": sorted({
+                        *grafted_topic_uuids,
+                        *core_topic_uuids,
+                    }),
+                    "topic_members": self.session.topic_members_by_topic(
+                        response_topic_uuids,
+                    ),
                 },
                 timeout=10,
             )
@@ -319,39 +344,66 @@ class HttpTransportAdapter:
             return {"status": "error", "reason": str(exc)}
 
         topic_members = self.session.topic_members_from_map(
-            response.get("topic_members") or {}, topic_uuids,
+            response.get("topic_members") or {}, response_topic_uuids,
         )
         all_members = set()
-        for topic_uuid, members in topic_members.items():
+        indirect_members: dict[str, set[str]] = {}
+        for current_topic_uuid, members in topic_members.items():
             for member in members:
                 all_members.add(member)
                 if member != self.session.address:
-                    self.session.add_peer(member, topic_uuid)
+                    already_known = current_topic_uuid in self.session.peer_topic_sets.get(
+                        member, set(),
+                    )
+                    self.session.add_peer(
+                        member,
+                        current_topic_uuid,
+                        fetch_from_peer=(
+                            member == peer_addr and current_topic_uuid in topic_uuids
+                        ),
+                    )
+                    if (
+                        member != peer_addr
+                        and current_topic_uuid in grafted_topic_uuids
+                        and not already_known
+                    ):
+                        indirect_members.setdefault(member, set()).add(
+                            current_topic_uuid,
+                        )
         if peer_addr != self.session.address:
+            # The peer owns the topics we fetched from it. Do not also mark it
+            # as a member of our local Core profile: doing so turns that
+            # pairwise identity exchange into a global discussion and leaks
+            # unrelated peers across otherwise independent application topics.
             self.session.add_peer_topics(peer_addr, topic_uuids)
-            for topic_uuid in topic_uuids:
+            for current_topic_uuid in topic_uuids:
                 all_members.add(peer_addr)
-                topic_members.setdefault(topic_uuid, set()).add(peer_addr)
-        for topic_uuid, members in sorted(topic_members.items()):
-            for member in sorted(members):
-                if member in (self.session.address, peer_addr):
-                    continue
+                topic_members.setdefault(current_topic_uuid, set()).add(peer_addr)
+        for member, topics in sorted(indirect_members.items()):
+            for current_topic_uuid in sorted(topics):
                 self.execute_effect(SessionEffect(
                     "pull_subtree",
                     member,
-                    {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
+                    {
+                        "node_uuid": current_topic_uuid,
+                        "topic_uuid": current_topic_uuid,
+                    },
                 ))
-        for topic_uuid in topic_uuids:
-            self.execute_effects(self.session.sync_effects(topic_uuid))
+            self.invite_to_discuss(
+                member,
+                topic_uuids=sorted({*topics, *core_topic_uuids}),
+            )
+        for current_topic_uuid in response_topic_uuids:
+            self.execute_effects(self.session.sync_effects(current_topic_uuid))
         return {
             "status": "ok",
             "members": sorted(all_members),
-            "topic_uuids": topic_uuids,
+            "topic_uuids": response_topic_uuids,
             "adopted_root_uuid": adopted[0] if adopted else None,
             "adopted_root_uuids": adopted,
             "topic_members": {
-                topic_uuid: sorted(members)
-                for topic_uuid, members in sorted(topic_members.items())
+                current_topic_uuid: sorted(members)
+                for current_topic_uuid, members in sorted(topic_members.items())
             },
         }
 

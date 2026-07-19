@@ -726,6 +726,22 @@ Exit: a host running **no** applications, and a host running only the Agreement
 proof, both accept an invited profile topic and render display name and avatar.
 No `/api/kanban/*` route serves a Core concept.
 
+**Implemented R3a record:**
+
+- Core registers `shared_user_profile` as an unscoped, cache-only shared-topic
+  handler. Channels enumerate it through the registry and contain no profile
+  node-type branch or hand-appended identity UUID.
+- `CoreProfileService` owns profile editing and presentation. Core endpoints are
+  `GET|POST /api/core/profile` and `POST /api/core/profile/avatar`; the former
+  S-Kanban routes no longer exist and its UI calls the Core endpoints.
+- Direct HTTP invitation dispatch is Core-owned and routes mounting through the
+  shared-topic registry. S-Kanban no longer owns a `join_discussion` override.
+- Peer profiles remain cache-only and pairwise: accepting a profile never
+  grafts over the local sovereign identity and never cross-introduces peers from
+  unrelated application topics.
+- Zero-application profile editing/rendering and invitation acceptance are
+  covered explicitly. Full suite after R3a: **413 passed**.
+
 ### R4 — formalize channels
 
 - Introduce ChannelManager and capability protocols.

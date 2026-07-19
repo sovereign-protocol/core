@@ -58,8 +58,8 @@ when the last reference is removed**.
 ```
 POST /api/blob            (raw request body)  -> {blob_id, size, mime} # stores locally
 GET  /api/blob/{hash}                          -> bytes                # serves from local store
-POST /api/kanban/profile/avatar {attachment}                          # adds the avatar ref
-POST /api/kanban/profile/avatar {remove: true}                        # removes the avatar ref
+POST /api/core/profile/avatar {attachment}                            # adds the avatar ref
+POST /api/core/profile/avatar {remove: true}                          # removes the avatar ref
 ```
 
 Upload is a two-step: the client uploads bytes (gets a hash), then attaches the

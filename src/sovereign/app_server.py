@@ -71,6 +71,7 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from .protocol import ProtocolNode, UnsupportedProtocolVersion
+from .profile import CoreProfileService
 from .blob_store import (
     BlobStore, SAFE_IMAGE_MIMES, blob_hex, canonical_attachments,
     is_valid_image, referenced_blob_ids,
@@ -144,6 +145,7 @@ class AppRuntime:
     session: Session
     adapter: HttpTransportAdapter
     blob_store: BlobStore
+    profile: CoreProfileService
     logic: Any = None
     relay_wakeup: asyncio.Event | None = None
     relay_loop: asyncio.AbstractEventLoop | None = None
@@ -493,6 +495,7 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         session=session,
         adapter=HttpTransportAdapter(session, trace=trace),
         blob_store=blob_store,
+        profile=CoreProfileService(session),
     )
     runtime.logic = load_logic(config, session, runtime)
     return runtime
@@ -545,13 +548,8 @@ def collect_channel_descriptors(runtime: AppRuntime) -> list[dict]:
 def _dispatch_join_discussion(runtime: AppRuntime, address: str,
                               topic_uuid: str | None,
                               topic_uuids: list[str] | None) -> dict:
-    # Shared by /api/join_discussion and the http branch of /api/connect -
-    # an app (e.g. kanban_logic.py) may override join_discussion with its
-    # own richer, topic-type-aware accept logic; otherwise this falls back
-    # to the generic HttpTransportAdapter implementation.
-    join_discussion = getattr(runtime.logic, "join_discussion", None)
-    if join_discussion:
-        return join_discussion(runtime, address, topic_uuid, topic_uuids)
+    # Core owns invitation dispatch. Applications contribute only their
+    # registered validation/mounting callback through Session.shared_topics.
     return runtime.adapter.join_discussion(address, topic_uuid, topic_uuids)
 
 
@@ -758,6 +756,65 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
 
     async def api_network(request: Request):
         return JSONResponse(runtime.session.get_network_info())
+
+    async def profile_result(result) -> JSONResponse:
+        if result.status != "ok":
+            return JSONResponse(
+                {"status": "error", "reason": result.reason}, status_code=409,
+            )
+        deliveries = await asyncio.to_thread(
+            runtime.adapter.execute_effects, result.effects,
+        )
+        runtime.notify_change("profile")
+        payload = {"status": "ok", **runtime.profile.view()}
+        errors = [item for item in deliveries if not item.ok]
+        if errors:
+            payload["delivery_errors"] = [
+                {
+                    "effect_type": item.effect_type,
+                    "target": item.target,
+                    "reason": item.reason,
+                }
+                for item in errors
+            ]
+        return JSONResponse(payload)
+
+    async def api_core_profile(request: Request):
+        if request.method == "GET":
+            return JSONResponse({"status": "ok", **runtime.profile.view()})
+        data = await request.json()
+        return await profile_result(runtime.profile.set_profile(
+            data.get("name", data.get("display_name", "")),
+            data.get("picture") if "picture" in data else None,
+        ))
+
+    async def api_core_profile_avatar(request: Request):
+        data = await request.json()
+        reference = None if data.get("remove") else data.get("attachment")
+        if reference is not None:
+            normalized = canonical_attachments([reference])
+            if not normalized:
+                return JSONResponse(
+                    {"status": "error", "reason": "invalid attachment"},
+                    status_code=400,
+                )
+            reference = normalized[0]
+            blob_data = runtime.blob_store.read_blob(reference["blob_id"])
+            if blob_data is None:
+                return JSONResponse(
+                    {"status": "error", "reason": "uploaded blob not found"},
+                    status_code=409,
+                )
+            if not is_valid_image(blob_data, reference["mime"]):
+                return JSONResponse(
+                    {"status": "error", "reason": "invalid image data"},
+                    status_code=400,
+                )
+            reference["size"] = len(blob_data)
+        response = await profile_result(runtime.profile.set_avatar(reference))
+        if response.status_code < 400:
+            runtime.collect_local_blobs()
+        return response
 
     async def api_join_discussion(request: Request):
         if denied := direct_http_disabled():
@@ -1117,6 +1174,12 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         Route("/shared.js", serve_shared_js),
         Route("/api/protocol", api_protocol),
         Route("/api/network", api_network),
+        Route("/api/core/profile", api_core_profile, methods=["GET", "POST"]),
+        Route(
+            "/api/core/profile/avatar",
+            api_core_profile_avatar,
+            methods=["POST"],
+        ),
         Route("/api/join_discussion", api_join_discussion, methods=["POST"]),
         Route("/api/connect_token", api_connect_token, methods=["POST"]),
         Route("/api/connect", api_connect, methods=["POST"]),

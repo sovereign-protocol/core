@@ -38,6 +38,26 @@ class SharedTopicRegistryTests(unittest.TestCase):
         registry.unregister("app")
         self.assertFalse(registry.supports(ProtocolNode({"type": "new"})))
 
+    def test_unscoped_core_topic_survives_application_assignment_filter(self):
+        registry = SharedTopicRegistry()
+        profile = ProtocolNode({"type": "profile"})
+        board = ProtocolNode({"type": "board"})
+        registry.register(
+            "core", {"profile"}, lambda: [profile], lambda tree: None,
+            assignment_scoped=False, mount_invitation=False,
+        )
+        registry.register(
+            "app", {"board"}, lambda: [board], lambda tree: None,
+        )
+
+        self.assertEqual(registry.local_topic_uuids(()), [profile.uuid])
+        self.assertEqual(
+            set(registry.local_topic_uuids({board.uuid})),
+            {profile.uuid, board.uuid},
+        )
+        self.assertFalse(registry.invitation_requires_mount(profile))
+        self.assertTrue(registry.invitation_requires_mount(board))
+
 
 if __name__ == "__main__":
     unittest.main()

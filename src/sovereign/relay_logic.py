@@ -548,17 +548,12 @@ class RelayLogic:
 
     @_relay_io_locked
     def relay_topic_uuids(self) -> list[str]:
-        # Includes our own identity node alongside application topics: identity is
-        # otherwise only ever delivered once, inline in a connect token at
-        # accept time (Session.apply_peer_identity_snapshot) - a later
-        # display-name/picture edit would never reach an already-connected
-        # relay peer without this, since relay has no other identity-sync
-        # path. Application handlers decide how invited topic roots are
-        # mounted; identity and unknown roots remain peer-cache-only.
-        topic_uuids = set(self.session.shared_topics.local_topic_uuids())
-        if self._scoped_topic_uuids is not None:
-            topic_uuids &= self._scoped_topic_uuids
-        return sorted(topic_uuids) + [self.session.identity.uuid]
+        # The registry applies target assignment only to scoped application
+        # topics. Core-owned topics (currently the public profile) opt out and
+        # ride every relationship, so this channel names no node type.
+        return self.session.shared_topics.local_topic_uuids(
+            self._scoped_topic_uuids,
+        )
 
     @_relay_io_locked
     def set_scoped_topics(self, topic_uuids: set[str] | list[str]) -> None:
@@ -1051,9 +1046,15 @@ class RelayLogic:
                 # though grafting is still pending - so an unchanged hash
                 # only short-circuits when there's nothing left to do.
                 with self._session_lock:
+                    cached_topic = self.session.get_cached_peer_subtree(
+                        peer_addr, topic_uuid,
+                    )
                     wants_graft = (
                         topic_uuid in self._state.get("desired", [])
                         and self.session.protocol.index.get(topic_uuid) is None
+                        and self.session.shared_topics.invitation_requires_mount(
+                            cached_topic,
+                        )
                     )
                 if state_hash == last_seen and not wants_graft:
                     continue

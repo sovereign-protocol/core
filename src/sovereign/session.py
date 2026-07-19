@@ -206,6 +206,14 @@ class Session:
         # Runtime-only application hooks used by channels to enumerate and
         # mount shared topic roots without importing application modules.
         self.shared_topics = SharedTopicRegistry()
+        self.shared_topics.register(
+            "Sovereign Core profile",
+            {"shared_user_profile"},
+            lambda: [self.identity],
+            self.accept_profile_invitation,
+            assignment_scoped=False,
+            mount_invitation=False,
+        )
         # Read-only observation: addresses/topics we poll for their cached
         # perspective only. Deliberately kept separate from
         # members/peer_topic_sets - an observed address is never a peer, so
@@ -283,6 +291,20 @@ class Session:
         if picture is not None:
             data["picture"] = picture or ""
         return self.modify(profile.uuid, data, profile.weights)
+
+    def accept_profile_invitation(self, tree: ProtocolNode) -> SessionResult:
+        """Validate a peer profile without grafting it into our sovereign tree.
+
+        The channel stores the peer's version in ``peer_perspectives`` after
+        this handler succeeds. Our local profile remains the only profile under
+        ``shared_user_data``.
+        """
+        error = _core_profile_schema_error(tree.data)
+        if error:
+            return SessionResult("error", reason=error)
+        if tree.children:
+            return SessionResult("error", reason="Core profile cannot have children")
+        return SessionResult("ok", value=tree.uuid)
 
     def find_peer_identity(self, identity_key: str) -> ProtocolNode | None:
         # Searches across every cached peer perspective's values, not one

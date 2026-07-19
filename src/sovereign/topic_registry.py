@@ -20,6 +20,8 @@ class SharedTopicHandler:
     root_types: frozenset[str]
     list_topics: Callable[[], Iterable[str | ProtocolNode]]
     accept_invitation: Callable[[ProtocolNode], Any]
+    assignment_scoped: bool
+    mount_invitation: bool
 
 
 class SharedTopicRegistry:
@@ -36,6 +38,9 @@ class SharedTopicRegistry:
         root_types: Iterable[str],
         list_topics: Callable[[], Iterable[str | ProtocolNode]],
         accept_invitation: Callable[[ProtocolNode], Any],
+        *,
+        assignment_scoped: bool = True,
+        mount_invitation: bool = True,
     ) -> None:
         owner = str(owner or "").strip()
         normalized_types = frozenset(
@@ -58,6 +63,7 @@ class SharedTopicRegistry:
             self.unregister(owner)
             handler = SharedTopicHandler(
                 owner, normalized_types, list_topics, accept_invitation,
+                assignment_scoped, mount_invitation,
             )
             self._handlers_by_owner[owner] = handler
             for root_type in normalized_types:
@@ -81,14 +87,31 @@ class SharedTopicRegistry:
     def supports(self, node: ProtocolNode | None) -> bool:
         return self.handler_for(node) is not None
 
-    def local_topic_uuids(self) -> list[str]:
+    def local_topic_uuids(
+        self,
+        assigned_topic_uuids: Iterable[str] | None = None,
+    ) -> list[str]:
+        """Return publishable topics, applying assignment scope in one place.
+
+        Application topics are normally scoped by a channel target assignment.
+        Core topics such as the local public profile opt out and therefore ride
+        every active relationship without channel-specific special cases.
+        """
         with self._lock:
             handlers = list(self._handlers_by_owner.values())
+        assigned = (
+            {str(value) for value in assigned_topic_uuids if str(value)}
+            if assigned_topic_uuids is not None else None
+        )
         found = set()
         for handler in handlers:
             for item in handler.list_topics() or []:
                 topic_uuid = item.uuid if isinstance(item, ProtocolNode) else str(item or "")
-                if topic_uuid:
+                if (topic_uuid and (
+                    assigned is None
+                    or not handler.assignment_scoped
+                    or topic_uuid in assigned
+                )):
                     found.add(topic_uuid)
         return sorted(found)
 
@@ -96,3 +119,14 @@ class SharedTopicRegistry:
         handler = self.handler_for(tree)
         return handler.accept_invitation(tree) if handler else None
 
+    def invitation_requires_mount(self, tree: ProtocolNode | None) -> bool:
+        """Whether a recognized topic is expected to exist in the local tree."""
+        handler = self.handler_for(tree)
+        return handler.mount_invitation if handler else True
+
+    def has_assignment_scoped_handlers(self) -> bool:
+        with self._lock:
+            return any(
+                handler.assignment_scoped
+                for handler in self._handlers_by_owner.values()
+            )
