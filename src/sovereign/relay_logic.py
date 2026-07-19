@@ -409,15 +409,15 @@ class RelayLogic:
             # defensively rather than let every user hit that once.
             if "://" in host:
                 host = host.split("://", 1)[1]
-            # Three ways to supply the secret, in priority order, none of
-            # which require writing it directly into a config file that
-            # could end up committed: an explicit config value (lowest
-            # priority - only for local, throwaway testing), an environment
-            # variable, or a path to a file holding just the secret (works
-            # even when the process reading it wasn't started from the same
-            # shell that set an env var - e.g. a file the user edits
-            # directly, that this code never needs to be told the contents
-            # of ahead of time).
+            # Credentials come from this config only - there is no
+            # environment-variable or secret-file lookup, so do not assume
+            # one exists. Prefer key authentication:
+            # relay_sftp_private_key_path, or neither key nor password, in
+            # which case paramiko falls back to the agent and the default
+            # ~/.ssh identities. relay_sftp_password is the least safe
+            # option because it puts the secret in a file on disk; the
+            # repository ignores relay_sftp_*.json for exactly that reason,
+            # and C2/O5 keep this whole path experimental.
             return SftpRelayStorage(
                 host=host,
                 port=int(config.get("relay_sftp_port", 22)),
