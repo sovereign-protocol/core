@@ -68,6 +68,29 @@ class AgreementLogicTests(unittest.TestCase):
             clause_uuid,
         )
 
+    def test_document_payload_carries_mailbox_targets_for_the_sharing_ui(self):
+        runtime = self.runtime(9402)
+        agreement_uuid = runtime.logic.create_agreement("Service terms").value
+
+        empty = runtime.logic.document_payload()
+        self.assertEqual(empty["channel_targets"], [])
+        self.assertIsNone(empty["channel_target_id"])
+
+        target_id = runtime.channel_manager.channel("mailbox").manager.create_target(
+            {"name": "Local folder", "backend": "local",
+             "root": str(Path(runtime._test_tmp.name) / "relay")},
+            verify=False,
+        ).value
+        runtime.channel_manager.channel("mailbox").manager.assign_topic_target(
+            agreement_uuid, target_id,
+        )
+        payload = runtime.logic.document_payload()
+
+        self.assertEqual(
+            [item["id"] for item in payload["channel_targets"]], [target_id],
+        )
+        self.assertEqual(payload["channel_target_id"], target_id)
+
     def test_direct_http_invitation_and_transition_visibility(self):
         left = self.runtime(9402)
         right = self.runtime(9403)
