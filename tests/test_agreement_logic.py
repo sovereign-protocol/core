@@ -68,6 +68,71 @@ class AgreementLogicTests(unittest.TestCase):
             clause_uuid,
         )
 
+    def test_titles_and_text_stay_editable_after_creation(self):
+        runtime = self.runtime(9403)
+        agreement_uuid = runtime.logic.create_agreement("Draft").value
+        section_uuid = runtime.logic.create_section(agreement_uuid, "Scpoe").value
+        clause_uuid = runtime.logic.create_clause(section_uuid, "Frist draft.").value
+
+        self.assertEqual(
+            runtime.logic.rename_agreement(agreement_uuid, "Service terms").status, "ok",
+        )
+        self.assertEqual(
+            runtime.logic.rename_section(section_uuid, "Scope").status, "ok",
+        )
+        self.assertEqual(
+            runtime.logic.update_clause(clause_uuid, "First draft.").status, "ok",
+        )
+
+        payload = runtime.logic.document_payload()
+        section = payload["agreement"]["children"][0]
+        self.assertEqual(payload["agreement"]["data"]["title"], "Service terms")
+        self.assertEqual(section["data"]["title"], "Scope")
+        self.assertEqual(section["children"][0]["data"]["text"], "First draft.")
+
+    def test_renaming_rejects_blank_titles_and_unknown_nodes(self):
+        runtime = self.runtime(9404)
+        agreement_uuid = runtime.logic.create_agreement("Draft").value
+        section_uuid = runtime.logic.create_section(agreement_uuid, "Scope").value
+
+        self.assertEqual(runtime.logic.rename_agreement(agreement_uuid, "  ").status, "error")
+        self.assertEqual(runtime.logic.rename_section(section_uuid, "").status, "error")
+        self.assertEqual(runtime.logic.rename_section("missing", "Scope").status, "error")
+        # A section uuid is not an agreement uuid; the type guard must hold.
+        self.assertEqual(runtime.logic.rename_agreement(section_uuid, "Nope").status, "error")
+
+    def test_deleting_a_section_removes_its_clauses(self):
+        runtime = self.runtime(9405)
+        agreement_uuid = runtime.logic.create_agreement("Draft").value
+        kept_uuid = runtime.logic.create_section(agreement_uuid, "Kept").value
+        removed_uuid = runtime.logic.create_section(agreement_uuid, "Removed").value
+        clause_uuid = runtime.logic.create_clause(removed_uuid, "Goes away.").value
+        runtime.logic.create_clause(kept_uuid, "Stays.")
+
+        self.assertEqual(runtime.logic.delete_section(removed_uuid).status, "ok")
+
+        payload = runtime.logic.document_payload()
+        sections = payload["agreement"]["children"]
+        live = [item for item in sections if not item["deleted"]]
+        self.assertEqual([item["uuid"] for item in live], [kept_uuid])
+        # Deleting a container prunes its descendants out of the index rather
+        # than tombstoning each one, so the clause is gone, not flagged.
+        self.assertNotIn(clause_uuid, runtime.session.protocol.index)
+
+    def test_deleting_a_single_clause_leaves_its_siblings(self):
+        runtime = self.runtime(9406)
+        agreement_uuid = runtime.logic.create_agreement("Draft").value
+        section_uuid = runtime.logic.create_section(agreement_uuid, "Scope").value
+        first_uuid = runtime.logic.create_clause(section_uuid, "First.").value
+        second_uuid = runtime.logic.create_clause(section_uuid, "Second.").value
+
+        self.assertEqual(runtime.logic.delete_clause(first_uuid).status, "ok")
+
+        payload = runtime.logic.document_payload()
+        clauses = payload["agreement"]["children"][0]["children"]
+        live = [item["uuid"] for item in clauses if not item["deleted"]]
+        self.assertEqual(live, [second_uuid])
+
     def test_document_payload_carries_mailbox_targets_for_the_sharing_ui(self):
         runtime = self.runtime(9402)
         agreement_uuid = runtime.logic.create_agreement("Service terms").value
