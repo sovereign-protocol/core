@@ -92,21 +92,21 @@ DEFAULT_CONFIG = {
 }
 LEGACY_APPLICATION_ALIASES = {
     "kanban": {
-        "app_module": "s_kanban.logic",
+        "app_module": "s_kanban.application",
         "application_id": "kanban",
         "asset_package": "s_kanban.assets",
         "ui_file": "kanban.html",
         "css_file": "kanban.css",
     },
     "manual": {
-        "app_module": "sovereign.protocol_explorer",
+        "app_module": "sovereign.protocol_explorer_application",
         "application_id": "protocol-explorer",
         "asset_package": "sovereign.assets",
         "ui_file": "manual.html",
         "css_file": "manual.css",
     },
     "boardofboards": {
-        "app_module": "personal_cockpit.logic",
+        "app_module": "personal_cockpit.application",
         "application_id": "personal-cockpit",
         "asset_package": "personal_cockpit.assets",
         "ui_file": "boardofboards.html",

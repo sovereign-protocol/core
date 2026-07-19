@@ -701,7 +701,7 @@ class Session:
         self.active_topic_uuids.clear()
 
     def leave_topic(self, topic_uuid: str) -> SessionResult:
-        peers = sorted(
+        tracked_peers = sorted(
             peer for peer, topics in self.peer_topic_sets.items()
             if topic_uuid in topics
         )
@@ -715,10 +715,11 @@ class Session:
                     "topic_uuids": [topic_uuid],
                 },
             )
-            for peer in peers
+            for peer in tracked_peers
+            if peer in self.members
         ]
         self.active_topic_uuids.discard(topic_uuid)
-        for peer in peers:
+        for peer in tracked_peers:
             self._remove_peer_topic(peer, topic_uuid)
         return SessionResult("ok", effects=effects)
 

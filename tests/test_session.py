@@ -671,6 +671,15 @@ class SessionTests(unittest.TestCase):
             ],
         )
 
+    def test_leave_topic_does_not_emit_live_effect_for_indirect_peer(self):
+        session = Session("si-a")
+        session.note_indirect_peer_topic("relay:B", "topic-1")
+
+        result = session.leave_topic("topic-1")
+
+        self.assertEqual(result.effects, [])
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+
     def test_handle_leave_removes_only_named_topics(self):
         session = Session("si-a")
         session.add_peer("si-b", "topic-1")

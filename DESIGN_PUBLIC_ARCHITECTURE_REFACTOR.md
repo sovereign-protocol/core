@@ -818,6 +818,36 @@ and mailbox adapters.
 
 Exit: application logic tests require no Starlette request/response objects.
 
+**Implemented 2026-07-19.**
+
+- S-Kanban and Personal Cockpit now separate `logic.py`, `controller.py`, and
+  `application.py`. Protocol Explorer has the equivalent Core modules.
+- Domain logic imports neither Starlette, host contracts, nor controller
+  modules. Manifests and `create_application` factories live in the composition
+  modules, so dependencies point controller → logic, never logic → controller.
+- Configured application entry points now name the composition modules
+  (`s_kanban.application`, `personal_cockpit.application`, and
+  `sovereign.protocol_explorer_application`). The old internal module names are
+  intentionally unsupported under P4.
+- `ApplicationResultView`, `application_result_view`, and `json_value` define a
+  framework-neutral JSON boundary. Controllers validate both query views and
+  action results before constructing Starlette responses; unknown objects and
+  non-finite numbers fail explicitly.
+- Kanban unsharing no longer accepts a runtime or performs delivery I/O. It
+  returns Session effects for the controller to deliver. Session topic-leave
+  effects are emitted only for live members, while indirect peers are still
+  removed from local tracking.
+- Browser assets were already moved into their owning application packages by
+  R2; R5 retains and verifies that ownership.
+- `S-Kanban.spec` now collects the installed Core and application packages,
+  replacing obsolete flat-module and loose-asset declarations. A full frozen
+  executable build remains part of the R6 packaging smoke work.
+- Controller tests are separate from Protocol Explorer logic tests. An AST
+  boundary test rejects Starlette, host/controller imports, route factories,
+  application factories, and runtime parameters in all three domain modules.
+
+Verification: **427 tests passed**.
+
 ### R6 — enforce boundaries
 
 - Add AST/import tests for forbidden dependency directions.

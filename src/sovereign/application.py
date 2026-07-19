@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
@@ -95,3 +96,58 @@ class ApplicationSpec:
         if not isinstance(settings, Mapping):
             raise ValueError("application settings must be an object")
         return cls(module, MappingProxyType(dict(settings)))
+
+
+JsonValue = (
+    bool | int | float | str | None
+    | list["JsonValue"] | dict[str, "JsonValue"]
+)
+
+
+@dataclass(frozen=True)
+class ApplicationResultView:
+    """Framework-neutral, JSON-safe presentation of an application action."""
+
+    payload: dict[str, JsonValue]
+    ok: bool
+
+
+def application_result_view(result, deliveries=()) -> ApplicationResultView:
+    if result.status != "ok":
+        return ApplicationResultView(
+            {"status": "error", "reason": str(result.reason or "unknown error")},
+            False,
+        )
+    payload: dict[str, JsonValue] = {"status": "ok"}
+    if result.value is not None:
+        payload["value"] = json_value(result.value)
+    errors = [item for item in deliveries if not item.ok]
+    if errors:
+        payload["delivery_errors"] = [
+            {
+                "effect_type": str(item.effect_type),
+                "target": json_value(item.target),
+                "reason": str(item.reason or "delivery failed"),
+            }
+            for item in errors
+        ]
+    return ApplicationResultView(payload, True)
+
+
+def json_value(value: Any) -> JsonValue:
+    """Convert public application values or reject a leaky internal object."""
+    if isinstance(value, float) and not math.isfinite(value):
+        raise TypeError("application result contains a non-finite number")
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if hasattr(value, "to_dict"):
+        return json_value(value.to_dict())
+    if isinstance(value, Mapping):
+        return {str(key): json_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [json_value(item) for item in value]
+    if isinstance(value, set):
+        return [json_value(item) for item in sorted(value, key=repr)]
+    raise TypeError(
+        f"application result value is not JSON-serializable: {type(value).__name__}"
+    )
