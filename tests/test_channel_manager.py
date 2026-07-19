@@ -159,7 +159,31 @@ class ChannelManagerTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertNotIn("http://b-old", session.members)
+        self.assertNotIn("http://b-old", session.peer_identity_key)
         self.assertEqual(session.peer_channel["http://b-new"], "http")
+
+    def test_accept_preserves_identity_knowledge_for_indirect_old_address(self):
+        session = Session("http://a")
+        peer = Session("http://b")
+        identity = peer.identity.to_dict()
+        identity_key = identity["data"]["identity_key"]
+        old_addr = "opaque-mailbox-address"
+        session.note_indirect_peer_topic(old_addr, "topic-1")
+        session.apply_peer_identity_snapshot(old_addr, identity)
+        manager = ChannelManager(session)
+        manager.register(_Channel(
+            "http", "http",
+            accept=ChannelResult.success(ChannelAcceptance(
+                "http://b-new", {"status": "ok"},
+            )),
+        ))
+
+        result = manager.accept_invitation(identity, ["topic-1"], [{
+            "type": "http", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
+        }])
+
+        self.assertTrue(result.ok)
+        self.assertEqual(session.peer_identity_key[old_addr], identity_key)
 
     def test_rejects_descriptor_collision(self):
         manager = ChannelManager(Session("http://a"))

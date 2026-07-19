@@ -1732,8 +1732,8 @@ class Session:
         # stays true after teardown. Clearing it here would erase the very
         # evidence relay's redundancy check needs to keep suppressing this
         # address on later polls - the self-erasing-evidence flip-flop,
-        # one level up. Reconnect replacement in ChannelManager forgets
-        # superseded addresses explicitly instead.
+        # one level up. Reconnect replacement in ChannelManager forgets only
+        # superseded direct-member addresses explicitly instead.
         self.peer_topic_sets.pop(peer_addr, None)
         self.peer_fetch_topic_sets.pop(peer_addr, None)
         self.peer_topics.pop(peer_addr, None)

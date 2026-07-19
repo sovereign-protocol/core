@@ -228,6 +228,9 @@ Before release, record for every dependency:
 
 Current direct dependencies include Requests, Starlette, Uvicorn, and Paramiko.
 Their licenses and transitive dependencies must be captured in release artifacts.
+CI installation plus `pip check` verifies that declared dependency ranges resolve;
+it does not replace this manual license/source/bundling audit, which remains a
+release gate.
 
 For frozen executables:
 
@@ -285,6 +288,10 @@ requirements.
 **ACCEPTED G5:** complete one professional review of the code/documentation/
 contribution license package before public contribution, and a second focused
 review before distributing a frozen executable.
+
+`S-Kanban.spec` may be committed and exercised for reproducible build testing.
+That technical verification is not a release artifact and does not open the
+executable-distribution gate above; the focused LGPL review remains mandatory.
 
 ## 12. Files required in each public repository
 

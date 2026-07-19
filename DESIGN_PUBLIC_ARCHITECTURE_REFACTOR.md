@@ -876,14 +876,26 @@ Exit: architectural violations fail CI.
   private Core imports. Runtime tests enforce the HTTP and mailbox contracts.
 - All three wheels are built in temporary directories, installed without
   dependencies into a new isolated virtual environment, and imported with
-  packaged assets verified. Stale generated application build trees were
-  removed.
-- CI runs the full suite on Python 3.10 and 3.14, making the declared floor an
-  executable contract.
+  packaged assets verified. CI additionally installs those wheels with their
+  declared runtime dependencies and runs `pip check`. Stale generated
+  application build trees were removed.
+- Required Windows jobs run the full suite on Python 3.10 and 3.14, making the
+  supported platform and declared floor executable contracts. Python 3.14 on
+  Ubuntu remains an explicitly experimental, non-blocking signal.
 - A clean PyInstaller build from `S-Kanban.spec` completed in temporary output
   directories and the frozen executable reached its command-line entry point.
+  This is a buildability check only: committing the spec and running the smoke
+  test do not satisfy G4/G5 or authorize executable distribution.
 
-Verification: **440 tests passed**, including the isolated wheel-install smoke.
+**Post-review R6 hardening:** required CI now covers Windows 10/11 semantics on
+Python 3.10 and 3.14; Ubuntu is an experimental non-blocking signal. CI resolves
+wheel dependencies in a clean environment and runs `pip check`. Boundary scans
+are recursive and validate exact public-root imports. Channel reconnect logic
+uses direct-versus-indirect Session membership rather than a relay address
+prefix.
+
+Verification: **441 tests passed**, plus the dependency-resolving wheel-install
+smoke.
 
 ### R7 — prove with minimal S-Agreement
 

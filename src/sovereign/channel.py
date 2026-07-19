@@ -243,8 +243,13 @@ class ChannelManager:
             for old_addr in self.session.addresses_for_identity(identity_key):
                 if old_addr == selected_addr:
                     continue
+                was_direct_member = old_addr in self.session.members
                 self.session.remove_peer(old_addr)
-                if not old_addr.startswith("relay:"):
+                # Direct members are superseded endpoints and may be forgotten.
+                # Indirect observations remain valid identity knowledge used to
+                # suppress redundant channel representations. This is a Session
+                # relationship distinction, not an address-format convention.
+                if was_direct_member:
                     self.session.peer_identity_key.pop(old_addr, None)
 
         if isinstance(identity, dict):
