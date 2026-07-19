@@ -94,10 +94,17 @@ plaintext relay data; putting a raw key in node data would not protect against
 the relay. The store remains encryption-agnostic, but encrypted references will
 need explicit algorithm/key metadata in a later format version.
 
+## Implemented since first draft
+
+- **Max blob size** — enforced. `POST /api/blob` rejects an oversized upload
+  using both the declared `content-length` and the actual received size, against
+  a `max_blob_size_bytes` limit defaulting to 20 MB (`app_server.py`). This is no
+  longer a deferred decision; only the per-target storage budget below remains.
+
 ## Deferred decisions
 
-- **Max blob size** (reject uploads above it) and total per-target budget
-  awareness (basic SFTP hosting is small).
+- **Per-target storage budget awareness** (basic SFTP hosting is small). The
+  per-upload limit exists; total consumption per relay target is not tracked.
 - **Thumbnails:** v1 = none (fetch full blob on click) is simplest; a small
   inline thumbnail (separate tiny blob, or a data-URI capped at N KB in the
   reference) is a nice-to-have that avoids fetching big images to preview.
