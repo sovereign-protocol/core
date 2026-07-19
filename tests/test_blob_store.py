@@ -6,7 +6,7 @@ from blob_store import (
     BlobStore, blob_id_for, canonical_attachments, is_valid_image,
     referenced_blob_ids,
 )
-from protocol import PRSPNode
+from protocol import ProtocolNode
 
 
 class BlobStoreTests(unittest.TestCase):
@@ -38,11 +38,11 @@ class BlobStoreTests(unittest.TestCase):
     def test_reference_collection_ignores_deleted_subtrees(self):
         live_id = blob_id_for(b"live")
         deleted_id = blob_id_for(b"deleted")
-        root = PRSPNode(data={"attachments": [{
+        root = ProtocolNode(data={"attachments": [{
             "id": "a", "role": "avatar", "blob_id": live_id,
             "name": "a.png", "size": 4, "mime": "image/png",
         }]})
-        deleted = PRSPNode(data={"attachments": [{
+        deleted = ProtocolNode(data={"attachments": [{
             "id": "b", "blob_id": deleted_id, "name": "b", "size": 1,
         }]})
         deleted.deleted = True

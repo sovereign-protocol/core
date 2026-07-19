@@ -24,7 +24,7 @@ Offered API:
   protocol operation wrappers: create_child, modify, delete, copy, move,
 
 Used API:
-  protocol.ProtocolState and protocol.PRSPNode only.
+  protocol.ProtocolState and protocol.ProtocolNode only.
 
 Transport contract:
   Session never sends data. It returns SessionEffect values that a server or
@@ -41,7 +41,10 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable
 
-from protocol import PRSPNode, ProtocolState, collect_subtree_uuids, stable_hash
+from protocol import (
+    ProtocolNode, ProtocolState, collect_subtree_uuids,
+    protocol_tree_envelope, stable_hash,
+)
 from topic_registry import SharedTopicRegistry
 from trace_log import TraceLogger
 
@@ -90,12 +93,12 @@ class ReadOnlyProtocolIndex:
         with self._lock:
             return len(self._protocol.index)
 
-    def get(self, node_uuid: str, default=None) -> PRSPNode | None:
+    def get(self, node_uuid: str, default=None) -> ProtocolNode | None:
         with self._lock:
             node = self._protocol.index.get(node_uuid)
             return Session._snapshot_node(node) if node else default
 
-    def __getitem__(self, node_uuid: str) -> PRSPNode:
+    def __getitem__(self, node_uuid: str) -> ProtocolNode:
         with self._lock:
             node = self._protocol.index[node_uuid]
             return Session._snapshot_node(node)
@@ -126,7 +129,7 @@ class ReadOnlyProtocolView:
         self.index = ReadOnlyProtocolIndex(protocol, lock)
 
     @property
-    def root(self) -> PRSPNode:
+    def root(self) -> ProtocolNode:
         with self._lock:
             return Session._snapshot_node(self._protocol.root)
 
@@ -147,7 +150,7 @@ class Session:
         self.peer_topics: dict[str, str] = {}
         self.peer_topic_sets: dict[str, set[str]] = {}
         self.peer_fetch_topic_sets: dict[str, set[str]] = {}
-        self.peer_perspectives: dict[str, PRSPNode] = {}
+        self.peer_perspectives: dict[str, ProtocolNode] = {}
         self.peer_status: dict[str, dict[str, Any]] = {}
         # Which channel type last successfully delivered to/from a peer
         # address - purely informational (the only transport-shaped thing
@@ -186,8 +189,8 @@ class Session:
     # this peer" for free through these, instead of reimplementing its own
     # profile node and lookup logic.
 
-    def _folder(self, parent: PRSPNode, name: str,
-               node_type: str = "folder") -> PRSPNode:
+    def _folder(self, parent: ProtocolNode, name: str,
+               node_type: str = "folder") -> ProtocolNode:
         for child in parent.children:
             if child.data.get("name") == name and child.data.get("type") in ("folder", node_type):
                 return child
@@ -195,7 +198,7 @@ class Session:
 
     @property
     @_session_locked
-    def identity(self) -> PRSPNode:
+    def identity(self) -> ProtocolNode:
         # The shared_user_data folder only ever holds this session's own
         # identity node - no address match needed to find "mine" among
         # others, unlike the old address-keyed lookup this replaced.
@@ -218,7 +221,7 @@ class Session:
             {},
         ).value
 
-    def _ensure_identity_defaults(self, node: PRSPNode) -> PRSPNode:
+    def _ensure_identity_defaults(self, node: ProtocolNode) -> ProtocolNode:
         data = dict(node.data)
         changed = False
         if data.get("type") != "shared_user_profile":
@@ -266,7 +269,7 @@ class Session:
             data["email"] = email
         return self.modify(profile.uuid, data, profile.weights)
 
-    def find_peer_identity(self, identity_key: str) -> PRSPNode | None:
+    def find_peer_identity(self, identity_key: str) -> ProtocolNode | None:
         # Searches across every cached peer perspective's values, not one
         # peer's cache keyed by address - this is what lets identity survive
         # a peer's address changing, since lookup never depends on which
@@ -277,7 +280,7 @@ class Session:
                 return found
         return None
 
-    def peer_identity(self, peer_addr: str) -> PRSPNode | None:
+    def peer_identity(self, peer_addr: str) -> ProtocolNode | None:
         # Address-scoped lookup: the bootstrap step for going from "a peer
         # address we're tracking" to "their identity" - find_peer_identity
         # alone can't do this once it's keyed by identity_key instead of
@@ -332,14 +335,14 @@ class Session:
         if not isinstance(identity, dict) or identity.get("data", {}).get("version") != 1:
             return
         try:
-            node = PRSPNode.from_dict(identity)
+            node = ProtocolNode.from_dict(identity)
         except (ValueError, KeyError):
             return
         self.apply_peer_subtree(peer_addr, node, None)
 
     @staticmethod
-    def _find_identity_in_tree(node: PRSPNode | None,
-                               identity_key: str | None = None) -> PRSPNode | None:
+    def _find_identity_in_tree(node: ProtocolNode | None,
+                               identity_key: str | None = None) -> ProtocolNode | None:
         if not node:
             return None
         if (node.data.get("type") == "shared_user_profile"
@@ -352,7 +355,7 @@ class Session:
         return None
 
     @staticmethod
-    def is_identity_node(node: PRSPNode | None) -> bool:
+    def is_identity_node(node: ProtocolNode | None) -> bool:
         if not node:
             return False
         return node.data.get("type") == "shared_user_profile"
@@ -360,7 +363,7 @@ class Session:
     # Read-only protocol access / persistence
 
     @_session_locked
-    def load_protocol_root(self, root: PRSPNode) -> None:
+    def load_protocol_root(self, root: ProtocolNode) -> None:
         self._protocol.root = root
         self._protocol.index = {}
         self._protocol.index_subtree(root)
@@ -489,7 +492,7 @@ class Session:
         }
 
     @_session_locked
-    def accept_topic_invitation(self, tree: PRSPNode,
+    def accept_topic_invitation(self, tree: ProtocolNode,
                                 parent_uuid: str | None = None) -> SessionResult:
         result = self._protocol.attach_topic(
             tree,
@@ -655,7 +658,7 @@ class Session:
         return SessionResult("ok", effects=effects)
 
     @staticmethod
-    def node_revision(node: PRSPNode) -> str:
+    def node_revision(node: ProtocolNode) -> str:
         # content_hash is this node's OWN version (no descendants), so a
         # descendant change never re-revisions an ancestor - observation stays
         # aligned with classification (both key on content_hash). parent_uuid
@@ -663,11 +666,11 @@ class Session:
         # identical content independently authored by two clients.
         return (
             f"{node.content_hash}@{node.parent_uuid or ''}"
-            f"@{node.revision_origin_identity or ''}"
+            f"@{node.revision_origin or ''}"
         )
 
     @classmethod
-    def node_revision_map(cls, root: PRSPNode) -> dict[str, str]:
+    def node_revision_map(cls, root: ProtocolNode) -> dict[str, str]:
         revisions = {root.uuid: cls.node_revision(root)}
         for child in root.children:
             revisions.update(cls.node_revision_map(child))
@@ -688,7 +691,7 @@ class Session:
                 changed = True
         return changed
 
-    def peer_observed_node(self, peer_addr: str, node: PRSPNode) -> bool:
+    def peer_observed_node(self, peer_addr: str, node: ProtocolNode) -> bool:
         return (
             self.peer_observed_node_revisions.get(peer_addr, {}).get(node.uuid)
             == self.node_revision(node)
@@ -820,7 +823,7 @@ class Session:
 
     @_session_locked
     def apply_peer_subtree(self, peer_addr: str,
-                           subtree: PRSPNode,
+                           subtree: ProtocolNode,
                            parent_uuid: str | None) -> None:
         # Identity topics are always applied with the profile node as the
         # subtree root (connect-token snapshot, direct profile pull, relay
@@ -924,7 +927,7 @@ class Session:
         target.base_hash = subtree.base_hash
         target.base_parent_uuid = subtree.base_parent_uuid
         target.deleted = subtree.deleted
-        target.revision_origin_identity = subtree.revision_origin_identity
+        target.revision_origin = subtree.revision_origin
         target.weights = subtree.weights
         target.data = subtree.data
         target.children = subtree.children
@@ -954,12 +957,12 @@ class Session:
         )
         self.prune_deleted_nodes()
 
-    def get_cached_peer_subtree(self, peer_addr: str, node_uuid: str) -> PRSPNode | None:
+    def get_cached_peer_subtree(self, peer_addr: str, node_uuid: str) -> ProtocolNode | None:
         tree = self.peer_perspectives.get(peer_addr)
         if not tree:
             return None
         node = self._find_in_tree(tree, node_uuid)
-        return PRSPNode.from_dict(node.to_dict()) if node else None
+        return ProtocolNode.from_dict(node.to_dict()) if node else None
 
     def peer_discusses_node(self, peer_addr: str, node_uuid: str) -> bool:
         return any(
@@ -1024,7 +1027,7 @@ class Session:
         return events
 
     @staticmethod
-    def _flatten_by_uuid(node: PRSPNode) -> dict[str, PRSPNode]:
+    def _flatten_by_uuid(node: ProtocolNode) -> dict[str, ProtocolNode]:
         out = {node.uuid: node}
         for child in node.children:
             out.update(Session._flatten_by_uuid(child))
@@ -1048,7 +1051,7 @@ class Session:
             node_uuid=child.uuid,
             node_type=child.data.get("type"),
             state_hash=child.state_hash,
-            revision_origin_identity=child.revision_origin_identity,
+            revision_origin=child.revision_origin,
         )
         return SessionResult("ok", value=self._snapshot_node(child),
                              effects=self.sync_effects(parent_uuid))
@@ -1056,13 +1059,13 @@ class Session:
     @_session_locked
     def modify(self, node_uuid: str, data: dict,
                weights: dict[str, float] | None = None,
-               revision_origin_identity: str | None | object = _LOCAL_REVISION_ORIGIN) -> SessionResult:
+               revision_origin: str | None | object = _LOCAL_REVISION_ORIGIN) -> SessionResult:
         before = self._protocol.index.get(node_uuid)
         old_state_hash = before.state_hash if before else None
         origin = (
             self._local_revision_origin(data)
-            if revision_origin_identity is _LOCAL_REVISION_ORIGIN
-            else revision_origin_identity
+            if revision_origin is _LOCAL_REVISION_ORIGIN
+            else revision_origin
         )
         result = self._protocol.modify(
             node_uuid, data, weights, origin,
@@ -1073,8 +1076,8 @@ class Session:
             node_uuid=node_uuid,
             old_state_hash=old_state_hash,
             state_hash=after.state_hash if after else None,
-            revision_origin_identity=(
-                after.revision_origin_identity if after else None
+            revision_origin=(
+                after.revision_origin if after else None
             ),
             ok=result.ok,
             reason=result.reason,
@@ -1144,7 +1147,7 @@ class Session:
         return self._operation_result(result, source_uuid)
 
     @_session_locked
-    def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
+    def adopt_subtree(self, tree: ProtocolNode, parent_uuid: str,
                       remove_descendant_duplicates: bool = False) -> SessionResult:
         result = self._protocol.adopt_subtree(
             tree,
@@ -1216,13 +1219,13 @@ class Session:
         if not local:
             return SessionResult("error", reason="rollback version not found")
         local_identity = self._local_revision_origin()
-        if not local_identity or local.revision_origin_identity != local_identity:
+        if not local_identity or local.revision_origin != local_identity:
             return SessionResult("error", reason="local version is not mine to roll back")
         if rollback_absence and not peer:
             return SessionResult("ok", value=None)
         if not peer:
             return SessionResult("error", reason="rollback version not found")
-        if peer.revision_origin_identity != local_identity:
+        if peer.revision_origin != local_identity:
             return SessionResult("error", reason="target is another client's revision")
         if peer.base_hash != local.base_hash:
             return SessionResult("error", reason="target is not from the same revision wave")
@@ -1246,7 +1249,7 @@ class Session:
         self,
         peer_addr: str,
         topic_uuid: str,
-        node_is_eligible: Callable[[PRSPNode, str], bool] | None = None,
+        node_is_eligible: Callable[[ProtocolNode, str], bool] | None = None,
     ) -> bool:
         # Generic "adopt incoming changes" walk - every app on this protocol
         # wants the same thing (adopt whatever a peer changed for one topic).
@@ -1351,7 +1354,7 @@ class Session:
             )
 
     @staticmethod
-    def _collect_deleted_uuids(node: PRSPNode) -> set[str]:
+    def _collect_deleted_uuids(node: ProtocolNode) -> set[str]:
         out = set()
         if node.deleted:
             out.add(node.uuid)
@@ -1360,7 +1363,7 @@ class Session:
         return out
 
     @_session_locked
-    def get_node(self, node_uuid: str) -> PRSPNode | None:
+    def get_node(self, node_uuid: str) -> ProtocolNode | None:
         node = self._protocol.index.get(node_uuid)
         return self._snapshot_node(node) if node else None
 
@@ -1369,10 +1372,7 @@ class Session:
         node = self._protocol.index.get(node_uuid)
         if not node:
             return None
-        return {
-            "subtree": node.to_dict(),
-            "parent_uuid": node.parent_uuid,
-        }
+        return protocol_tree_envelope(node)
 
     @_session_locked
     def snapshot_subtree_state(self, node_uuid: str) -> tuple[str, dict] | None:
@@ -1380,10 +1380,7 @@ class Session:
         node = self._protocol.index.get(node_uuid)
         if not node:
             return None
-        return node.state_hash, {
-            "subtree": node.to_dict(),
-            "parent_uuid": node.parent_uuid,
-        }
+        return node.state_hash, protocol_tree_envelope(node)
 
     def get_network_info(self) -> dict:
         return {
@@ -1600,8 +1597,8 @@ class Session:
         return [topic_uuid] if topic_uuid else []
 
     @staticmethod
-    def _snapshot_node(node: PRSPNode) -> PRSPNode:
-        return PRSPNode.from_dict(node.to_dict())
+    def _snapshot_node(node: ProtocolNode) -> ProtocolNode:
+        return ProtocolNode.from_dict(node.to_dict())
 
     @staticmethod
     def _new_peer_status() -> dict[str, Any]:
@@ -1622,8 +1619,8 @@ class Session:
         }
 
     @staticmethod
-    def _peer_cache_root(peer_addr: str) -> PRSPNode:
-        root = PRSPNode({"type": "peer_cache_root", "label": peer_addr})
+    def _peer_cache_root(peer_addr: str) -> ProtocolNode:
+        root = ProtocolNode({"type": "peer_cache_root", "label": peer_addr})
         root.uuid = f"peer-cache:{peer_addr}"
         root.refresh_hashes()
         return root
@@ -1641,8 +1638,8 @@ class Session:
         return created.value.uuid
 
     def _analyze_transition_node(self, peer_addr: str,
-                                 local_node: PRSPNode | None,
-                                 peer_node: PRSPNode | None,
+                                 local_node: ProtocolNode | None,
+                                 peer_node: ProtocolNode | None,
                                  is_topic_root: bool = False) -> dict:
         if not local_node:
             # A node that only the peer still has, and only as a tombstone,
@@ -1677,7 +1674,7 @@ class Session:
         return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
     @staticmethod
-    def _classify_content(local_node: PRSPNode, peer_node: PRSPNode,
+    def _classify_content(local_node: ProtocolNode, peer_node: ProtocolNode,
                           local_identity: str | None = None,
                           peer_identity: str | None = None) -> str:
         if local_node.content_hash == peer_node.content_hash:
@@ -1687,9 +1684,9 @@ class Session:
         if local_node.content_hash == peer_node.base_hash:
             return "peer_made_changes"
         if (local_node.base_hash == peer_node.base_hash
-                and local_node.revision_origin_identity
-                == peer_node.revision_origin_identity):
-            origin = local_node.revision_origin_identity
+                and local_node.revision_origin
+                == peer_node.revision_origin):
+            origin = local_node.revision_origin
             # An unset origin must not classify by identity: `None == None`
             # would otherwise pick a definite side instead of falling through
             # to the recency tiebreak / divergence.
@@ -1704,7 +1701,7 @@ class Session:
         return "divergence"
 
     @staticmethod
-    def _classify_move(local_node: PRSPNode, peer_node: PRSPNode,
+    def _classify_move(local_node: ProtocolNode, peer_node: ProtocolNode,
                        local_identity: str | None = None,
                        peer_identity: str | None = None) -> str:
         if local_node.parent_uuid == peer_node.parent_uuid:
@@ -1713,9 +1710,9 @@ class Session:
         local_moved_from_peer = peer_node.parent_uuid == local_node.base_parent_uuid
         if peer_moved_from_local and local_moved_from_peer:
             if (local_node.base_parent_uuid == peer_node.base_parent_uuid
-                    and local_node.revision_origin_identity
-                    == peer_node.revision_origin_identity):
-                origin = local_node.revision_origin_identity
+                    and local_node.revision_origin
+                    == peer_node.revision_origin):
+                origin = local_node.revision_origin
                 # See _classify_content: an unset origin must not match a
                 # None identity and short-circuit the recency tiebreak.
                 if origin and origin == local_identity:
@@ -1734,7 +1731,7 @@ class Session:
         return "divergence"
 
     @staticmethod
-    def _classify_node(local_node: PRSPNode, peer_node: PRSPNode,
+    def _classify_node(local_node: ProtocolNode, peer_node: ProtocolNode,
                        local_identity: str | None = None,
                        peer_identity: str | None = None) -> str:
         content = Session._classify_content(
@@ -1755,13 +1752,13 @@ class Session:
 
     @staticmethod
     def _transition_event(event_type: str, peer_addr: str,
-                          local_node: PRSPNode | None,
-                          peer_node: PRSPNode | None) -> dict:
+                          local_node: ProtocolNode | None,
+                          peer_node: ProtocolNode | None) -> dict:
         node = local_node or peer_node
         local_origin = (
-            local_node.revision_origin_identity if local_node else None
+            local_node.revision_origin if local_node else None
         )
-        peer_origin = peer_node.revision_origin_identity if peer_node else None
+        peer_origin = peer_node.revision_origin if peer_node else None
         if event_type in (
             "peer_made_changes", "local_missing_node", "divergence",
         ):
@@ -1785,16 +1782,16 @@ class Session:
                 Session.node_revision(peer_node) if peer_node else None
             ),
             "origin_identity": origin,
-            "local_revision_origin_identity": local_origin,
-            "peer_revision_origin_identity": peer_origin,
+            "local_revision_origin": local_origin,
+            "peer_revision_origin": peer_origin,
         }
 
     @staticmethod
     def _stage_transition_event(event: dict) -> dict:
         event_type = event["type"]
         observed = event.get("peer_observed_local_revision") is True
-        local_origin = event.get("local_revision_origin_identity")
-        peer_origin = event.get("peer_revision_origin_identity")
+        local_origin = event.get("local_revision_origin")
+        peer_origin = event.get("peer_revision_origin")
         competing_origins = bool(
             local_origin and peer_origin and local_origin != peer_origin
         )
@@ -1809,7 +1806,7 @@ class Session:
         return event
 
     @staticmethod
-    def _remove_uuid_from_tree(root: PRSPNode, uuid: str) -> bool:
+    def _remove_uuid_from_tree(root: ProtocolNode, uuid: str) -> bool:
         original_len = len(root.children)
         root.children = [child for child in root.children if child.uuid != uuid]
         removed = len(root.children) != original_len
@@ -1818,7 +1815,7 @@ class Session:
         return removed
 
     @staticmethod
-    def _remove_duplicate_subtree_uuids(root: PRSPNode,
+    def _remove_duplicate_subtree_uuids(root: ProtocolNode,
                                         subtree_uuids: set[str],
                                         keep_uuid: str) -> None:
         for uuid in subtree_uuids:
@@ -1826,7 +1823,7 @@ class Session:
                 Session._remove_uuid_from_tree(root, uuid)
 
     @staticmethod
-    def _find_in_tree(root: PRSPNode, uuid: str | None) -> PRSPNode | None:
+    def _find_in_tree(root: ProtocolNode, uuid: str | None) -> ProtocolNode | None:
         if uuid is None:
             return None
         if root.uuid == uuid:
@@ -1838,7 +1835,7 @@ class Session:
         return None
 
     @staticmethod
-    def _refresh_tree_hashes(node: PRSPNode) -> None:
+    def _refresh_tree_hashes(node: ProtocolNode) -> None:
         for child in node.children:
             Session._refresh_tree_hashes(child)
         node.refresh_hashes()

@@ -1,13 +1,13 @@
 import unittest
 
-from protocol import PRSPNode
+from protocol import ProtocolNode
 from topic_registry import SharedTopicRegistry
 
 
 class SharedTopicRegistryTests(unittest.TestCase):
     def test_enumerates_topics_and_routes_invitation_by_root_type(self):
         registry = SharedTopicRegistry()
-        topic = PRSPNode({"type": "agreement", "title": "Terms"})
+        topic = ProtocolNode({"type": "agreement", "title": "Terms"})
         accepted = []
         registry.register(
             "S-Agreement",
@@ -33,10 +33,10 @@ class SharedTopicRegistryTests(unittest.TestCase):
         registry.register("app", {"old"}, lambda: [], lambda tree: None)
         registry.register("app", {"new"}, lambda: [], lambda tree: None)
 
-        self.assertFalse(registry.supports(PRSPNode({"type": "old"})))
-        self.assertTrue(registry.supports(PRSPNode({"type": "new"})))
+        self.assertFalse(registry.supports(ProtocolNode({"type": "old"})))
+        self.assertTrue(registry.supports(ProtocolNode({"type": "new"})))
         registry.unregister("app")
-        self.assertFalse(registry.supports(PRSPNode({"type": "new"})))
+        self.assertFalse(registry.supports(ProtocolNode({"type": "new"})))
 
 
 if __name__ == "__main__":

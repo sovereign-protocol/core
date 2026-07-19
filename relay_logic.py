@@ -39,7 +39,7 @@ Functionality:
 
   Bookkeeping (which hash we last published/applied per topic/peer) is
   local-only sync state, kept in its own JSON file next to the session's
-  own storage file - never written into PRSP data, since that would make it
+  own storage file - never written into S-Protocol data, since that would make it
   content needing its own sync, which defeats the purpose.
 
 Offered API:
@@ -47,7 +47,8 @@ Offered API:
   build_routes(logic, runtime, config) -> list[Route]  (extra-app-module hook)
   channel_descriptor(runtime, config) -> dict | None  (extra-app-module hook)
     Advertises relay as a connectable channel for /api/connect_token, if
-    configured - {"type": "relay", "version": 1, "root": ..., "identity": ...}.
+    configured - {"type": "relay", "descriptor_version": 1, "root": ...,
+    "identity": ...}.
   RelayLogic
     relay_topic_uuids() -> list[str]
     publish_due_topics() -> list[str]
@@ -85,7 +86,7 @@ Offered API:
       Peers we've actually applied something from, per our own bookkeeping.
 
 Used API:
-  protocol.PRSPNode, session.Session and its shared-topic registry,
+  protocol.ProtocolNode, session.Session and its shared-topic registry,
   relay_storage.LocalFolderRelayStorage,
   relay_storage.SftpRelayStorage.
 """
@@ -109,13 +110,14 @@ from pathlib import Path
 from typing import Any
 
 from blob_store import blob_hex, referenced_blob_ids
-from protocol import PRSPNode
+from protocol import ProtocolNode, protocol_node_from_envelope
 from session import Session, SessionResult
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from relay_storage import LocalFolderRelayStorage, SftpRelayStorage, now_iso
+from versions import CHANNEL_DESCRIPTOR_VERSION
 
 
 def _storage_fingerprint(config: dict) -> str:
@@ -580,7 +582,7 @@ class RelayLogic:
             # password, never a key.
             return {
                 "type": "sftp",
-                "version": 1,
+                "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
                 "host": self.storage.host,
                 "port": self.storage.port,
                 "root": self.storage.root,
@@ -591,7 +593,7 @@ class RelayLogic:
             }
         return {
             "type": "relay",
-            "version": 1,
+            "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
             "root": str(self.storage.root),
             "identity": self.identity,
             "poll_interval_seconds": self.poll_interval_seconds,
@@ -1058,7 +1060,7 @@ class RelayLogic:
                 payload = self.storage.read_snapshot(topic_uuid, peer_id, state_hash)
                 if not payload:
                     continue
-                subtree = PRSPNode.from_dict(payload["subtree"])
+                subtree = protocol_node_from_envelope(payload)
                 peer_copy = copy.deepcopy(subtree)
                 # Registering peer_topic_sets (not add_peer - see
                 # Session.note_relay_peer_topic) is what lets application
@@ -1294,7 +1296,7 @@ class RelayManager:
     def _descriptor_from_record(record: dict) -> dict:
         if record.get("backend") == "sftp":
             return {
-                "type": "sftp", "version": 1,
+                "type": "sftp", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
                 "host": record.get("host") or "",
                 "port": int(record.get("port", 22)),
                 "username": record.get("username") or "",
@@ -1304,7 +1306,7 @@ class RelayManager:
                 "target_name": record.get("name") or "Relay",
             }
         return {
-            "type": "relay", "version": 1,
+            "type": "relay", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
             "root": record.get("root") or "",
             "poll_interval_seconds": record.get("poll_interval_seconds", 3),
             "target_name": record.get("name") or "Local relay",
@@ -1464,7 +1466,7 @@ class RelayManager:
             return SessionResult("error", reason="port must be between 1 and 65535")
         descriptor = {
             "type": "sftp" if backend == "sftp" else "relay",
-            "version": 1,
+            "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
             "host": str(values.get("host") or "").strip(),
             "port": port,
             "username": str(values.get("username") or "").strip(),

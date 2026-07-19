@@ -22,7 +22,7 @@ Offered API:
 
 Used API:
   session.Session and session.SessionEffect.
-  protocol.PRSPNode only for checked wire decoding.
+  protocol.ProtocolNode only for checked wire decoding.
 
 HTTP contract:
   POST /p2p/sync_status
@@ -39,7 +39,9 @@ import copy
 from dataclasses import dataclass
 from typing import Any, Protocol
 
-from protocol import PRSPNode
+from protocol import (
+    ProtocolNode, UnsupportedProtocolVersion, protocol_node_from_envelope,
+)
 from session import Session, SessionEffect, SessionResult
 from trace_log import TraceLogger
 
@@ -206,7 +208,7 @@ class HttpTransportAdapter:
             topic_uuid=effect.payload.get("topic_uuid"),
         )
         payload = self.fetch_subtree(effect.target, node_uuid)
-        subtree = self._decode_wire_subtree(payload["subtree"], effect.target)
+        subtree = self._decode_wire_subtree(payload, effect.target)
         self.session.apply_peer_subtree(
             effect.target,
             subtree,
@@ -275,7 +277,7 @@ class HttpTransportAdapter:
             adopted = []
             for topic_uuid in topic_uuids:
                 tree_payload = self.fetch_subtree(peer_addr, topic_uuid)
-                tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
+                tree = self._decode_wire_subtree(tree_payload, peer_addr)
                 # The grafted tree and the cached peer copy must be distinct
                 # objects, or divergence checks between "our copy" and
                 # "their copy" would compare a node against itself. Copy
@@ -372,7 +374,7 @@ class HttpTransportAdapter:
         try:
             for uuid in topic_uuids:
                 tree_payload = self.fetch_subtree(peer_addr, uuid)
-                tree = self._decode_wire_subtree(tree_payload["subtree"], peer_addr)
+                tree = self._decode_wire_subtree(tree_payload, peer_addr)
                 self.session.apply_peer_subtree(
                     peer_addr,
                     tree,
@@ -509,15 +511,17 @@ class HttpTransportAdapter:
 
     # Internals
 
-    def _decode_wire_subtree(self, payload: dict, peer_addr: str | None) -> PRSPNode:
+    def _decode_wire_subtree(self, payload: dict, peer_addr: str | None) -> ProtocolNode:
         try:
-            return PRSPNode.from_dict(payload)
+            return protocol_node_from_envelope(payload)
+        except UnsupportedProtocolVersion:
+            raise
         except ValueError as exc:
             self.logger(
                 "[transport] repairing invalid subtree from "
                 f"{peer_addr or 'peer'}: {exc}"
             )
-            return PRSPNode.from_dict(payload, repair_hashes=True)
+            return protocol_node_from_envelope(payload, repair_hashes=True)
 
     @staticmethod
     def _topic_uuids(topic_uuid: str | None,

@@ -1,0 +1,41 @@
+{
+  "parent_uuid": null,
+  "protocol_schema_version": 1,
+  "subtree": {
+    "base_hash": "c1db147d1403df61d211",
+    "base_parent_uuid": null,
+    "children": [
+      {
+        "base_hash": "7db2493cfe5d0d0b0e22",
+        "base_parent_uuid": "00000000-0000-0000-0000-000000000001",
+        "children": [],
+        "content_hash": "7db2493cfe5d0d0b0e22",
+        "created_at": "2026-01-01T00:00:01.000+00:00",
+        "data": {
+          "text": "Hello"
+        },
+        "deleted": false,
+        "parent_uuid": "00000000-0000-0000-0000-000000000001",
+        "revision_origin": "identity-a",
+        "state_hash": "a9dfe3bf69201212bedf",
+        "updated_at": "2026-01-01T00:00:01.000+00:00",
+        "uuid": "00000000-0000-0000-0000-000000000002",
+        "weights": {
+          "rank": 1.0
+        }
+      }
+    ],
+    "content_hash": "c1db147d1403df61d211",
+    "created_at": "2026-01-01T00:00:00.000+00:00",
+    "data": {
+      "label": "Example"
+    },
+    "deleted": false,
+    "parent_uuid": null,
+    "revision_origin": null,
+    "state_hash": "d20f3b241193d82f3847",
+    "updated_at": "2026-01-01T00:00:00.000+00:00",
+    "uuid": "00000000-0000-0000-0000-000000000001",
+    "weights": {}
+  }
+}

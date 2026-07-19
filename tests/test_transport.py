@@ -1,6 +1,6 @@
 import unittest
 
-from protocol import PRSPNode, stable_hash
+from protocol import ProtocolNode, stable_hash
 from session import Session, SessionEffect
 from transport import HttpTransportAdapter, TransportHttpError
 
@@ -83,13 +83,14 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        remote_topic = PRSPNode({"name": "remote"})
+        remote_topic = ProtocolNode({"name": "remote"})
         summary = {
             "topics": {remote_topic.uuid: remote_topic.state_hash},
             "deleted": {},
         }
         summary["sync_hash"] = stable_hash(summary)
         http.get_responses[f"http://b/p2p/subtree/{remote_topic.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": remote_topic.to_dict(),
             "parent_uuid": None,
         }
@@ -111,8 +112,9 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        topic = PRSPNode({"name": "topic"})
+        topic = ProtocolNode({"name": "topic"})
         http.get_responses["http://b/p2p/subtree/topic"] = {
+            "protocol_schema_version": 1,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
@@ -130,9 +132,10 @@ class TransportTests(unittest.TestCase):
 
     def test_pull_subtree_falls_back_to_topic_when_changed_node_missing(self):
         session = Session("http://a")
-        topic = PRSPNode({"name": "topic"})
+        topic = ProtocolNode({"name": "topic"})
         http = MissingChangedHttpClient("http://b/p2p/subtree/missing-child")
         http.get_responses["http://b/p2p/subtree/topic"] = {
+            "protocol_schema_version": 1,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
@@ -156,14 +159,15 @@ class TransportTests(unittest.TestCase):
         http = FakeHttpClient()
         logs = []
         adapter = HttpTransportAdapter(session, http, logger=logs.append)
-        topic = PRSPNode({"name": "topic"})
-        child = PRSPNode({"name": "child"}, parent_uuid=topic.uuid)
+        topic = ProtocolNode({"name": "topic"})
+        child = ProtocolNode({"name": "child"}, parent_uuid=topic.uuid)
         topic.children.append(child)
         topic.refresh_hashes_deep()
         payload = topic.to_dict()
         payload["content_hash"] = "stale"
         payload["state_hash"] = "stale"
         http.get_responses["http://b/p2p/subtree/topic"] = {
+            "protocol_schema_version": 1,
             "subtree": payload,
             "parent_uuid": None,
         }
@@ -184,8 +188,9 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        topic = PRSPNode({"name": "topic"})
+        topic = ProtocolNode({"name": "topic"})
         http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
@@ -194,10 +199,11 @@ class TransportTests(unittest.TestCase):
             "members": ["http://b", "http://c"],
             "topic_members": {topic.uuid: ["http://b", "http://c"]},
         }
-        peer_topic = PRSPNode.from_dict(topic.to_dict())
+        peer_topic = ProtocolNode.from_dict(topic.to_dict())
         peer_topic.data["name"] = "peer-topic"
         peer_topic.refresh_hashes()
         http.get_responses[f"http://c/p2p/subtree/{topic.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": peer_topic.to_dict(),
             "parent_uuid": None,
         }
@@ -221,13 +227,15 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        topic_one = PRSPNode({"name": "one"})
-        topic_two = PRSPNode({"name": "two"})
+        topic_one = ProtocolNode({"name": "one"})
+        topic_two = ProtocolNode({"name": "two"})
         http.get_responses[f"http://b/p2p/subtree/{topic_one.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": topic_one.to_dict(),
             "parent_uuid": None,
         }
         http.get_responses[f"http://b/p2p/subtree/{topic_two.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": topic_two.to_dict(),
             "parent_uuid": None,
         }
@@ -240,10 +248,12 @@ class TransportTests(unittest.TestCase):
             },
         }
         http.get_responses[f"http://c/p2p/subtree/{topic_one.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": topic_one.to_dict(),
             "parent_uuid": None,
         }
         http.get_responses[f"http://d/p2p/subtree/{topic_two.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": topic_two.to_dict(),
             "parent_uuid": None,
         }
@@ -261,8 +271,9 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        topic = PRSPNode({"name": "topic"})
+        topic = ProtocolNode({"name": "topic"})
         http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
+            "protocol_schema_version": 1,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }

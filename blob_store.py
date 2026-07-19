@@ -71,7 +71,7 @@ def is_valid_image(data: bytes, mime: str) -> bool:
 
 
 def referenced_blob_ids(root) -> set[str]:
-    """Collect blob IDs from every live node in a PRSP subtree."""
+    """Collect blob IDs from every live node in an S-Protocol subtree."""
     if root is None:
         return set()
     if isinstance(root, dict):

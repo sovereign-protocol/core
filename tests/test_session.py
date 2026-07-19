@@ -1,6 +1,6 @@
 import unittest
 
-from protocol import PRSPNode
+from protocol import ProtocolNode
 from session import Session
 
 
@@ -249,7 +249,7 @@ class SessionTests(unittest.TestCase):
 
     def test_handle_join_preserves_existing_peer_cache(self):
         session = Session("si-a")
-        cached = PRSPNode({"name": "cached-topic"})
+        cached = ProtocolNode({"name": "cached-topic"})
         session.apply_peer_subtree("si-b", cached, None)
 
         result = session.handle_join({
@@ -268,7 +268,7 @@ class SessionTests(unittest.TestCase):
 
     def test_handle_announce_preserves_existing_peer_cache(self):
         session = Session("si-a")
-        cached = PRSPNode({"name": "cached-topic"})
+        cached = ProtocolNode({"name": "cached-topic"})
         session.apply_peer_subtree("si-b", cached, None)
 
         result = session.handle_announce({
@@ -293,7 +293,7 @@ class SessionTests(unittest.TestCase):
         ).value
 
         invited = Session("si-b")
-        result = invited.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        result = invited.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
 
         self.assertEqual(result.status, "ok")
         self.assertEqual(result.value, topic.uuid)
@@ -307,8 +307,8 @@ class SessionTests(unittest.TestCase):
 
     def test_apply_peer_subtree_updates_peer_cache_without_http(self):
         session = Session("si-a")
-        topic = PRSPNode({"name": "topic"})
-        child = PRSPNode({"name": "child"}, parent_uuid=topic.uuid)
+        topic = ProtocolNode({"name": "topic"})
+        child = ProtocolNode({"name": "child"}, parent_uuid=topic.uuid)
         topic.children.append(child)
         topic.refresh_hashes()
 
@@ -322,16 +322,16 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
-        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        peer.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
         peer.modify(topic.uuid, {"name": "peer-topic"}, {})
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -345,12 +345,12 @@ class SessionTests(unittest.TestCase):
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
         local.modify(topic.uuid, {"name": "new-topic"}, {})
-        peer.accept_topic_invitation(PRSPNode.from_dict(
+        peer.accept_topic_invitation(ProtocolNode.from_dict(
             local.protocol.index[topic.uuid].to_dict()
         ))
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -366,17 +366,17 @@ class SessionTests(unittest.TestCase):
         local.set_peer_identity_key("si-b", peer_identity)
         peer.set_peer_identity_key("si-a", local_identity)
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
-        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        peer.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
         local.modify(topic.uuid, {"name": "local"}, {})
         peer.modify(topic.uuid, {"name": "peer"}, {})
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -388,11 +388,11 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
-        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        peer.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
         child = peer.create_child(topic.uuid, {"name": "peer child"}, {}).value
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -404,11 +404,11 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         peer = Session("si-b")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
-        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        peer.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
         child = local.create_child(topic.uuid, {"name": "local child"}, {}).value
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -421,10 +421,10 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         peer = Session("si-c")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
-        peer.accept_topic_invitation(PRSPNode.from_dict(topic.to_dict()))
+        peer.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
         local.apply_peer_subtree(
             "si-c",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -432,7 +432,7 @@ class SessionTests(unittest.TestCase):
         peer.modify(topic.uuid, {"name": "peer-second"}, {})
         local.apply_peer_subtree(
             "si-c",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -443,12 +443,12 @@ class SessionTests(unittest.TestCase):
     @staticmethod
     def _node(state_hash, base_hash, parent_uuid, base_parent_uuid,
               origin=None):
-        node = PRSPNode({"name": "x"})
+        node = ProtocolNode({"name": "x"})
         node.state_hash = state_hash
         node.base_hash = base_hash
         node.parent_uuid = parent_uuid
         node.base_parent_uuid = base_parent_uuid
-        node.revision_origin_identity = origin
+        node.revision_origin = origin
         return node
 
     def test_opposing_moves_are_divergence(self):
@@ -487,8 +487,8 @@ class SessionTests(unittest.TestCase):
         event = {
             "type": "divergence",
             "node_uuid": "n1",
-            "local_revision_origin_identity": "identity-a",
-            "peer_revision_origin_identity": "identity-b",
+            "local_revision_origin": "identity-a",
+            "peer_revision_origin": "identity-b",
             "peer_observed_local_revision": False,
         }
 
@@ -518,7 +518,7 @@ class SessionTests(unittest.TestCase):
         local.add_peer("si-b", topic.uuid)
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             peer.protocol.root.uuid,
         )
 
@@ -527,7 +527,7 @@ class SessionTests(unittest.TestCase):
         # Pull just the changed node, hitting the update-in-place merge path.
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[child.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[child.uuid].to_dict()),
             topic.uuid,
         )
 
@@ -547,7 +547,7 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         topic = local.create_child(local.protocol.root.uuid, {"name": "topic"}, {}).value
         child = local.create_child(topic.uuid, {"name": "child"}, {}).value
-        stale_topic = PRSPNode.from_dict(local.protocol.index[topic.uuid].to_dict())
+        stale_topic = ProtocolNode.from_dict(local.protocol.index[topic.uuid].to_dict())
         local.start_discussion(topic.uuid)
         local.add_peer("si-b", topic.uuid)
 
@@ -563,7 +563,7 @@ class SessionTests(unittest.TestCase):
         self.assertIn(child.uuid, local.protocol.index)
 
         # Once the peer's cache also shows the node deleted, it can be pruned.
-        current_topic = PRSPNode.from_dict(local.protocol.index[topic.uuid].to_dict())
+        current_topic = ProtocolNode.from_dict(local.protocol.index[topic.uuid].to_dict())
         local.apply_peer_subtree("si-b", current_topic, local.protocol.root.uuid)
 
         self.assertNotIn(child.uuid, local.protocol.index)
@@ -618,7 +618,7 @@ class SessionTests(unittest.TestCase):
         session.watch_topic("si-b", "topic-1")
         session.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer_topic.to_dict()),
+            ProtocolNode.from_dict(peer_topic.to_dict()),
             session.protocol.root.uuid,
         )
 
@@ -756,7 +756,7 @@ class SessionTests(unittest.TestCase):
 
     def test_find_peer_identity_searches_cached_peer_perspectives(self):
         session = Session("si-a")
-        peer_profile = PRSPNode({
+        peer_profile = ProtocolNode({
             "type": "shared_user_profile",
             "name": "public_profile",
             "version": 1,
@@ -780,14 +780,14 @@ class SessionTests(unittest.TestCase):
         # peer_perspectives dict keys (simulating Bob reconnecting from a
         # new address), must still resolve to one identity.
         session = Session("si-a")
-        bob_v1 = PRSPNode({
+        bob_v1 = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
             "version": 1, "identity_key": "key-bob", "email": "",
             "display_name": "Bob", "picture": "",
         })
         bob_v1.refresh_hashes()
         session.peer_perspectives["old-address"] = bob_v1
-        bob_v2 = PRSPNode({
+        bob_v2 = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
             "version": 1, "identity_key": "key-bob", "email": "",
             "display_name": "Bob", "picture": "",
@@ -829,7 +829,7 @@ class SessionTests(unittest.TestCase):
 
     def test_apply_peer_subtree_records_identity_key_for_profile_roots(self):
         session = Session("si-a")
-        bob = PRSPNode({
+        bob = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
             "version": 1, "identity_key": "key-bob", "email": "",
             "display_name": "Bob", "picture": "",
@@ -842,7 +842,7 @@ class SessionTests(unittest.TestCase):
 
     def test_apply_peer_subtree_ignores_non_identity_roots(self):
         session = Session("si-a")
-        board = PRSPNode({"type": "kanban_board", "name": "Board"})
+        board = ProtocolNode({"type": "kanban_board", "name": "Board"})
         board.refresh_hashes()
 
         session.apply_peer_subtree("http://addr-b", board, None)
@@ -865,7 +865,7 @@ class SessionTests(unittest.TestCase):
 
     def test_peer_identity_scoped_to_one_address(self):
         session = Session("si-a")
-        bob = PRSPNode({
+        bob = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
             "version": 1, "identity_key": "key-bob", "email": "",
             "display_name": "Bob", "picture": "",
@@ -946,13 +946,13 @@ class SessionTests(unittest.TestCase):
         ).value
         local = Session("si-a")
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
         child = peer.create_child(topic.uuid, {"type": "note_item", "text": "x"}, {}).value
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -974,7 +974,7 @@ class SessionTests(unittest.TestCase):
         child = local.create_child(
             topic.uuid, {"type": "note_item", "text": "original"}, {},
         ).value
-        peer_copy = PRSPNode.from_dict(
+        peer_copy = ProtocolNode.from_dict(
             local.protocol.index[topic.uuid].to_dict(),
         )
         local.apply_peer_subtree("si-b", peer_copy, local.protocol.root.uuid)
@@ -983,7 +983,7 @@ class SessionTests(unittest.TestCase):
         local.modify(child.uuid, {"type": "note_item", "text": "first"}, {})
         local.modify(child.uuid, {"type": "note_item", "text": "second"}, {})
         changed = local.protocol.index[child.uuid]
-        self.assertEqual(changed.revision_origin_identity, local_identity)
+        self.assertEqual(changed.revision_origin, local_identity)
         self.assertEqual(changed.base_hash, peer_child.base_hash)
 
         result = local.rollback_peer_node("si-b", child.uuid)
@@ -993,7 +993,7 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(rolled_back.data["text"], "original")
         self.assertEqual(rolled_back.state_hash, peer_child.state_hash)
         self.assertEqual(rolled_back.base_hash, peer_child.base_hash)
-        self.assertEqual(rolled_back.revision_origin_identity, local_identity)
+        self.assertEqual(rolled_back.revision_origin, local_identity)
 
     def test_rollback_rejects_another_origins_revision(self):
         peer = Session("si-b")
@@ -1004,11 +1004,11 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         local.identity
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
         local.apply_peer_subtree(
-            "si-b", PRSPNode.from_dict(topic.to_dict()), local.protocol.root.uuid,
+            "si-b", ProtocolNode.from_dict(topic.to_dict()), local.protocol.root.uuid,
         )
 
         result = local.rollback_peer_node("si-b", topic.uuid)
@@ -1028,14 +1028,14 @@ class SessionTests(unittest.TestCase):
         child = peer.create_child(topic.uuid, {"type": "note_item", "text": "original"}, {}).value
         local = Session("si-a")
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
         peer.modify(child.uuid, {"type": "note_item", "text": "updated"}, {})
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -1052,14 +1052,14 @@ class SessionTests(unittest.TestCase):
         child = peer.create_child(topic.uuid, {"type": "note_item", "text": "original"}, {}).value
         local = Session("si-a")
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
         peer.modify(child.uuid, {"type": "note_item", "text": "updated"}, {})
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -1083,14 +1083,14 @@ class SessionTests(unittest.TestCase):
         folder = peer.create_child(topic.uuid, {"type": "folder", "text": "orig"}, {}).value
         local = Session("si-a")
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
         peer.modify(folder.uuid, {"type": "folder", "text": "new"}, {})
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
@@ -1111,14 +1111,14 @@ class SessionTests(unittest.TestCase):
         local = Session("si-a")
         local.identity
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
         peer.modify(folder.uuid, {"type": "folder", "text": "new"}, {})
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
         local.reconcile_peer_changes("si-b", topic.uuid)
@@ -1126,7 +1126,7 @@ class SessionTests(unittest.TestCase):
         adopted = local.protocol.index[folder.uuid]
         self.assertEqual(adopted.data["text"], "new")
         self.assertEqual(
-            adopted.revision_origin_identity, peer_identity_key,
+            adopted.revision_origin, peer_identity_key,
         )
 
     def test_reconcile_peer_changes_filters_ineligible_new_nodes(self):
@@ -1141,14 +1141,14 @@ class SessionTests(unittest.TestCase):
         ).value
         local = Session("si-a")
         local.adopt_subtree(
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 
         leaf = peer.create_child(topic.uuid, {"type": "leaf", "text": "new"}, {}).value
         local.apply_peer_subtree(
             "si-b",
-            PRSPNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
             local.protocol.root.uuid,
         )
 

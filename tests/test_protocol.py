@@ -1,19 +1,19 @@
 import unittest
 
-from protocol import PRSPNode, ProtocolState
+from protocol import ProtocolNode, ProtocolState
 
 
 class ProtocolTests(unittest.TestCase):
     def test_hashes_ignore_child_order(self):
-        first = PRSPNode({"name": "root"})
-        a = PRSPNode({"name": "a"}, parent_uuid=first.uuid)
-        b = PRSPNode({"name": "b"}, parent_uuid=first.uuid)
+        first = ProtocolNode({"name": "root"})
+        a = ProtocolNode({"name": "a"}, parent_uuid=first.uuid)
+        b = ProtocolNode({"name": "b"}, parent_uuid=first.uuid)
         first.children = [a, b]
         first.refresh_hashes_deep()
 
-        second = PRSPNode({"name": "root"})
-        a2 = PRSPNode.from_dict(a.to_dict())
-        b2 = PRSPNode.from_dict(b.to_dict())
+        second = ProtocolNode({"name": "root"})
+        a2 = ProtocolNode.from_dict(a.to_dict())
+        b2 = ProtocolNode.from_dict(b.to_dict())
         a2.parent_uuid = second.uuid
         b2.parent_uuid = second.uuid
         second.children = [b2, a2]
@@ -23,15 +23,22 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(first.state_hash, second.state_hash)
 
     def test_from_dict_rejects_mismatched_hash(self):
-        node = PRSPNode({"name": "node"})
+        node = ProtocolNode({"name": "node"})
         payload = node.to_dict()
         payload["data"]["name"] = "tampered"
 
         with self.assertRaises(ValueError):
-            PRSPNode.from_dict(payload)
+            ProtocolNode.from_dict(payload)
+
+    def test_from_dict_rejects_legacy_revision_origin_field(self):
+        payload = ProtocolNode({"name": "node"}).to_dict()
+        payload["revision_origin_identity"] = payload.pop("revision_origin")
+
+        with self.assertRaisesRegex(ValueError, "unsupported legacy field"):
+            ProtocolNode.from_dict(payload)
 
     def test_new_node_starts_settled(self):
-        node = PRSPNode({"name": "node"})
+        node = ProtocolNode({"name": "node"})
 
         # base_hash snapshots the node's OWN content (content_hash), not the
         # recursive subtree (state_hash).
@@ -63,7 +70,7 @@ class ProtocolTests(unittest.TestCase):
         state.modify(child.uuid, {"name": "second"}, {}, "identity-b")
 
         self.assertEqual(child.base_hash, previous_actual)
-        self.assertEqual(child.revision_origin_identity, "identity-b")
+        self.assertEqual(child.revision_origin, "identity-b")
 
     def test_move_child_tracks_base_parent_uuid(self):
         state = ProtocolState("si-a")
@@ -132,13 +139,13 @@ class ProtocolTests(unittest.TestCase):
         # subtree_hash folds in child uuids, so swapping a child for an
         # identical-content node with a different uuid still changes the
         # parent - required for transfer validation to catch a structural swap.
-        parent = PRSPNode({"name": "parent"})
-        child_a = PRSPNode({"name": "same"}, parent_uuid=parent.uuid)
+        parent = ProtocolNode({"name": "parent"})
+        child_a = ProtocolNode({"name": "same"}, parent_uuid=parent.uuid)
         parent.children = [child_a]
         parent.refresh_hashes()
         hash_with_a = parent.state_hash
 
-        child_b = PRSPNode({"name": "same"}, parent_uuid=parent.uuid)
+        child_b = ProtocolNode({"name": "same"}, parent_uuid=parent.uuid)
         self.assertNotEqual(child_a.uuid, child_b.uuid)
         self.assertEqual(child_a.content_hash, child_b.content_hash)
         self.assertEqual(child_a.state_hash, child_b.state_hash)
@@ -158,7 +165,7 @@ class ProtocolTests(unittest.TestCase):
         card = state.create_child(
             column.uuid, {"name": "card"}, {}, "identity-a",
         ).value
-        source = PRSPNode({"name": "col-renamed"}, revision_origin_identity="identity-b")
+        source = ProtocolNode({"name": "col-renamed"}, revision_origin="identity-b")
         source.refresh_hashes()
 
         state.adopt_own_fields(column.uuid, source)
@@ -166,7 +173,7 @@ class ProtocolTests(unittest.TestCase):
         self.assertEqual(column.data["name"], "col-renamed")
         self.assertIn(card, column.children)
         self.assertIn(card.uuid, state.index)
-        self.assertEqual(column.revision_origin_identity, "identity-b")
+        self.assertEqual(column.revision_origin, "identity-b")
         self.assertEqual(column.base_hash, source.base_hash)
 
     def test_adopt_own_fields_propagates_deletion_without_cascading(self):
@@ -180,7 +187,7 @@ class ProtocolTests(unittest.TestCase):
         card = state.create_child(
             column.uuid, {"name": "card"}, {}, "identity-a",
         ).value
-        source = PRSPNode({"name": "col"}, revision_origin_identity="identity-b")
+        source = ProtocolNode({"name": "col"}, revision_origin="identity-b")
         source.deleted = True
         source.refresh_hashes()
 
@@ -198,7 +205,7 @@ class ProtocolTests(unittest.TestCase):
         node = state.create_child(
             state.root.uuid, {"name": "n"}, {}, "identity-a",
         ).value
-        source = PRSPNode({"name": "n2"}, revision_origin_identity="identity-b")
+        source = ProtocolNode({"name": "n2"}, revision_origin="identity-b")
         source.updated_at = "2020-01-01T00:00:00.000+00:00"
         source.refresh_hashes()
 
@@ -220,9 +227,9 @@ class ProtocolTests(unittest.TestCase):
         ).value
         before_parent = card.parent_uuid
         before_content = card.content_hash
-        source = PRSPNode(
+        source = ProtocolNode(
             {"name": "card-edited"}, parent_uuid="missing-parent",
-            revision_origin_identity="identity-a",
+            revision_origin="identity-a",
         )
         source.refresh_hashes()
 
@@ -246,14 +253,14 @@ class ProtocolTests(unittest.TestCase):
 
         # The child's actual editor is C. The parent's hash changed only
         # because of the descendant, so its own revision still belongs to A.
-        self.assertEqual(child.revision_origin_identity, "identity-c")
-        self.assertEqual(parent.revision_origin_identity, "identity-a")
-        restored = PRSPNode.from_dict(child.to_dict())
-        self.assertEqual(restored.revision_origin_identity, "identity-c")
+        self.assertEqual(child.revision_origin, "identity-c")
+        self.assertEqual(parent.revision_origin, "identity-a")
+        restored = ProtocolNode.from_dict(child.to_dict())
+        self.assertEqual(restored.revision_origin, "identity-c")
 
         # A no-op must not relabel C's revision as B's.
         state.modify(child.uuid, {"name": "changed"}, {}, "identity-b")
-        self.assertEqual(child.revision_origin_identity, "identity-c")
+        self.assertEqual(child.revision_origin, "identity-c")
 
     def test_delete_and_copy_record_the_client_that_performed_the_operation(self):
         state = ProtocolState("si-a")
@@ -268,13 +275,13 @@ class ProtocolTests(unittest.TestCase):
             parent.uuid, state.root.uuid, "identity-b",
         ).value
         self.assertTrue(all(
-            node.revision_origin_identity == "identity-b"
+            node.revision_origin == "identity-b"
             for node in (clone, *clone.children)
         ))
 
         state.delete(parent.uuid, "identity-c")
         self.assertTrue(all(
-            node.revision_origin_identity == "identity-c"
+            node.revision_origin == "identity-c"
             for node in (parent, child)
         ))
 

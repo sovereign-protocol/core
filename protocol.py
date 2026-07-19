@@ -1,12 +1,12 @@
 """
-Pure Sovereign Perspective protocol.
+Pure Sovereign Protocol tree model.
 
 Offered API:
-  PRSPNode
+  ProtocolNode
     Tree node with stable content/state hashes and checked serialization.
 
   ProtocolState(author)
-    Owns one local PRSP tree and offers atomic operations and topic
+    Owns one local protocol tree and offers atomic operations and topic
     attachment.
 
   ProtocolResult
@@ -29,6 +29,8 @@ import uuid as uuid_mod
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
+
+from versions import PROTOCOL_SCHEMA_VERSION
 
 
 _REVISION_ORIGIN_UNSET = object()
@@ -70,7 +72,7 @@ def state_hash(node_content_hash: str, child_uuid_state_hashes: list[list[str]])
     })
 
 
-def collect_subtree_uuids(node: "PRSPNode") -> set[str]:
+def collect_subtree_uuids(node: "ProtocolNode") -> set[str]:
     out = {node.uuid}
     for child in node.children:
         out.update(collect_subtree_uuids(child))
@@ -84,11 +86,15 @@ class ProtocolResult:
     reason: str | None = None
 
 
-class PRSPNode:
+class UnsupportedProtocolVersion(ValueError):
+    """Raised when a serialized protocol tree uses another schema."""
+
+
+class ProtocolNode:
     def __init__(self, data: dict,
                  weights: dict[str, float] | None = None,
                  parent_uuid: str | None = None,
-                 revision_origin_identity: str | None = None):
+                 revision_origin: str | None = None):
         self.uuid = str(uuid_mod.uuid4())
         self.created_at = now_iso()
         self.updated_at = now_iso()
@@ -96,7 +102,7 @@ class PRSPNode:
         self.data = copy.deepcopy(data)
         self.parent_uuid = parent_uuid
         self.deleted = False
-        self.children: list[PRSPNode] = []
+        self.children: list[ProtocolNode] = []
         self.content_hash = ""
         self.state_hash = ""
         self.refresh_hashes()
@@ -111,7 +117,7 @@ class PRSPNode:
         # Protocol metadata, deliberately excluded from content/state hashes.
         # It identifies the client that started this revision wave, even
         # when another peer merely forwards or adopts its latest state.
-        self.revision_origin_identity = revision_origin_identity
+        self.revision_origin = revision_origin
 
     def recompute_content_hash(self) -> str:
         return content_hash(self.data, self.weights, self.deleted)
@@ -131,7 +137,7 @@ class PRSPNode:
             child.refresh_hashes_deep()
         self.refresh_hashes()
 
-    def live_children(self) -> list["PRSPNode"]:
+    def live_children(self) -> list["ProtocolNode"]:
         return [child for child in self.children if not child.deleted]
 
     def to_dict(self) -> dict:
@@ -143,7 +149,7 @@ class PRSPNode:
             "state_hash": self.state_hash,
             "base_hash": self.base_hash,
             "base_parent_uuid": self.base_parent_uuid,
-            "revision_origin_identity": self.revision_origin_identity,
+            "revision_origin": self.revision_origin,
             "weights": copy.deepcopy(self.weights),
             "data": copy.deepcopy(self.data),
             "parent_uuid": self.parent_uuid,
@@ -152,7 +158,12 @@ class PRSPNode:
         }
 
     @classmethod
-    def from_dict(cls, payload: dict, repair_hashes: bool = False) -> "PRSPNode":
+    def from_dict(cls, payload: dict, repair_hashes: bool = False) -> "ProtocolNode":
+        if "revision_origin_identity" in payload:
+            raise UnsupportedProtocolVersion(
+                "unsupported legacy field 'revision_origin_identity'; "
+                "expected 'revision_origin'"
+            )
         node = cls.__new__(cls)
         node.uuid = payload["uuid"]
         node.created_at = payload["created_at"]
@@ -161,7 +172,7 @@ class PRSPNode:
         node.state_hash = payload["state_hash"]
         node.base_hash = payload.get("base_hash", payload["content_hash"])
         node.base_parent_uuid = payload.get("base_parent_uuid", payload.get("parent_uuid"))
-        node.revision_origin_identity = payload.get("revision_origin_identity")
+        node.revision_origin = payload.get("revision_origin")
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.data = copy.deepcopy(payload["data"])
         node.parent_uuid = payload.get("parent_uuid")
@@ -185,22 +196,48 @@ class PRSPNode:
         return node
 
 
+def protocol_tree_envelope(node: ProtocolNode) -> dict:
+    """Return the versioned wire envelope for one protocol subtree."""
+    return {
+        "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
+        "subtree": node.to_dict(),
+        "parent_uuid": node.parent_uuid,
+    }
+
+
+def protocol_node_from_envelope(payload: dict,
+                                repair_hashes: bool = False) -> ProtocolNode:
+    """Validate a protocol envelope and decode its checked subtree."""
+    if not isinstance(payload, dict):
+        raise ValueError("protocol envelope must be an object")
+    version = payload.get("protocol_schema_version")
+    if version != PROTOCOL_SCHEMA_VERSION:
+        raise UnsupportedProtocolVersion(
+            f"unsupported protocol schema version {version!r}; "
+            f"expected {PROTOCOL_SCHEMA_VERSION}"
+        )
+    subtree = payload.get("subtree")
+    if not isinstance(subtree, dict):
+        raise ValueError("protocol envelope is missing subtree")
+    return ProtocolNode.from_dict(subtree, repair_hashes=repair_hashes)
+
+
 class ProtocolState:
     def __init__(self, author: str):
         self.author = author
-        self.root = PRSPNode({"label": author})
-        self.index: dict[str, PRSPNode] = {}
+        self.root = ProtocolNode({"label": author})
+        self.index: dict[str, ProtocolNode] = {}
         self.index_subtree(self.root)
 
     # Atomic operations
 
     def create_child(self, parent_uuid: str, data: dict,
                      weights: dict | None = None,
-                     revision_origin_identity: str | None = None) -> ProtocolResult:
+                     revision_origin: str | None = None) -> ProtocolResult:
         parent = self.index.get(parent_uuid)
         if not parent:
             return ProtocolResult(False, reason="parent not found")
-        child = PRSPNode(data, weights, parent_uuid, revision_origin_identity)
+        child = ProtocolNode(data, weights, parent_uuid, revision_origin)
         parent.children.append(child)
         self.index_subtree(child)
         self.cascade_hash(parent_uuid)
@@ -208,7 +245,7 @@ class ProtocolState:
 
     def modify(self, node_uuid: str, data: dict,
                weights: dict | None = None,
-               revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+               revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
         node = self.index.get(node_uuid)
         if not node:
             return ProtocolResult(False, reason="node not found")
@@ -219,23 +256,23 @@ class ProtocolState:
         node.weights = new_weights
         if changed:
             node.updated_at = now_iso()
-            self._begin_revision(node, revision_origin_identity)
+            self._begin_revision(node, revision_origin)
         self.cascade_hash(node_uuid)
         return ProtocolResult(True, True)
 
     def delete(self, node_uuid: str,
-               revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
-        ok = self._delete_impl(node_uuid, revision_origin_identity)
+               revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+        ok = self._delete_impl(node_uuid, revision_origin)
         return ProtocolResult(ok, ok, None if ok else "delete failed")
 
     def copy(self, source_uuid: str, destination_uuid: str,
-             revision_origin_identity: str | None = None) -> ProtocolResult:
+             revision_origin: str | None = None) -> ProtocolResult:
         source = self.index.get(source_uuid)
         destination = self.index.get(destination_uuid)
         if not source or not destination:
             return ProtocolResult(False, reason="source or destination not found")
         clone = self.clone_subtree(
-            source, destination.uuid, revision_origin_identity,
+            source, destination.uuid, revision_origin,
         )
         destination.children.append(clone)
         self.index_subtree(clone)
@@ -243,15 +280,15 @@ class ProtocolState:
         return ProtocolResult(True, clone)
 
     def move(self, source_uuid: str, destination_uuid: str,
-             revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+             revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
         ok = self._move_impl(
-            source_uuid, destination_uuid, revision_origin_identity,
+            source_uuid, destination_uuid, revision_origin,
         )
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
     def move_child(self, source_uuid: str, destination_uuid: str,
                    index: int | None = None,
-                   revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+                   revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
         # NOTE on `index`: sibling *position* is not part of any hash
         # (content/state hashes sort their children), so it never syncs -
         # it only affects this local list's order. An app that wants order
@@ -259,11 +296,11 @@ class ProtocolState:
         # kanban's `data.order` + _place_in_order does. Passing `index`
         # alone will silently look right locally and wrong on every peer.
         ok = self._move_child_impl(
-            source_uuid, destination_uuid, index, revision_origin_identity,
+            source_uuid, destination_uuid, index, revision_origin,
         )
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
-    def adopt_own_fields(self, node_uuid: str, source: PRSPNode,
+    def adopt_own_fields(self, node_uuid: str, source: ProtocolNode,
                          adopt_move: bool = True) -> ProtocolResult:
         # Shallow adopt: make an existing node's OWN revision identical to
         # `source` (data, weights, deleted, base and origin) while leaving its
@@ -291,12 +328,12 @@ class ProtocolState:
                 return ProtocolResult(False, reason="destination parent not present")
             if not self._move_child_impl(
                     node_uuid, source.parent_uuid, None,
-                    source.revision_origin_identity):
+                    source.revision_origin):
                 return ProtocolResult(False, reason="move not applicable")
         node.data = copy.deepcopy(source.data)
         node.weights = copy.deepcopy(source.weights)
         node.deleted = source.deleted
-        node.revision_origin_identity = source.revision_origin_identity
+        node.revision_origin = source.revision_origin
         # Preserve the source revision's timestamp. Session orders forwarded
         # same-origin revisions by updated_at, so stamping the adopter's clock
         # would let a stale adopted copy look newer than the originator's head.
@@ -311,11 +348,11 @@ class ProtocolState:
             node.base_parent_uuid = source.base_parent_uuid
         return ProtocolResult(True, node)
 
-    def adopt_subtree(self, tree: PRSPNode, parent_uuid: str,
+    def adopt_subtree(self, tree: ProtocolNode, parent_uuid: str,
                       remove_descendant_duplicates: bool = False) -> ProtocolResult:
         if parent_uuid not in self.index:
             return ProtocolResult(False, reason="parent not found")
-        adopted = PRSPNode.from_dict(tree.to_dict())
+        adopted = ProtocolNode.from_dict(tree.to_dict())
         ok = self._adopt_subtree_impl(
             adopted,
             parent_uuid,
@@ -333,7 +370,7 @@ class ProtocolState:
 
     # Topic / tree helpers
 
-    def attach_topic(self, tree: PRSPNode, parent_uuid: str | None = None) -> ProtocolResult:
+    def attach_topic(self, tree: ProtocolNode, parent_uuid: str | None = None) -> ProtocolResult:
         existing = self.index.get(tree.uuid)
         if existing:
             return ProtocolResult(True, existing.uuid)
@@ -352,12 +389,12 @@ class ProtocolState:
 
     # Internal tree mechanics
 
-    def index_subtree(self, node: PRSPNode) -> None:
+    def index_subtree(self, node: ProtocolNode) -> None:
         self.index[node.uuid] = node
         for child in node.children:
             self.index_subtree(child)
 
-    def deindex_subtree(self, node: PRSPNode) -> None:
+    def deindex_subtree(self, node: ProtocolNode) -> None:
         for child in node.children:
             self.deindex_subtree(child)
         self.index.pop(node.uuid, None)
@@ -377,61 +414,61 @@ class ProtocolState:
             current_uuid = node.parent_uuid
 
     @staticmethod
-    def _begin_revision(node: PRSPNode,
-                        revision_origin_identity: str | None | object) -> None:
-        if revision_origin_identity is _REVISION_ORIGIN_UNSET:
+    def _begin_revision(node: ProtocolNode,
+                        revision_origin: str | None | object) -> None:
+        if revision_origin is _REVISION_ORIGIN_UNSET:
             return
-        if node.revision_origin_identity != revision_origin_identity:
+        if node.revision_origin != revision_origin:
             # Snapshot the node's own content at the wave start. Callers run
             # this before the edit's hashes are recomputed, so content_hash
             # here is still the pre-edit value.
             node.base_hash = node.content_hash
             node.base_parent_uuid = node.parent_uuid
-        node.revision_origin_identity = revision_origin_identity
+        node.revision_origin = revision_origin
 
-    def clone_subtree(self, node: PRSPNode, parent_uuid: str | None,
-                      revision_origin_identity: str | None = None) -> PRSPNode:
-        clone = PRSPNode(
+    def clone_subtree(self, node: ProtocolNode, parent_uuid: str | None,
+                      revision_origin: str | None = None) -> ProtocolNode:
+        clone = ProtocolNode(
             copy.deepcopy(node.data),
             copy.deepcopy(node.weights),
             parent_uuid,
-            revision_origin_identity,
+            revision_origin,
         )
         for child in node.children:
             clone.children.append(self.clone_subtree(
-                child, clone.uuid, revision_origin_identity,
+                child, clone.uuid, revision_origin,
             ))
         clone.refresh_hashes_deep()
         return clone
 
     def _delete_impl(self, node_uuid: str,
-                     revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
+                     revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
         node = self.index.get(node_uuid)
         if not node or node.parent_uuid is None or node.deleted:
             return False
-        self._mark_deleted_cascade(node, revision_origin_identity)
+        self._mark_deleted_cascade(node, revision_origin)
         node.refresh_hashes_deep()
         self.cascade_hash(node.parent_uuid)
         return True
 
-    def _mark_deleted_cascade(self, node: PRSPNode,
-                              revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> None:
+    def _mark_deleted_cascade(self, node: ProtocolNode,
+                              revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> None:
         if not node.deleted:
-            self._begin_revision(node, revision_origin_identity)
+            self._begin_revision(node, revision_origin)
             node.deleted = True
             node.updated_at = now_iso()
         for child in node.children:
-            self._mark_deleted_cascade(child, revision_origin_identity)
+            self._mark_deleted_cascade(child, revision_origin)
 
     def _move_impl(self, source_uuid: str, destination_uuid: str,
-                   revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
+                   revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
         return self._move_child_impl(
-            source_uuid, destination_uuid, None, revision_origin_identity,
+            source_uuid, destination_uuid, None, revision_origin,
         )
 
     def _move_child_impl(self, source_uuid: str, destination_uuid: str,
                           index: int | None = None,
-                          revision_origin_identity: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
+                          revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
         node = self.index.get(source_uuid)
         destination = self.index.get(destination_uuid)
         if not node or not destination or node.parent_uuid is None:
@@ -447,7 +484,7 @@ class ProtocolState:
         # A same-parent call is a reorder, not a move: leave the compound
         # move base alone.
         if node.parent_uuid != destination.uuid:
-            self._begin_revision(node, revision_origin_identity)
+            self._begin_revision(node, revision_origin)
         node.parent_uuid = destination.uuid
         node.updated_at = now_iso()
         insert_at = len(destination.children) if index is None else max(0, min(index, len(destination.children)))
@@ -456,7 +493,7 @@ class ProtocolState:
         self.cascade_hash(destination.uuid)
         return True
 
-    def _adopt_subtree_impl(self, adopted: PRSPNode, parent_uuid: str,
+    def _adopt_subtree_impl(self, adopted: ProtocolNode, parent_uuid: str,
                              remove_descendant_duplicates: bool = False) -> bool:
         parent = self.index.get(parent_uuid)
         if not parent:
@@ -501,7 +538,7 @@ class ProtocolState:
 
     collect_subtree_uuids = staticmethod(collect_subtree_uuids)
 
-    def _remove_subtree_uuids_impl(self, root: PRSPNode, uuids: set[str]) -> bool:
+    def _remove_subtree_uuids_impl(self, root: ProtocolNode, uuids: set[str]) -> bool:
         changed = False
         kept = []
         for child in root.children:
@@ -517,7 +554,7 @@ class ProtocolState:
         return changed
 
     @staticmethod
-    def is_descendant(root: PRSPNode, uuid: str) -> bool:
+    def is_descendant(root: ProtocolNode, uuid: str) -> bool:
         return any(
             child.uuid == uuid or ProtocolState.is_descendant(child, uuid)
             for child in root.children

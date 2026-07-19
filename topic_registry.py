@@ -11,15 +11,15 @@ import threading
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from protocol import PRSPNode
+from protocol import ProtocolNode
 
 
 @dataclass(frozen=True)
 class SharedTopicHandler:
     owner: str
     root_types: frozenset[str]
-    list_topics: Callable[[], Iterable[str | PRSPNode]]
-    accept_invitation: Callable[[PRSPNode], Any]
+    list_topics: Callable[[], Iterable[str | ProtocolNode]]
+    accept_invitation: Callable[[ProtocolNode], Any]
 
 
 class SharedTopicRegistry:
@@ -34,8 +34,8 @@ class SharedTopicRegistry:
         self,
         owner: str,
         root_types: Iterable[str],
-        list_topics: Callable[[], Iterable[str | PRSPNode]],
-        accept_invitation: Callable[[PRSPNode], Any],
+        list_topics: Callable[[], Iterable[str | ProtocolNode]],
+        accept_invitation: Callable[[ProtocolNode], Any],
     ) -> None:
         owner = str(owner or "").strip()
         normalized_types = frozenset(
@@ -72,13 +72,13 @@ class SharedTopicRegistry:
                 if self._owner_by_root_type.get(root_type) == owner:
                     self._owner_by_root_type.pop(root_type, None)
 
-    def handler_for(self, node: PRSPNode | None) -> SharedTopicHandler | None:
+    def handler_for(self, node: ProtocolNode | None) -> SharedTopicHandler | None:
         root_type = str((node.data if node else {}).get("type") or "")
         with self._lock:
             owner = self._owner_by_root_type.get(root_type)
             return self._handlers_by_owner.get(owner) if owner else None
 
-    def supports(self, node: PRSPNode | None) -> bool:
+    def supports(self, node: ProtocolNode | None) -> bool:
         return self.handler_for(node) is not None
 
     def local_topic_uuids(self) -> list[str]:
@@ -87,12 +87,12 @@ class SharedTopicRegistry:
         found = set()
         for handler in handlers:
             for item in handler.list_topics() or []:
-                topic_uuid = item.uuid if isinstance(item, PRSPNode) else str(item or "")
+                topic_uuid = item.uuid if isinstance(item, ProtocolNode) else str(item or "")
                 if topic_uuid:
                     found.add(topic_uuid)
         return sorted(found)
 
-    def accept_invited_topic(self, tree: PRSPNode):
+    def accept_invited_topic(self, tree: ProtocolNode):
         handler = self.handler_for(tree)
         return handler.accept_invitation(tree) if handler else None
 
