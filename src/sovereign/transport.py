@@ -283,30 +283,26 @@ class HttpTransportAdapter:
             # Core-owned topics accompany every relationship. The registry,
             # not this transport, decides which handlers opt out of channel
             # assignment scope.
-            core_topic_uuids = self.session.shared_topics.local_topic_uuids(())
+            core_topic_uuids = self.session.shared_topic_uuids(())
             response_topic_uuids = sorted({*topic_uuids, *core_topic_uuids})
             for core_topic_uuid in core_topic_uuids:
                 self.session.start_discussion(core_topic_uuid)
 
             adopted = []
             grafted_topic_uuids = set()
+            pending_topic_uuids = set()
             for tree, parent_uuid in fetched:
                 cached_copy = copy.deepcopy(tree)
-                handler = self.session.shared_topics.handler_for(tree)
-                if (
-                    handler is None
-                    and self.session.shared_topics.has_assignment_scoped_handlers()
-                ):
-                    return {
-                        "status": "error",
-                        "reason": f"no active application accepts {tree.data.get('type')!r}",
-                    }
-                accepted = (
-                    handler.accept_invitation(tree)
-                    if handler else self.session.accept_topic_invitation(tree)
-                )
-                if accepted.status != "ok":
-                    return {"status": "error", "reason": accepted.reason}
+                handler = self.session.shared_topic_handler_for(tree)
+                if handler:
+                    accepted = self.session.accept_shared_topic_invitation(tree)
+                    if accepted.status != "ok":
+                        return {"status": "error", "reason": accepted.reason}
+                else:
+                    # The token is explicit consent, but an inactive app must
+                    # validate and mount its own topic later. Cache only now.
+                    self.session.note_pending_topic_invitation(tree.uuid)
+                    pending_topic_uuids.add(tree.uuid)
                 if self.session.has_node(tree.uuid):
                     grafted_topic_uuids.add(tree.uuid)
                     adopted.append(tree.uuid)
@@ -364,7 +360,9 @@ class HttpTransportAdapter:
                     )
                     if (
                         member != peer_addr
-                        and current_topic_uuid in grafted_topic_uuids
+                        and current_topic_uuid in (
+                            grafted_topic_uuids | pending_topic_uuids
+                        )
                         and not already_known
                     ):
                         indirect_members.setdefault(member, set()).add(

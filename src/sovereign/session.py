@@ -34,6 +34,7 @@ Transport contract:
 
 from __future__ import annotations
 
+import copy
 import time
 import threading
 import uuid as uuid_mod
@@ -45,7 +46,7 @@ from .protocol import (
     ProtocolNode, ProtocolState, collect_subtree_uuids,
     protocol_tree_envelope, stable_hash,
 )
-from .topic_registry import SharedTopicRegistry
+from .topic_registry import ApplicationRegistration, SharedTopicRegistry
 from .trace_log import TraceLogger
 from .versions import CORE_PROFILE_SCHEMA_VERSION
 
@@ -202,6 +203,11 @@ class Session:
         # durable relay heads after restart.
         self.peer_observed_node_revisions: dict[str, dict[str, str]] = {}
         self.active_topic_uuids: set[str] = set()
+        # Runtime-only consent markers for invited application topics that
+        # arrived while their application was inactive. Passive relay cache
+        # entries are deliberately absent and must never be grafted merely
+        # because an application is activated later.
+        self.pending_topic_invitations: set[str] = set()
         self.app_metadata: dict[str, Any] = {}
         # Runtime-only application hooks used by channels to enumerate and
         # mount shared topic roots without importing application modules.
@@ -305,6 +311,95 @@ class Session:
         if tree.children:
             return SessionResult("error", reason="Core profile cannot have children")
         return SessionResult("ok", value=tree.uuid)
+
+    # Application registration. Callbacks are runtime-only and are never
+    # persisted. Session owns invocation so channels do not touch registry
+    # locks or mutable protocol state directly.
+
+    @_session_locked
+    def register_application(self, registration: ApplicationRegistration) -> None:
+        self.shared_topics.register_application(registration)
+
+    @_session_locked
+    def unregister_application(self, application_id: str) -> None:
+        if application_id == "Sovereign Core profile":
+            raise ValueError("the Core profile registration cannot be removed")
+        self.shared_topics.unregister(application_id)
+
+    @_session_locked
+    def mount_cached_topics(self, application_id: str) -> list[str]:
+        registration = next((
+            item for item in self.shared_topics.registrations()
+            if item.application_id == application_id
+        ), None)
+        if not registration or not registration.mount_invitation:
+            return []
+        mounted = []
+        seen = set()
+        stack = list(self.peer_perspectives.values())
+        while stack:
+            node = stack.pop()
+            if node.uuid in seen:
+                continue
+            seen.add(node.uuid)
+            if (
+                node.uuid in self.pending_topic_invitations
+                and
+                node.data.get("type") in registration.root_types
+                and node.uuid not in self._protocol.index
+            ):
+                result = registration.accept_invitation(copy.deepcopy(node))
+                if getattr(result, "status", None) == "ok":
+                    mounted.append(node.uuid)
+                    self.pending_topic_invitations.discard(node.uuid)
+                    continue
+            stack.extend(node.children)
+        return sorted(mounted)
+
+    @_session_locked
+    def registered_application_ids(self) -> tuple[str, ...]:
+        return tuple(sorted(
+            registration.application_id
+            for registration in self.shared_topics.registrations()
+            if registration.application_id != "Sovereign Core profile"
+        ))
+
+    @_session_locked
+    def shared_topic_uuids(
+        self,
+        assigned_topic_uuids: set[str] | list[str] | tuple[str, ...] | None = None,
+    ) -> list[str]:
+        return self.shared_topics.local_topic_uuids(assigned_topic_uuids)
+
+    @_session_locked
+    def shared_topic_handler_for(self, tree: ProtocolNode | None):
+        return self.shared_topics.handler_for(tree)
+
+    @_session_locked
+    def supports_shared_topic(self, tree: ProtocolNode | None) -> bool:
+        return self.shared_topics.supports(tree)
+
+    @_session_locked
+    def accept_shared_topic_invitation(self, tree: ProtocolNode):
+        result = self.shared_topics.accept_invited_topic(tree)
+        if getattr(result, "status", None) == "ok":
+            self.pending_topic_invitations.discard(tree.uuid)
+        return result
+
+    @_session_locked
+    def note_pending_topic_invitation(self, topic_uuid: str) -> None:
+        if topic_uuid:
+            self.pending_topic_invitations.add(str(topic_uuid))
+
+    @_session_locked
+    def shared_topic_invitation_requires_mount(
+        self, tree: ProtocolNode | None,
+    ) -> bool:
+        return self.shared_topics.invitation_requires_mount(tree)
+
+    @_session_locked
+    def has_application_topic_handlers(self) -> bool:
+        return self.shared_topics.has_assignment_scoped_handlers()
 
     def find_peer_identity(self, identity_key: str) -> ProtocolNode | None:
         # Searches across every cached peer perspective's values, not one

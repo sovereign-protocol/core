@@ -4,7 +4,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Manual Perspective</title>
-    <link rel="stylesheet" href="/styles.css" />
+    <link rel="stylesheet" href="/apps/protocol-explorer/styles.css" />
   </head>
   <body>
     <header class="topbar">
@@ -133,7 +133,7 @@
       async function loadState(silent = false, attempts = 1) {
         for (let attempt = 1; attempt <= attempts; attempt += 1) {
           try {
-            appState = await api("/api/manual/state");
+            appState = await api("/api/protocol-explorer/state");
             lastRefreshError = "";
             if (!selectedUuid) selectedUuid = appState.root.uuid;
             render();
@@ -559,7 +559,7 @@
       }
 
       async function acceptPeerNode(sourceAddr, nodeUuid, adoptAbsence = false) {
-        await api("/api/manual/accept_peer_node", {
+        await api("/api/protocol-explorer/accept_peer_node", {
           source_addr: sourceAddr,
           node_uuid: nodeUuid,
           adopt_absence: adoptAbsence,
@@ -851,7 +851,7 @@
 
       el("addBtn").onclick = () =>
         openNodeModal("Add Child", { name: "New node" }, {}, async (data, weights) => {
-          await api("/api/manual/create_child", {
+          await api("/api/protocol-explorer/create_child", {
             parent_uuid: ensureSelected(),
             data,
             weights,
@@ -863,7 +863,7 @@
         const node = currentNode();
         if (!node) return log("Select a node first", true);
         openNodeModal("Modify Node", node.data, node.weights, async (data, weights) => {
-          await api("/api/manual/modify", {
+          await api("/api/protocol-explorer/modify", {
             node_uuid: ensureSelected(),
             data,
             weights,
@@ -876,7 +876,7 @@
         try {
           const uuid = ensureSelected();
           if (!confirm("Delete selected node and its children?")) return;
-          await api("/api/manual/delete", { node_uuid: uuid });
+          await api("/api/protocol-explorer/delete", { node_uuid: uuid });
           selectedUuid = appState.root.uuid;
           log("Node deleted");
           await loadState(true);
@@ -890,7 +890,7 @@
           "Copy Subtree",
           [{ name: "destination", label: "Destination UUID", value: selectedUuid || "" }],
           async (form) => {
-            await api("/api/manual/copy", {
+            await api("/api/protocol-explorer/copy", {
               source_uuid: ensureSelected(),
               destination_uuid: form.get("destination").trim(),
             });
@@ -903,7 +903,7 @@
           "Move Subtree",
           [{ name: "destination", label: "Destination UUID", value: "" }],
           async (form) => {
-            await api("/api/manual/move", {
+            await api("/api/protocol-explorer/move", {
               source_uuid: ensureSelected(),
               destination_uuid: form.get("destination").trim(),
             });
@@ -913,7 +913,7 @@
 
       el("topicBtn").onclick = async () => {
         try {
-          await api("/api/manual/start_discussion", { topic_uuid: ensureSelected() });
+          await api("/api/protocol-explorer/start_discussion", { topic_uuid: ensureSelected() });
           log("Topic set");
           await loadState(true);
         } catch (error) {
@@ -935,7 +935,7 @@
           ],
           async (form) => {
             const readOnly = form.get("readOnly") === "on";
-            await api("/api/manual/invite", {
+            await api("/api/protocol-explorer/invite", {
               address: form.get("address").trim(),
               topic_uuid: form.get("topic").trim(),
               read_only: readOnly,

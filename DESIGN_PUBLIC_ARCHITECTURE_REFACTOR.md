@@ -710,6 +710,37 @@ lookup before R8/repository publication.
 
 Exit: Kanban starts through its manifest; Session imports no app.
 
+**Implemented R3 record:**
+
+- `ApplicationManifest`, typed read-only `ApplicationServices`,
+  `ApplicationInstance`, and `ApplicationHost` are now Core contracts.
+- Applications are loaded only from the explicit `applications` configuration;
+  filename discovery and relay-as-extra-app loading are gone. Zero to many
+  active applications are supported, with one optional primary UI alias.
+- Activation registers the application's topic ownership and namespaced routes;
+  deactivation removes callbacks/routes but deliberately retains protocol data.
+  Root-type, application-id, application-route, and Core-route collisions fail
+  activation.
+- Session owns registration locking and callback invocation. A newly activated
+  application mounts matching, explicitly invited topics that arrived in the
+  peer cache while its type was unknown. Passively observed relay topics remain
+  cache-only, preserving the token consent boundary.
+- Kanban, Personal Cockpit, and Protocol Explorer use manifests and factories.
+  Application HTTP routes live below `/api/<application-id>` and assets below
+  `/apps/<application-id>`.
+- Relay is constructed once as a Core service and supplied through
+  `ApplicationServices`; application discovery is no longer a channel hook.
+- Protocol Explorer is explicitly a local/HTTP diagnostic surface and registers
+  no mailbox topic type. This narrows the earlier A2 claim instead of inventing
+  a generic shared node type without a real semantic owner.
+- Legacy `runtime.logic` and direct module factories remain internal test/CLI
+  compatibility aliases only; the host is authoritative. Removal can follow
+  after the controller split.
+
+Verification: lifecycle retention, registration collision, route namespace,
+Core-route collision, and unknown-topic late-load behavior have dedicated tests.
+Full suite after R3: **416 passed**.
+
 ### R3a — move the profile surface into Core (B1)
 
 Small, mandatory, and separated from R3 so it can be reviewed on its own.
@@ -835,9 +866,9 @@ history rewriting afterward.
       move from S-Kanban to Core in R3a (§11.0); rich identity becomes a future
       optional S-Identity application (§11.2).
 - [x] A2: Manual becomes Core's non-stable Protocol Explorer. **Scope note:**
-      it registers no topic handler today, so it cannot exercise the mailbox
-      channel; either register a generic explorer root type in R3 or narrow the
-      claim to HTTP-only inspection.
+      it registers no topic handler and is intentionally a local/HTTP-only
+      diagnostic surface. Mailbox conformance belongs to real applications,
+      beginning with S-Agreement.
 - [x] A3: Core host shell versus application-owned domain UI.
 - [x] A4: Personal Cockpit adapters over public application facades; separation
       and removal of the direct Kanban import are required before R8 (§10).

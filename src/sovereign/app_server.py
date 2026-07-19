@@ -3,7 +3,8 @@
 Application server component.
 
 Functionality:
-  Bind UI, app module, persistence, Session, and the Transport adapter.
+  Bind the Core HTTP surface, explicit applications, persistence, Session,
+  and transport services.
   Protocol meaning stays in protocol.py/session.py. Browsers learn about
   changes by polling - there is no push channel.
 
@@ -17,8 +18,8 @@ Offered API:
   build_app(runtime)
   main(argv=None)
   collect_channel_descriptors(runtime) -> list[dict]
-    One entry per configured module offering a channel_descriptor hook
-    (e.g. relay_logic.py), prepended by {"type": "http", ...} unless the
+    The configured Core relay descriptor, prepended by {"type": "http", ...}
+    unless the
     config sets "offer_http_channel": false (which advertises relay-only
     tokens, so an accepter can never race a direct connection alongside
     relay - the http server still serves the local UI).
@@ -34,15 +35,11 @@ Offered API:
     token (see DESIGN_IDENTITY_AND_TRANSPORT.md §1.6). Accepting a token
     for an already-known identity supersedes that peer's old address
     rather than accumulating a second one. The http channel reuses the
-    exact same dispatch as /api/join_discussion (an app's own
-    join_discussion override if present, else
-    HttpTransportAdapter.join_discussion) - not a rewrite of that flow,
-    just a second caller of it.
+    exact same Core dispatch as /api/join_discussion.
 
 Expected app module API:
-  create_logic(session, config) -> object                 optional
-  build_routes(logic, runtime, config) -> list[Route]     optional
-  channel_descriptor(runtime, config) -> dict | None       optional
+  APPLICATION_MANIFEST: ApplicationManifest
+  create_application(services: ApplicationServices) -> ApplicationInstance
 
 The server keeps HTTP and browser concerns here. It does not implement tree
 operations directly.
@@ -51,7 +48,6 @@ operations directly.
 from __future__ import annotations
 
 import asyncio
-import importlib
 import json
 import os
 import sys
@@ -71,6 +67,8 @@ from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
 from .protocol import ProtocolNode, UnsupportedProtocolVersion
+from .application import ApplicationServices
+from .host import ApplicationHost
 from .profile import CoreProfileService
 from .blob_store import (
     BlobStore, SAFE_IMAGE_MIMES, blob_hex, canonical_attachments,
@@ -79,6 +77,7 @@ from .blob_store import (
 from .session import Session, SessionEffect
 from .trace_log import TraceLogger
 from .transport import HttpTransportAdapter
+from .relay_logic import RelayManager, build_routes as build_relay_routes
 from .versions import (
     CHANNEL_DESCRIPTOR_VERSION,
     CONNECT_TOKEN_VERSION,
@@ -105,28 +104,27 @@ DEFAULT_CONFIG = {
     # Keep the local browser UI available, but disable direct HTTP as a peer
     # transport in both directions. Relay descriptors remain usable.
     "relay_only": False,
+    "applications": None,
+    "primary_application_id": None,
 }
-# Extra app modules are opt-in purely by the presence of their own config
-# file next to app_server.py (e.g. boardofboards_config.json), regardless of
-# which primary app_name/port was launched - no edit to the primary app's
-# own config file is needed to turn one on or off.
-EXTRA_MODULE_CONFIG_FILES = ["boardofboards_config.json", "relay_config.json"]
-
-APPLICATION_DEFAULTS = {
+LEGACY_APPLICATION_ALIASES = {
     "kanban": {
         "app_module": "s_kanban.logic",
+        "application_id": "kanban",
         "asset_package": "s_kanban.assets",
         "ui_file": "kanban.html",
         "css_file": "kanban.css",
     },
     "manual": {
         "app_module": "sovereign.protocol_explorer",
+        "application_id": "protocol-explorer",
         "asset_package": "sovereign.assets",
         "ui_file": "manual.html",
         "css_file": "manual.css",
     },
     "boardofboards": {
         "app_module": "personal_cockpit.logic",
+        "application_id": "personal-cockpit",
         "asset_package": "personal_cockpit.assets",
         "ui_file": "boardofboards.html",
         "css_file": "boardofboards.css",
@@ -146,6 +144,8 @@ class AppRuntime:
     adapter: HttpTransportAdapter
     blob_store: BlobStore
     profile: CoreProfileService
+    relay_manager: RelayManager
+    host: ApplicationHost | None = None
     logic: Any = None
     relay_wakeup: asyncio.Event | None = None
     relay_loop: asyncio.AbstractEventLoop | None = None
@@ -153,11 +153,10 @@ class AppRuntime:
     def persist(self) -> None:
         storage_file = self.config.get("storage_file")
         if storage_file:
-            manager = self.config.get("_relay_manager")
-            if manager is not None:
+            if self.relay_manager is not None:
                 # Target registry and board assignments live in app_metadata;
                 # snapshot them while the manager cannot mutate them.
-                with manager._manager_lock:
+                with self.relay_manager._manager_lock:
                     save_session_to_file(self.session, storage_file)
             else:
                 save_session_to_file(self.session, storage_file)
@@ -198,13 +197,16 @@ def parse_target(target: str) -> tuple[int, str | None]:
 
 
 def app_default_config(app_name: str) -> dict:
-    known = APPLICATION_DEFAULTS.get(app_name)
+    known = LEGACY_APPLICATION_ALIASES.get(app_name)
     if known:
-        return dict(known)
+        config = dict(known)
+        config["applications"] = [{"module": known["app_module"]}]
+        config["primary_application_id"] = known["application_id"]
+        return config
     return {
         "app_module": f"{app_name}_logic",
-        "ui_file": f"{app_name}.html",
-        "css_file": f"{app_name}.css",
+        "applications": [{"module": f"{app_name}_logic"}],
+        "primary_application_id": app_name,
     }
 
 
@@ -221,25 +223,15 @@ def load_config(config_path: str | None = None,
         if not path.exists():
             raise FileNotFoundError(f"config file not found: {config_path}")
         with path.open(encoding="utf-8") as f:
-            config.update(json.load(f))
-    config["extra_app_modules"] = _discover_extra_app_modules(config.get("app_module"))
+            overrides = json.load(f)
+        config.update(overrides)
+        if "applications" not in overrides and "app_module" in overrides:
+            config["applications"] = [{"module": overrides["app_module"]}]
+            config["primary_application_id"] = overrides.get(
+                "primary_application_id",
+            )
+    config["applications"] = list(config.get("applications") or [])
     return config
-
-
-def _discover_extra_app_modules(primary_module: str | None,
-                                base_dir: Path | None = None) -> list[str]:
-    base_dir = base_dir or Path.cwd()
-    modules = []
-    for filename in EXTRA_MODULE_CONFIG_FILES:
-        extra_path = base_dir / filename
-        if not extra_path.exists():
-            continue
-        with extra_path.open(encoding="utf-8") as f:
-            extra_config = json.load(f)
-        module_name = extra_config.get("app_module")
-        if module_name and module_name != primary_module and module_name not in modules:
-            modules.append(module_name)
-    return modules
 
 
 def default_storage_file(config: dict, port: int) -> str:
@@ -460,6 +452,9 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
 
 def create_runtime(port: int, config: dict) -> AppRuntime:
     config = dict(config)
+    if config.get("applications") is None:
+        module_name = config.get("app_module")
+        config["applications"] = ([{"module": module_name}] if module_name else [])
     if config.get("storage_file") is None:
         config["storage_file"] = default_storage_file(config, port)
     advertise_host = config.get("advertise_host") or "127.0.0.1"
@@ -481,48 +476,47 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         blob_root,
         grace_seconds=float(config.get("blob_gc_grace_seconds", 60)),
     )
-    config["_blob_store"] = blob_store
     if config.get("relay_only", False):
         # A policy change must not revive persisted direct peers or observers.
         # Relay pseudo-peers are not members and therefore survive this cleanup.
         for peer_addr in sorted(session.members - {session.address}):
             session.remove_peer(peer_addr)
         session.observed_topics.clear()
+    adapter = HttpTransportAdapter(session, trace=trace)
+    relay_manager = RelayManager(session, config, blob_store=blob_store)
     runtime = AppRuntime(
         port=port,
         address=address,
         config=config,
         session=session,
-        adapter=HttpTransportAdapter(session, trace=trace),
+        adapter=adapter,
         blob_store=blob_store,
         profile=CoreProfileService(session),
+        relay_manager=relay_manager,
     )
-    runtime.logic = load_logic(config, session, runtime)
+    services = ApplicationServices(
+        session=session,
+        adapter=adapter,
+        blob_store=blob_store,
+        trace=trace,
+        relay_manager=relay_manager,
+        notify_change=runtime.notify_change,
+        collect_local_blobs=runtime.collect_local_blobs,
+    )
+    runtime.host = ApplicationHost(
+        services,
+        config.get("applications") or [],
+        config.get("primary_application_id"),
+    )
+    # Transitional primary-app alias. Application discovery, lifecycle and
+    # hooks are owned exclusively by ApplicationHost.
+    runtime.logic = runtime.host.primary_logic
     return runtime
 
 
-def load_logic(config: dict, session: Session, runtime: AppRuntime) -> Any:
-    module_name = config.get("app_module")
-    if not module_name:
-        return None
-    module = importlib.import_module(module_name)
-    factory = getattr(module, "create_logic", None)
-    if not factory:
-        return None
-    return factory(session, config)
-
-
 def collect_channel_descriptors(runtime: AppRuntime) -> list[dict]:
-    # Mirrors load_app_routes's primary+extra module traversal, but for the
-    # optional channel_descriptor(runtime, config) hook instead of
-    # create_logic/build_routes - any module (primary or extra) can offer a
-    # connectable channel this way. The HTTP channel isn't a hook result -
-    # every instance always has one - so it's prepended unless the config
-    # opts out via "offer_http_channel": false. Opting out advertises only
-    # the relay/other channels in a token, so an accepting peer can never
-    # select (and never race to open) a direct HTTP connection alongside
-    # relay - the http server itself keeps running for the local UI, it's
-    # just not offered as a connect channel.
+    # Transitional descriptor collector until R4's ChannelManager. Application
+    # modules are never probed for channels.
     channels = []
     if (not runtime.config.get("relay_only", False)
             and runtime.config.get("offer_http_channel", True)):
@@ -531,18 +525,15 @@ def collect_channel_descriptors(runtime: AppRuntime) -> list[dict]:
             "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
             "address": runtime.address,
         })
-    module_names = []
-    primary = runtime.config.get("app_module")
-    if primary:
-        module_names.append(primary)
-    module_names.extend(runtime.config.get("extra_app_modules") or [])
-    for module_name in module_names:
-        module = importlib.import_module(module_name)
-        hook = getattr(module, "channel_descriptor", None)
-        descriptor = hook(runtime, runtime.config) if hook else None
-        if descriptor:
-            channels.append(descriptor)
+    manager = _runtime_relay_manager(runtime)
+    descriptor = manager.channel_descriptor() if manager else None
+    if descriptor:
+        channels.append(descriptor)
     return channels
+
+
+def _runtime_relay_manager(runtime):
+    return getattr(runtime, "relay_manager", None)
 
 
 def _dispatch_join_discussion(runtime: AppRuntime, address: str,
@@ -602,7 +593,7 @@ def accept_connect_token(runtime: AppRuntime, identity: dict | None,
         # writes/reads bytes (relay_storage.py), not in how a token is
         # accepted.
         channel_type = relay_channel.get("type")
-        relay_manager = runtime.config.get("_relay_manager")
+        relay_manager = _runtime_relay_manager(runtime)
         # accept_descriptor verifies the advertised storage, registers it as a
         # target, provisions a connection from the token (DESIGN §1.6), and
         # persists the desired topics + board assignments atomically. Absent a
@@ -689,39 +680,6 @@ def accept_connect_token(runtime: AppRuntime, identity: dict | None,
     return {"status": "ok", "channels_used": [selected_type], "results": results}
 
 
-def load_app_routes(runtime: AppRuntime) -> list[Route]:
-    routes: list[Route] = []
-    module_name = runtime.config.get("app_module")
-    if module_name:
-        module = importlib.import_module(module_name)
-        factory = getattr(module, "build_routes", None)
-        if factory:
-            routes.extend(factory(runtime.logic, runtime, runtime.config))
-    for extra_module_name in runtime.config.get("extra_app_modules") or []:
-        extra_module = importlib.import_module(extra_module_name)
-        create_factory = getattr(extra_module, "create_logic", None)
-        extra_logic = (
-            create_factory(runtime.session, runtime.config) if create_factory else None
-        )
-        build_factory = getattr(extra_module, "build_routes", None)
-        if build_factory:
-            routes.extend(build_factory(extra_logic, runtime, runtime.config))
-    return routes
-
-
-def read_static(runtime: AppRuntime, key: str) -> str:
-    filename = runtime.config.get(key)
-    if not filename:
-        return ""
-    package = runtime.config.get("asset_package")
-    if package:
-        return files(package).joinpath(filename).read_text(encoding="utf-8")
-    path = Path(filename)
-    if not path.is_absolute():
-        path = Path.cwd() / path
-    return path.read_text(encoding="utf-8")
-
-
 def build_core_routes(runtime: AppRuntime) -> list[Route]:
     def direct_http_disabled() -> JSONResponse | None:
         if not runtime.config.get("relay_only", False):
@@ -735,10 +693,10 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         )
 
     async def serve_ui(request: Request):
-        return HTMLResponse(read_static(runtime, "ui_file"))
+        return HTMLResponse(runtime.host.read_primary_asset("ui") if runtime.host else "")
 
     async def serve_css(request: Request):
-        return Response(read_static(runtime, "css_file"),
+        return Response(runtime.host.read_primary_asset("css") if runtime.host else "",
                         media_type="text/css")
 
     async def serve_shared_css(request: Request):
@@ -845,7 +803,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         # relay loop (assignment replaced the old mark_topics_shared trigger).
         # Without a target it is an HTTP-only token for a direct peer
         # connection (e.g. on a LAN) that never touches a relay.
-        manager = runtime.config.get("_relay_manager")
+        manager = _runtime_relay_manager(runtime)
         data = await request.json()
         topic_uuids = sorted({
             str(value).strip()
@@ -1110,7 +1068,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         local = runtime.blob_store.read_blob(blob_id)
         if local is not None:
             return local
-        manager = runtime.config.get("_relay_manager")
+        manager = _runtime_relay_manager(runtime)
         if manager is not None:
             fetched = manager.read_blob(blob_id)
             if fetched is not None:
@@ -1199,16 +1157,10 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
 
 
 async def run_peer_update_hook(runtime: AppRuntime) -> bool:
-    hook = getattr(runtime.logic, "on_peer_update", None)
-    if not hook:
+    host = getattr(runtime, "host", None)
+    if not host:
         return False
-    result = await asyncio.to_thread(hook)
-    if getattr(result, "status", None) != "ok":
-        return False
-    effects = getattr(result, "effects", [])
-    if effects:
-        await asyncio.to_thread(runtime.adapter.execute_effects, effects)
-    return bool(getattr(result, "value", False))
+    return await asyncio.to_thread(host.notify_peer_update)
 
 
 async def drain_peer_update_hook(runtime: AppRuntime, passes: int = 4) -> None:
@@ -1252,13 +1204,23 @@ def build_app(runtime: AppRuntime) -> Starlette:
                     await task
                 except asyncio.CancelledError:
                     pass
+            if runtime.host:
+                runtime.host.close()
             runtime.persist()
 
-    return Starlette(
+    core_routes = build_core_routes(runtime)
+    relay_routes = build_relay_routes(
+        runtime.relay_manager, runtime, runtime.config,
+    )
+    application_routes = runtime.host.controller_routes() if runtime.host else []
+    app = Starlette(
         debug=bool(runtime.config.get("debug", True)),
-        routes=build_core_routes(runtime) + load_app_routes(runtime),
+        routes=core_routes + relay_routes + application_routes,
         lifespan=lifespan,
     )
+    if runtime.host:
+        runtime.host.bind_starlette(app, [*core_routes, *relay_routes])
+    return app
 
 
 async def peer_sync_loop(runtime: AppRuntime) -> None:
@@ -1308,7 +1270,7 @@ async def relay_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
     # http p2p endpoints, so a headless relay-only session synced content
     # it never adopted (and never republished merged). Factored out of the
     # loop so this behavior is testable without spinning the loop.
-    manager = runtime.config.get("_relay_manager")
+    manager = _runtime_relay_manager(runtime)
     if manager is None:
         return False
     changed = False
@@ -1410,15 +1372,13 @@ async def relay_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
 
 
 async def relay_poll_loop(runtime: AppRuntime) -> None:
-    # No-op whenever relay_config.json's create_logic hasn't stashed an
-    # instance (not present) or that instance has no relay_root configured
-    # (present but inactive) - relay_logic.py's own RelayLogic already
-    # returns [] from both calls in that case, so this just avoids the
-    # sleep/dict-lookup churn being visibly wasteful in logs.
+    # RelayManager is always a Core service. With no configured or accepted
+    # target it has no active relationship, so this loop remains idle without
+    # relying on application discovery or a private config handle.
     runtime.relay_loop = asyncio.get_running_loop()
     runtime.relay_wakeup = asyncio.Event()
     while True:
-        manager = runtime.config.get("_relay_manager")
+        manager = _runtime_relay_manager(runtime)
         connections = manager.all_connections() if manager else []
         now = time.monotonic()
         next_due = runtime.config.setdefault("_relay_next_due", {})
@@ -1452,8 +1412,7 @@ def main(argv: list[str] | None = None) -> None:
     app = build_app(runtime)
     print(f"SI node: {runtime.address}")
     print(f"Root: {runtime.session.root_uuid()}")
-    print(f"App module: {runtime.config.get('app_module')}")
-    print(f"UI: {runtime.config.get('ui_file')}")
+    print(f"Applications: {', '.join(runtime.host.instances) if runtime.host else ''}")
     print(f"Storage: {runtime.config.get('storage_file')}")
     if runtime.session.trace.enabled:
         print(f"Trace: {runtime.session.trace.path}")

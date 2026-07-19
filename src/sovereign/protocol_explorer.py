@@ -19,7 +19,18 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
+from .application import ApplicationInstance, ApplicationManifest, ApplicationServices
 from .session import Session, SessionResult
+
+
+APPLICATION_MANIFEST = ApplicationManifest(
+    application_id="protocol-explorer",
+    display_name="Protocol Explorer",
+    data_schema_version=1,
+    asset_package="sovereign.assets",
+    ui_file="manual.html",
+    css_file="manual.css",
+)
 
 
 class ManualLogic:
@@ -90,6 +101,16 @@ class ManualLogic:
 
 def create_logic(session: Session, config: dict) -> ManualLogic:
     return ManualLogic(session, config)
+
+
+def create_application(services: ApplicationServices) -> ApplicationInstance:
+    logic = ManualLogic(services.session, dict(services.settings))
+    return ApplicationInstance(
+        manifest=APPLICATION_MANIFEST,
+        logic=logic,
+        registration=None,
+        controllers=tuple(build_routes(logic, services, dict(services.settings))),
+    )
 
 
 def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
@@ -173,16 +194,16 @@ def build_routes(logic: ManualLogic, runtime, config: dict) -> list[Route]:
         return await _json_result(runtime, result)
 
     return [
-        Route("/api/manual/state", api_state),
-        Route("/api/manual/start_discussion", api_start_discussion,
+        Route("/api/protocol-explorer/state", api_state),
+        Route("/api/protocol-explorer/start_discussion", api_start_discussion,
               methods=["POST"]),
-        Route("/api/manual/invite", api_invite, methods=["POST"]),
-        Route("/api/manual/create_child", api_create_child, methods=["POST"]),
-        Route("/api/manual/modify", api_modify, methods=["POST"]),
-        Route("/api/manual/delete", api_delete, methods=["POST"]),
-        Route("/api/manual/copy", api_copy, methods=["POST"]),
-        Route("/api/manual/move", api_move, methods=["POST"]),
-        Route("/api/manual/accept_peer_node", api_accept_peer_node,
+        Route("/api/protocol-explorer/invite", api_invite, methods=["POST"]),
+        Route("/api/protocol-explorer/create_child", api_create_child, methods=["POST"]),
+        Route("/api/protocol-explorer/modify", api_modify, methods=["POST"]),
+        Route("/api/protocol-explorer/delete", api_delete, methods=["POST"]),
+        Route("/api/protocol-explorer/copy", api_copy, methods=["POST"]),
+        Route("/api/protocol-explorer/move", api_move, methods=["POST"]),
+        Route("/api/protocol-explorer/accept_peer_node", api_accept_peer_node,
               methods=["POST"]),
     ]
 

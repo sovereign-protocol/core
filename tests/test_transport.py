@@ -2,6 +2,7 @@ import unittest
 
 from sovereign.protocol import ProtocolNode, stable_hash
 from sovereign.session import Session, SessionEffect
+from sovereign.topic_registry import ApplicationRegistration
 from sovereign.transport import HttpTransportAdapter, TransportHttpError
 
 
@@ -188,7 +189,15 @@ class TransportTests(unittest.TestCase):
         session = Session("http://a")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
-        topic = ProtocolNode({"name": "topic"})
+        topic = ProtocolNode({"type": "notes", "name": "topic"})
+        session.register_application(ApplicationRegistration(
+            application_id="notes",
+            root_types=frozenset({"notes"}),
+            list_topics=lambda: [],
+            accept_invitation=session.accept_topic_invitation,
+            assignment_scoped=True,
+            mount_invitation=True,
+        ))
         http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
             "protocol_schema_version": 1,
             "subtree": topic.to_dict(),

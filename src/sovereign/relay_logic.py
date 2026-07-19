@@ -43,9 +43,10 @@ Functionality:
   content needing its own sync, which defeats the purpose.
 
 Offered API:
-  create_logic(session, config) -> RelayLogic     (extra-app-module hook)
-  build_routes(logic, runtime, config) -> list[Route]  (extra-app-module hook)
-  channel_descriptor(runtime, config) -> dict | None  (extra-app-module hook)
+  RelayManager(session, config, blob_store)
+  build_routes(manager, runtime, config) -> list[Route]
+    Core service/controller surface. Relay is not an application plugin.
+  RelayManager.channel_descriptor()
     Advertises relay as a connectable channel for /api/connect_token, if
     configured - {"type": "relay", "descriptor_version": 1, "root": ...,
     "identity": ...}.
@@ -332,11 +333,11 @@ class RelayTiming:
 
 
 class RelayLogic:
-    def __init__(self, session: Session, config: dict):
+    def __init__(self, session: Session, config: dict, blob_store=None):
         self.session = session
         self._io_lock = threading.RLock()
         self._session_lock = session.lock
-        self.blob_store = config.get("_blob_store")
+        self.blob_store = blob_store
         self._manager = None
         try:
             lease_seconds = float(config.get("relay_blob_lease_seconds", 300.0))
@@ -551,7 +552,7 @@ class RelayLogic:
         # The registry applies target assignment only to scoped application
         # topics. Core-owned topics (currently the public profile) opt out and
         # ride every relationship, so this channel names no node type.
-        return self.session.shared_topics.local_topic_uuids(
+        return self.session.shared_topic_uuids(
             self._scoped_topic_uuids,
         )
 
@@ -660,7 +661,7 @@ class RelayLogic:
         # application topic becomes an active discussion on the issuer too.
         for topic in self._state.get("shared", []):
             node = self.session.protocol.index.get(topic)
-            if node is not None and self.session.shared_topics.supports(node):
+            if node is not None and self.session.supports_shared_topic(node):
                 self.session.start_discussion(topic)
 
     @_relay_io_locked
@@ -1052,7 +1053,7 @@ class RelayLogic:
                     wants_graft = (
                         topic_uuid in self._state.get("desired", [])
                         and self.session.protocol.index.get(topic_uuid) is None
-                        and self.session.shared_topics.invitation_requires_mount(
+                        and self.session.shared_topic_invitation_requires_mount(
                             cached_topic,
                         )
                     )
@@ -1072,7 +1073,10 @@ class RelayLogic:
                         # Applications own validation, mounting and defaults.
                         # Unknown types remain visible only as peer cache and
                         # are retried if a matching application is loaded.
-                        self.session.shared_topics.accept_invited_topic(subtree)
+                        if self.session.shared_topic_handler_for(subtree):
+                            self.session.accept_shared_topic_invitation(subtree)
+                        else:
+                            self.session.note_pending_topic_invitation(topic_uuid)
                     self.session.apply_peer_subtree(
                         peer_addr, peer_copy, payload.get("parent_uuid"),
                     )
@@ -1233,9 +1237,10 @@ class RelayManager:
     layer on without touching callers again.
     """
 
-    def __init__(self, session: Session, config: dict):
+    def __init__(self, session: Session, config: dict, blob_store=None):
         self.session = session
         self.config = config
+        self.blob_store = blob_store
         self._session_lock = session.lock
         # Registry iteration/mutation has its own lock. Protocol snapshots
         # use Session.lock; keeping the two distinct avoids an io->session vs
@@ -1244,7 +1249,7 @@ class RelayManager:
         self.connections: dict[str, RelayLogic] = {}
         # The implicit connection: built from the flat config (or a persisted
         # adopted-descriptor) exactly as before. Registered by fingerprint.
-        self.primary = RelayLogic(session, config)
+        self.primary = RelayLogic(session, config, blob_store=blob_store)
         self.primary._manager = self
         self.primary._session_lock = self._session_lock
         self._primary_fingerprint = _relay_fingerprint(self.primary.storage)
@@ -1351,7 +1356,7 @@ class RelayManager:
             self.primary._state.get("desired", [])
         ):
             node = self.session.protocol.index.get(topic_uuid)
-            if node and self.session.shared_topics.supports(node):
+            if node and self.session.supports_shared_topic(node):
                 mapping.setdefault(topic_uuid, target_id)
 
     @_manager_locked
@@ -1409,7 +1414,6 @@ class RelayManager:
                 "relay_identity": self.config.get("relay_identity") or self.session.identity.uuid,
                 "relay_poll_interval_seconds": record.get("poll_interval_seconds", 3),
                 "relay_blob_lease_seconds": self.config.get("relay_blob_lease_seconds", 300),
-                "_blob_store": self.config.get("_blob_store"),
             }
             state_directory = self.config.get("relay_state_directory")
             if state_directory:
@@ -1430,7 +1434,9 @@ class RelayManager:
                 connection_config.update({
                     "relay_backend": "local", "relay_root": record.get("root"),
                 })
-            connection = RelayLogic(self.session, connection_config)
+            connection = RelayLogic(
+                self.session, connection_config, blob_store=self.blob_store,
+            )
             connection._session_lock = self._session_lock
             connection._manager = self
             self.connections[fingerprint] = connection
@@ -1675,7 +1681,7 @@ class RelayManager:
     @_manager_locked
     def assign_topic_target(self, topic_uuid: str, target_id: str | None) -> SessionResult:
         topic = self.session.get_node(topic_uuid)
-        if not topic or not self.session.shared_topics.supports(topic):
+        if not topic or not self.session.supports_shared_topic(topic):
             return SessionResult("error", reason="application topic not found")
         if target_id and target_id not in self._target_registry():
             return SessionResult("error", reason="relay target not found")
@@ -1710,7 +1716,7 @@ class RelayManager:
         # earlier topics silently reassigned.
         for topic_uuid in normalized:
             topic = self.session.get_node(topic_uuid)
-            if not topic or not self.session.shared_topics.supports(topic):
+            if not topic or not self.session.supports_shared_topic(topic):
                 return SessionResult(
                     "error", reason=f"application topic not found: {topic_uuid}",
                 )
@@ -1858,17 +1864,6 @@ class RelayManager:
             if topic_uuid in conn._state.get("published", {}) or topic_uuid in conn._state.get("applied", {}):
                 return conn.delete_topic(topic_uuid)
         return self.primary.delete_topic(topic_uuid)
-
-
-def create_logic(session: Session, config: dict) -> RelayManager:
-    manager = RelayManager(session, config)
-    config["_relay_manager"] = manager
-    return manager
-
-
-def channel_descriptor(runtime, config: dict) -> dict | None:
-    manager = config.get("_relay_manager")
-    return manager.channel_descriptor() if manager else None
 
 
 def build_routes(logic: RelayManager, runtime, config: dict) -> list[Route]:

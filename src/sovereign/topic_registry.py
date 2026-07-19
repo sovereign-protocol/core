@@ -15,13 +15,17 @@ from .protocol import ProtocolNode
 
 
 @dataclass(frozen=True)
-class SharedTopicHandler:
-    owner: str
+class ApplicationRegistration:
+    application_id: str
     root_types: frozenset[str]
     list_topics: Callable[[], Iterable[str | ProtocolNode]]
     accept_invitation: Callable[[ProtocolNode], Any]
     assignment_scoped: bool
     mount_invitation: bool
+    on_peer_update: Callable[[], Any] | None = None
+
+
+SharedTopicHandler = ApplicationRegistration
 
 
 class SharedTopicRegistry:
@@ -29,7 +33,7 @@ class SharedTopicRegistry:
 
     def __init__(self):
         self._lock = threading.RLock()
-        self._handlers_by_owner: dict[str, SharedTopicHandler] = {}
+        self._handlers_by_owner: dict[str, ApplicationRegistration] = {}
         self._owner_by_root_type: dict[str, str] = {}
 
     def register(
@@ -61,7 +65,7 @@ class SharedTopicRegistry:
                     f"topic type {root_type!r} is already handled by {current_owner!r}"
                 )
             self.unregister(owner)
-            handler = SharedTopicHandler(
+            handler = ApplicationRegistration(
                 owner, normalized_types, list_topics, accept_invitation,
                 assignment_scoped, mount_invitation,
             )
@@ -77,6 +81,26 @@ class SharedTopicRegistry:
             for root_type in handler.root_types:
                 if self._owner_by_root_type.get(root_type) == owner:
                     self._owner_by_root_type.pop(root_type, None)
+
+    def register_application(self, registration: ApplicationRegistration) -> None:
+        with self._lock:
+            if registration.application_id in self._handlers_by_owner:
+                raise ValueError(
+                    f"application {registration.application_id!r} is already registered"
+                )
+            self.register(
+                registration.application_id,
+                registration.root_types,
+                registration.list_topics,
+                registration.accept_invitation,
+                assignment_scoped=registration.assignment_scoped,
+                mount_invitation=registration.mount_invitation,
+            )
+            self._handlers_by_owner[registration.application_id] = registration
+
+    def registrations(self) -> tuple[ApplicationRegistration, ...]:
+        with self._lock:
+            return tuple(self._handlers_by_owner.values())
 
     def handler_for(self, node: ProtocolNode | None) -> SharedTopicHandler | None:
         root_type = str((node.data if node else {}).get("type") or "")
