@@ -1828,6 +1828,20 @@ class Session:
             )
         return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
+    # How loudly each transition should speak when one node carries several.
+    # Session decides what the words mean, so Session ranks them; applications
+    # that grouped events per node had each copied this table, and the copies
+    # had already drifted apart on divergence.
+    TRANSITION_PRIORITY = {
+        "divergence": 6,
+        "peer_made_changes": 4,
+        "local_missing_node": 4,
+        "local_made_changes": 3,
+        "peer_missing_node": 3,
+        "in_transition": 1,
+        "in_agreement": 0,
+    }
+
     @staticmethod
     def _classify_content(local_node: ProtocolNode, peer_node: ProtocolNode,
                           local_identity: str | None = None,

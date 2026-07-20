@@ -68,6 +68,26 @@ class AgreementLogicTests(unittest.TestCase):
             clause_uuid,
         )
 
+    def test_transition_priority_comes_from_session_not_per_application(self):
+        # Both applications group transition events per node, and both had
+        # copied Session's ranking. The copies drifted: Kanban ranked
+        # divergence 6, Agreement 5, so the same conflict could surface as
+        # divergence in one application and something milder in the other.
+        from s_agreement import logic as agreement_logic
+        from s_kanban import logic as kanban_logic
+
+        source = Path(agreement_logic.__file__).read_text(encoding="utf-8")
+        kanban_source = Path(kanban_logic.__file__).read_text(encoding="utf-8")
+        for text in (source, kanban_source):
+            self.assertIn("Session.TRANSITION_PRIORITY", text)
+            self.assertNotIn('"divergence": 5', text)
+            self.assertNotIn('"divergence": 6', text)
+
+        priority = Session.TRANSITION_PRIORITY
+        self.assertGreater(priority["divergence"], priority["peer_made_changes"])
+        self.assertGreater(priority["peer_made_changes"], priority["in_transition"])
+        self.assertEqual(priority["in_agreement"], 0)
+
     def test_titles_and_text_stay_editable_after_creation(self):
         runtime = self.runtime(9403)
         agreement_uuid = runtime.logic.create_agreement("Draft").value

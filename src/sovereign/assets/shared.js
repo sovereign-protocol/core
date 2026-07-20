@@ -86,6 +86,14 @@ function dedupe(items) {
   return [...new Set(items)];
 }
 
+// Pages that model people define peerLabel(); ones that do not - a minimal
+// application, or any page before its first load - must still be able to
+// render a transition rather than throwing a ReferenceError.
+function safePeerLabel(addr) {
+  if (typeof peerLabel === "function") return peerLabel(addr);
+  return String(addr || "a peer");
+}
+
 function transitionActorLabel(info) {
   const sourceType = info.original_type || info.type;
   const originDescribesIncomingRevision = [
@@ -101,7 +109,7 @@ function transitionActorLabel(info) {
     const user = userForParticipant(info.origin_identity);
     if (user && user.name && user.name !== "?") return user.name;
   }
-  return peerLabel(info.peer_addr);
+  return safePeerLabel(info.peer_addr);
 }
 
 function eventChangeSummary(event, limit = 3) {
@@ -233,12 +241,7 @@ const SovereignShell = {
   // shell never reaches into an application's own payload shape.
   async mount(options) {
     this._options = options;
-    const container = options.container;
-    container.classList.add("shell-bar");
-    container.replaceChildren();
-
-    const nav = document.createElement("nav");
-    nav.className = "shell-nav";
+    const nav = this._buildHeader(options.container, options);
     for (const app of await this.applications()) {
       const link = document.createElement("a");
       link.className = "shell-nav-link";
@@ -250,31 +253,14 @@ const SovereignShell = {
       }
       nav.append(link);
     }
-    container.append(nav);
-
-    const actions = document.createElement("div");
-    actions.className = "shell-actions";
-    const relay = document.createElement("button");
-    relay.type = "button";
-    relay.className = "shell-relay-btn";
-    relay.textContent = "Relay targets";
-    relay.onclick = () => this.openRelayTargets();
-    actions.append(relay);
-
-    const connection = document.createElement("button");
-    connection.type = "button";
-    connection.id = "shellConnectionBtn";
-    connection.className = "peer-cluster local";
-    connection.textContent = "local";
-    connection.onclick = () => this.openConnectionPanel();
-    actions.append(connection);
-    container.append(actions);
 
     this._ensureDialogs();
     this.refresh();
+    this.refreshAvatar();
   },
 
   refresh() {
+    this.refreshDisagreements();
     const button = document.getElementById("shellConnectionBtn");
     const state = this._options.state ? this._options.state() : {};
     if (!button || !state) return;
@@ -679,3 +665,312 @@ const SovereignShell = {
     if (this._options.onChanged) await this._options.onChanged();
   },
 };
+
+/*
+  Shell additions: a fixed header layout, the Core profile editor, and the
+  disagreement pane.
+
+  The header has stable regions so every application looks the same and
+  nothing jumps as state changes:
+
+    [brand] [topic] [app slot] ....... [disagreements] [peers] [avatar]
+
+  The topic region is filled by the application for now. When Core owns
+  topic selection, the shell fills it instead and nothing else moves.
+*/
+Object.assign(SovereignShell, {
+  _profileReady: false,
+
+  _buildHeader(container, options) {
+    container.classList.add("shell-bar");
+    container.replaceChildren();
+
+    const brand = document.createElement("div");
+    brand.className = "shell-brand";
+    const nav = document.createElement("nav");
+    nav.className = "shell-nav";
+    brand.append(nav);
+
+    const topic = document.createElement("div");
+    topic.className = "shell-topic";
+    topic.id = "shellTopicRegion";
+
+    const slot = document.createElement("div");
+    slot.className = "shell-slot";
+    slot.id = "shellSlot";
+
+    const actions = document.createElement("div");
+    actions.className = "shell-actions";
+
+    const disagreements = document.createElement("button");
+    disagreements.type = "button";
+    disagreements.id = "shellDisagreementBtn";
+    disagreements.className = "shell-disagreement-btn";
+    disagreements.textContent = "In agreement";
+    disagreements.onclick = () => this.openDisagreements();
+
+    const relay = document.createElement("button");
+    relay.type = "button";
+    relay.className = "shell-relay-btn";
+    relay.textContent = "Relay targets";
+    relay.onclick = () => this.openRelayTargets();
+
+    const connection = document.createElement("button");
+    connection.type = "button";
+    connection.id = "shellConnectionBtn";
+    connection.className = "peer-cluster local";
+    connection.textContent = "local";
+    connection.onclick = () => this.openConnectionPanel();
+
+    const avatar = document.createElement("button");
+    avatar.type = "button";
+    avatar.id = "shellAvatarBtn";
+    avatar.className = "header-avatar-btn";
+    avatar.title = "Edit your profile";
+    avatar.onclick = () => this.openProfile();
+
+    actions.append(disagreements, relay, connection, avatar);
+    container.append(brand, topic, slot, actions);
+    return nav;
+  },
+
+  // The topic region belongs to the application until Core owns selection.
+  setTopicRegion(node) {
+    const region = document.getElementById("shellTopicRegion");
+    if (!region) return;
+    region.replaceChildren();
+    if (node) region.append(node);
+  },
+
+  slot() {
+    return document.getElementById("shellSlot");
+  },
+
+  // ---- profile -----------------------------------------------------------
+
+  _ensureProfileDialog() {
+    if (this._profileReady) return;
+    const host = document.createElement("div");
+    host.innerHTML = [
+      '<dialog id="shellProfileModal" class="shell-dialog">',
+      '<form method="dialog" class="shell-panel" id="shellProfileForm">',
+      "<h2>Profile</h2>",
+      '<label for="shellProfileName">Name</label>',
+      '<input id="shellProfileName">',
+      '<label for="shellProfilePicture">Profile picture</label>',
+      '<input id="shellProfilePicture" type="file" accept="image/png,image/jpeg,image/gif,image/webp">',
+      '<img id="shellProfilePreview" class="shell-avatar-preview" alt="">',
+      '<p class="shell-note">PNG, JPEG, GIF or WebP. The picture is shared with everyone you collaborate with.</p>',
+      '<p id="shellProfileNote" class="shell-note"></p>',
+      "<menu>",
+      '<button type="button" id="shellRemoveAvatarBtn" class="danger">Remove picture</button>',
+      '<button type="button" id="shellProfileCancelBtn">Cancel</button>',
+      '<button type="submit" class="primary">Save</button>',
+      "</menu></form></dialog>",
+    ].join("");
+    document.body.append(...host.children);
+    this._profileReady = true;
+
+    document.getElementById("shellProfileCancelBtn").onclick = () =>
+      document.getElementById("shellProfileModal").close();
+    document.getElementById("shellProfilePicture").onchange = () => {
+      const file = document.getElementById("shellProfilePicture").files[0];
+      if (!file) return;
+      const preview = document.getElementById("shellProfilePreview");
+      preview.src = URL.createObjectURL(file);
+      preview.style.display = "block";
+    };
+    document.getElementById("shellProfileForm").onsubmit = (event) => {
+      event.preventDefault();
+      this._saveProfile();
+    };
+    document.getElementById("shellRemoveAvatarBtn").onclick = () =>
+      this._saveProfile({ removePicture: true });
+  },
+
+  async _profileView() {
+    const response = await fetch("/api/core/profile");
+    return response.json();
+  },
+
+  async openProfile() {
+    this._ensureProfileDialog();
+    this._note("shellProfileNote", "");
+    let view = {};
+    try {
+      view = await this._profileView();
+    } catch (error) {
+      this._note("shellProfileNote", "Could not read your profile.");
+    }
+    document.getElementById("shellProfileName").value = view.display_name || "";
+    document.getElementById("shellProfilePicture").value = "";
+    const preview = document.getElementById("shellProfilePreview");
+    preview.src = view.picture || "";
+    preview.style.display = view.picture ? "block" : "none";
+    document.getElementById("shellRemoveAvatarBtn").hidden = !view.picture;
+    document.getElementById("shellProfileModal").showModal();
+  },
+
+  async _uploadBlob(file) {
+    const response = await fetch("/api/blob", {
+      method: "POST",
+      headers: {
+        "Content-Type": file.type || "application/octet-stream",
+        "X-Filename": file.name,
+      },
+      body: file,
+    });
+    const payload = await response.json();
+    if (!response.ok || payload.status === "error") {
+      throw new Error(payload.reason || "Upload failed");
+    }
+    return payload;
+  },
+
+  async _saveProfile(options) {
+    const request = options || {};
+    const name = document.getElementById("shellProfileName").value;
+    const file = document.getElementById("shellProfilePicture").files[0];
+    try {
+      await this._post("/api/core/profile", { name });
+      if (request.removePicture) {
+        await this._post("/api/core/profile/avatar", { remove: true });
+      } else if (file) {
+        const uploaded = await this._uploadBlob(file);
+        await this._post("/api/core/profile/avatar", {
+          attachment: {
+            id: (globalThis.crypto && globalThis.crypto.randomUUID)
+              ? globalThis.crypto.randomUUID()
+              : String(Date.now()) + "-" + file.name,
+            role: "avatar",
+            blob_id: uploaded.blob_id,
+            name: file.name,
+            size: uploaded.size,
+            mime: uploaded.mime,
+          },
+        });
+      }
+      document.getElementById("shellProfileModal").close();
+      await this._changed();
+      this.refreshAvatar();
+    } catch (error) {
+      this._note("shellProfileNote", error.message);
+    }
+  },
+
+  async refreshAvatar() {
+    const button = document.getElementById("shellAvatarBtn");
+    if (!button) return;
+    let view = {};
+    try {
+      view = await this._profileView();
+    } catch (error) {
+      return;
+    }
+    button.replaceChildren();
+    const avatar = document.createElement("span");
+    avatar.className = "header-avatar status-online";
+    if (view.picture) {
+      avatar.style.backgroundImage = 'url("' + view.picture + '")';
+    } else {
+      const source = view.display_name || "?";
+      avatar.textContent = source.slice(0, 2).toUpperCase();
+    }
+    button.title = (view.display_name || "You") + " - edit your profile";
+    button.append(avatar);
+  },
+
+  // ---- disagreements -----------------------------------------------------
+
+  // Both applications already publish transition_events and
+  // transition_by_node in the same shape, because Session decides what a
+  // transition is. Reading them here means neither has to render agreement
+  // state itself.
+  _disagreements() {
+    const state = this._options.state ? this._options.state() : {};
+    const grouped = state.transition_by_node || {};
+    return Object.keys(grouped)
+      .map((uuid) => Object.assign({ node_uuid: uuid }, grouped[uuid]))
+      .filter((item) => item.type && item.type !== "in_agreement");
+  },
+
+  refreshDisagreements() {
+    const button = document.getElementById("shellDisagreementBtn");
+    if (!button) return;
+    // Agreement state is a property of one topic. An application that shows
+    // many at once - an overview - has no single answer, so it says nothing
+    // rather than claiming everything is settled.
+    if (!this._options.topicUuid) {
+      button.hidden = true;
+      return;
+    }
+    button.hidden = false;
+    const items = this._disagreements();
+    const diverged = items.filter((item) => item.type === "divergence").length;
+    button.textContent = items.length
+      ? items.length + (diverged ? " to resolve" : " in transition")
+      : "In agreement";
+    button.classList.toggle("has-divergence", diverged > 0);
+    button.classList.toggle("has-items", items.length > 0);
+    button.title = items.length
+      ? "Open what is not yet in agreement"
+      : "Everything on this topic is in agreement";
+  },
+
+  _ensureDisagreementDialog() {
+    if (this._disagreementReady) return;
+    const host = document.createElement("div");
+    host.innerHTML = [
+      '<dialog id="shellDisagreementModal" class="shell-dialog">',
+      '<form method="dialog" class="shell-panel">',
+      "<h2>Not yet in agreement</h2>",
+      '<div id="shellDisagreementList" class="shell-disagreement-list"></div>',
+      '<menu><button type="button" id="shellDisagreementCloseBtn">Close</button></menu>',
+      "</form></dialog>",
+    ].join("");
+    document.body.append(...host.children);
+    this._disagreementReady = true;
+    document.getElementById("shellDisagreementCloseBtn").onclick = () =>
+      document.getElementById("shellDisagreementModal").close();
+  },
+
+  openDisagreements() {
+    this._ensureDisagreementDialog();
+    const list = document.getElementById("shellDisagreementList");
+    list.replaceChildren();
+    const items = this._disagreements();
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "shell-note";
+      empty.textContent = "Everything on this topic is in agreement.";
+      list.append(empty);
+    }
+    for (const item of items) {
+      const row = document.createElement("div");
+      row.className = "shell-disagreement-row";
+      row.dataset.status = item.type;
+      const label = document.createElement("span");
+      label.className = "shell-disagreement-label";
+      // transitionLabel already knows how to phrase every transition type,
+      // including grouped multi-peer events.
+      label.textContent = transitionLabel(item);
+      const where = document.createElement("span");
+      where.className = "shell-note";
+      const describe = this._options.describeNode;
+      where.textContent = describe ? describe(item.node_uuid) || "" : "";
+      row.append(label, where);
+      if (this._options.revealNode) {
+        const reveal = document.createElement("button");
+        reveal.type = "button";
+        reveal.textContent = "Show";
+        reveal.onclick = () => {
+          document.getElementById("shellDisagreementModal").close();
+          this._options.revealNode(item.node_uuid);
+        };
+        row.append(reveal);
+      }
+      list.append(row);
+    }
+    document.getElementById("shellDisagreementModal").showModal();
+  },
+});

@@ -272,3 +272,84 @@ dialog menu .danger:not(:last-child) {
   margin: 4px 0 0;
   padding: 0;
 }
+
+/* Header regions. Fixed order and fixed alignment so the bar never
+   reshuffles as state arrives: brand, topic, application slot, actions. */
+.shell-brand {
+  display: flex;
+  align-items: center;
+  flex: 0 0 auto;
+}
+.shell-topic {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  flex: 0 1 auto;
+}
+.shell-slot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+.shell-actions {
+  flex: 0 0 auto;
+  margin-left: auto;
+}
+.shell-disagreement-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  opacity: 0.75;
+}
+.shell-disagreement-btn.has-items {
+  opacity: 1;
+  font-weight: 600;
+}
+.shell-disagreement-btn.has-divergence {
+  color: #b91c1c;
+  border-color: currentColor;
+}
+.shell-disagreement-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 55vh;
+  overflow-y: auto;
+}
+.shell-disagreement-row {
+  display: grid;
+  grid-template-columns: 1fr auto;
+  gap: 4px 10px;
+  align-items: baseline;
+  padding: 8px 10px;
+  border-radius: 6px;
+  border-left: 3px solid transparent;
+  background: rgba(127, 127, 127, 0.1);
+}
+.shell-disagreement-row[data-status="divergence"] {
+  border-left-color: #dc2626;
+}
+.shell-disagreement-row[data-status="in_transition"] {
+  border-left-color: #f59e0b;
+}
+.shell-disagreement-label {
+  white-space: pre-line;
+  font-size: 13px;
+}
+.shell-avatar-preview {
+  display: none;
+  max-width: 96px;
+  max-height: 96px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+.header-avatar-btn {
+  border: none;
+  background: none;
+  padding: 0;
+  cursor: pointer;
+  line-height: 0;
+}
