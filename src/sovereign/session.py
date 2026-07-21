@@ -1828,6 +1828,30 @@ class Session:
             )
         return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
+    def reaction_for_event(self, event: dict) -> str:
+        """Which reaction resolves this transition: "adopt" or "rollback".
+
+        Reacting is how a divergence is left behind, so every application
+        needs it and none should decide it. The answer is drawn entirely from
+        Core vocabulary - revision origins and base hashes - so it belongs
+        here rather than being re-derived per application.
+
+        "rollback" when the local side authored the revision the peer is
+        answering, so the peer's copy is the stale one; "adopt" otherwise.
+        """
+        local_identity = self._local_revision_origin()
+        local_origin = event.get("local_revision_origin")
+        peer_origin = event.get("peer_revision_origin")
+        original_type = event.get("original_type") or event.get("type")
+        same_local_wave = (
+            peer_origin == local_identity
+            and event.get("local_base_hash") == event.get("peer_base_hash")
+        )
+        if (local_identity and local_origin == local_identity
+                and (same_local_wave or original_type == "peer_missing_node")):
+            return "rollback"
+        return "adopt"
+
     # How loudly each transition should speak when one node carries several.
     # Session decides what the words mean, so Session ranks them; applications
     # that grouped events per node had each copied this table, and the copies

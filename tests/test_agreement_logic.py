@@ -5,7 +5,7 @@ from unittest.mock import patch
 
 from s_agreement.application import APPLICATION_MANIFEST
 from s_agreement.logic import AgreementLogic
-from sovereign import Session
+from sovereign import ProtocolNode, Session
 from sovereign import app_server
 from sovereign.relay_logic import RelayLogic
 
@@ -66,6 +66,57 @@ class AgreementLogicTests(unittest.TestCase):
         self.assertEqual(
             payload["agreement"]["children"][0]["children"][0]["uuid"],
             clause_uuid,
+        )
+
+    def test_reacting_resolves_a_divergence_on_a_clause(self):
+        # Without reactions an agreement can reach a state it cannot leave:
+        # two sides edit the same clause, both see divergence, and nothing
+        # either does resolves it. This is that dead end, and its exit.
+        left, right = self.runtime(9410), self.runtime(9411)
+        client = MemoryHttpClient({left.address: left, right.address: right})
+        left.adapter.http = client
+        right.adapter.http = client
+        agreement_uuid = left.logic.create_agreement("Service terms").value
+        section_uuid = left.logic.create_section(agreement_uuid, "Scope").value
+        clause_uuid = left.logic.create_clause(section_uuid, "Original text.").value
+        left.session.start_discussion(agreement_uuid)
+        right.channel_manager.accept_invitation(
+            left.session.identity.to_dict(),
+            [agreement_uuid],
+            [{"type": "http", "descriptor_version": 1, "address": left.address}],
+        )
+
+        # Both sides rewrite the same clause without seeing the other's edit.
+        changed = left.logic.update_clause(clause_uuid, "Left text.")
+        right.logic.update_clause(clause_uuid, "Right text.")
+        left.channel_manager.execute_effects(changed.effects)
+        grouped = right.logic.document_payload(agreement_uuid)["transition_by_node"]
+        self.assertEqual(grouped[clause_uuid]["type"], "divergence")
+        self.assertIn(grouped[clause_uuid]["reaction"], {"adopt", "rollback"})
+
+        # Reacting with adopt takes the peer's revision and leaves the
+        # divergence behind - the exit that did not exist before.
+        self.assertEqual(
+            right.logic.accept_peer_node(left.address, clause_uuid).status, "ok",
+        )
+        self.assertEqual(
+            right.session.protocol.index[clause_uuid].data["text"], "Left text.",
+        )
+        settled = right.logic.document_payload(agreement_uuid)["transition_by_node"]
+        self.assertNotEqual(settled.get(clause_uuid, {}).get("type"), "divergence")
+
+    def test_reacting_refuses_a_node_outside_this_application(self):
+        runtime = self.runtime(9412)
+        runtime.logic.create_agreement("Service terms")
+        foreign = runtime.session.create_child(
+            runtime.session.protocol.root.uuid, {"type": "not_an_agreement"}, {},
+        ).value
+
+        result = runtime.logic.accept_peer_node("http://peer", foreign.uuid)
+        self.assertEqual(result.status, "error")
+        self.assertEqual(
+            runtime.logic.rollback_peer_node("http://peer", foreign.uuid).status,
+            "error",
         )
 
     def test_transition_priority_comes_from_session_not_per_application(self):
