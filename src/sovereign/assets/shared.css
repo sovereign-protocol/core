@@ -510,3 +510,101 @@ dialog menu .danger:not(:last-child) {
   border: 1px solid var(--shell-border);
   border-radius: 8px;
 }
+
+/* The collaboration pane. Same surface in every application, so it is styled
+   here completely rather than inheriting a page palette. */
+.shell-pane-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.45);
+  z-index: 900;
+}
+.shell-pane {
+  position: fixed;
+  top: 0;
+  left: 0;
+  bottom: 0;
+  width: min(380px, 92vw);
+  z-index: 901;
+  display: flex;
+  flex-direction: column;
+  gap: 0;
+  overflow-y: auto;
+  background: var(--shell-surface, #161b22);
+  color: var(--shell-text, #e6edf3);
+  border-right: 1px solid var(--shell-border, #30363d);
+  font: 14px system-ui, sans-serif;
+  --shell-surface: #161b22;
+  --shell-field: #0d1117;
+  --shell-text: #e6edf3;
+  --shell-muted: #9aa4b2;
+  --shell-border: #30363d;
+}
+.shell-pane-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--shell-border);
+  position: sticky;
+  top: 0;
+  background: var(--shell-surface);
+}
+.shell-pane-close {
+  background: none;
+  border: none;
+  color: var(--shell-text);
+  font-size: 22px;
+  line-height: 1;
+  padding: 0 4px;
+  cursor: pointer;
+}
+.shell-pane-section {
+  padding: 14px 16px;
+  border-bottom: 1px solid var(--shell-border);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.shell-pane-section h3 {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--shell-muted);
+}
+.shell-pane input,
+.shell-pane select,
+.shell-pane button {
+  font: inherit;
+  color: var(--shell-text);
+  background: var(--shell-field);
+  border: 1px solid var(--shell-border);
+  border-radius: 6px;
+  padding: 6px 9px;
+}
+.shell-pane button { cursor: pointer; background: rgba(255, 255, 255, 0.06); }
+.shell-pane .shell-row input { flex: 1 1 auto; min-width: 0; }
+
+.shell-agenda-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.shell-agenda-item {
+  display: grid;
+  grid-template-columns: 1fr auto auto;
+  gap: 6px;
+  align-items: center;
+  padding: 7px 9px;
+  border-radius: 6px;
+  background: rgba(127, 127, 127, 0.12);
+  border-left: 3px solid transparent;
+}
+.shell-agenda-item[data-priority="high"] { border-left-color: #f87171; }
+.shell-agenda-item[data-priority="medium"] { border-left-color: #fbbf24; }
+.shell-agenda-item[data-priority="low"] { border-left-color: #60a5fa; }
+.shell-agenda-text { min-width: 0; overflow-wrap: anywhere; }
+.shell-agenda-delete { color: #f87171; }
+.shell-pane .shell-disagreement-list { max-height: none; }

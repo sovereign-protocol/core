@@ -1828,6 +1828,77 @@ class Session:
             )
         return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
+    # An agenda is what a topic's participants want to talk about, merged
+    # across everyone discussing it. That is a collaboration primitive, not a
+    # property of boards, and it needs no new storage: an agenda item is
+    # already a child of the topic root, and every application's topic is a
+    # root. Only the originator may edit or remove their own item; everyone
+    # sees the merged list.
+    AGENDA_PRIORITIES = ("high", "medium", "low")
+    AGENDA_PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
+
+    def agenda_items(self, topic_uuid: str) -> list[ProtocolNode]:
+        topic = self._protocol.index.get(topic_uuid)
+        if topic is None:
+            return []
+        return sorted(
+            [
+                child for child in topic.live_children()
+                if child.data.get("type") == "agenda_item"
+            ],
+            key=lambda node: (
+                -self.AGENDA_PRIORITY_RANK.get(node.data.get("priority"), 0),
+                node.created_at,
+            ),
+        )
+
+    def create_agenda_item(self, topic_uuid: str, text: str,
+                           priority: str | None = None) -> SessionResult:
+        if self._protocol.index.get(topic_uuid) is None:
+            return SessionResult("error", reason="topic not found")
+        normalized = str(text or "").strip()
+        if not normalized:
+            return SessionResult("error", reason="discussion topic text is required")
+        return self.create_child(
+            topic_uuid,
+            {
+                "type": "agenda_item",
+                "text": normalized,
+                "priority": priority if priority in self.AGENDA_PRIORITIES else None,
+                "author": self.identity.uuid,
+            },
+            {},
+        )
+
+    def delete_agenda_item(self, item_uuid: str) -> SessionResult:
+        item = self._agenda_item(item_uuid)
+        if item is None:
+            return SessionResult("error", reason="agenda item not found")
+        if item.data.get("author") != self.identity.uuid:
+            return SessionResult(
+                "error", reason="only the topic originator can delete it",
+            )
+        return self.delete(item.uuid)
+
+    def set_agenda_item_priority(self, item_uuid: str,
+                                 priority: str | None) -> SessionResult:
+        item = self._agenda_item(item_uuid)
+        if item is None:
+            return SessionResult("error", reason="agenda item not found")
+        if item.data.get("author") != self.identity.uuid:
+            return SessionResult(
+                "error", reason="only the topic originator can set its priority",
+            )
+        data = dict(item.data)
+        data["priority"] = priority if priority in self.AGENDA_PRIORITIES else None
+        return self.modify(item.uuid, data, item.weights)
+
+    def _agenda_item(self, item_uuid: str) -> ProtocolNode | None:
+        node = self._protocol.index.get(item_uuid)
+        if node is None or node.data.get("type") != "agenda_item":
+            return None
+        return node
+
     def reaction_for_event(self, event: dict) -> str:
         """Which reaction resolves this transition: "adopt" or "rollback".
 

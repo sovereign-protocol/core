@@ -969,26 +969,10 @@ Object.assign(SovereignShell, {
     status.title = button.title;
   },
 
-  _ensureDisagreementDialog() {
-    if (this._disagreementReady) return;
-    const host = document.createElement("div");
-    host.innerHTML = [
-      '<dialog id="shellDisagreementModal" class="shell-dialog">',
-      '<form method="dialog" class="shell-panel">',
-      "<h2>Not yet in agreement</h2>",
-      '<div id="shellDisagreementList" class="shell-disagreement-list"></div>',
-      '<menu><button type="button" id="shellDisagreementCloseBtn">Close</button></menu>',
-      "</form></dialog>",
-    ].join("");
-    document.body.append(...host.children);
-    this._disagreementReady = true;
-    document.getElementById("shellDisagreementCloseBtn").onclick = () =>
-      document.getElementById("shellDisagreementModal").close();
-  },
-
-  openDisagreements() {
-    this._ensureDisagreementDialog();
-    const list = document.getElementById("shellDisagreementList");
+  // Rendering the unsettled list is separate from where it is shown, so the
+  // collaboration pane and the standalone dialog draw the same thing.
+  _renderDisagreementList(list) {
+    if (!list) return;
     list.replaceChildren();
     const items = this._disagreements();
     if (!items.length) {
@@ -996,6 +980,7 @@ Object.assign(SovereignShell, {
       empty.className = "shell-note";
       empty.textContent = "Everything on this topic is in agreement.";
       list.append(empty);
+      return;
     }
     for (const item of items) {
       const row = document.createElement("div");
@@ -1003,8 +988,6 @@ Object.assign(SovereignShell, {
       row.dataset.status = item.type;
       const label = document.createElement("span");
       label.className = "shell-disagreement-label";
-      // transitionLabel already knows how to phrase every transition type,
-      // including grouped multi-peer events.
       label.textContent = transitionLabel(item);
       const where = document.createElement("span");
       where.className = "shell-note";
@@ -1016,13 +999,211 @@ Object.assign(SovereignShell, {
         reveal.type = "button";
         reveal.textContent = "Show";
         reveal.onclick = () => {
-          document.getElementById("shellDisagreementModal").close();
+          this.closeCollab();
           this._options.revealNode(item.node_uuid);
         };
         row.append(reveal);
       }
       list.append(row);
     }
-    document.getElementById("shellDisagreementModal").showModal();
+  },
+
+  openDisagreements() {
+    // The header button opens the whole collaboration pane; what is not in
+    // agreement is one section of it, beside the agenda it belongs with.
+    this.openCollab();
+  },
+});
+
+/*
+  The collaboration pane - the same surface in every application.
+
+  Sections, in the order S-Kanban established: what I want to discuss, what
+  everyone wants to discuss, what is not yet in agreement, and the settings
+  that govern adoption. All four are Core concepts, so all four live here and
+  no application renders them itself.
+
+  Agendas are Session's: an agenda item is a child of the topic root, and
+  every application's topic is a root. An application supplies only the API
+  paths it exposes them on, because route namespacing is per application.
+*/
+Object.assign(SovereignShell, {
+  _collabReady: false,
+
+  _ensureCollabPane() {
+    if (this._collabReady) return;
+    const host = document.createElement("div");
+    host.innerHTML = [
+      '<div id="shellCollabOverlay" class="shell-pane-overlay" hidden></div>',
+      '<aside id="shellCollabPane" class="shell-pane" hidden>',
+      '<div class="shell-pane-header">',
+      "<strong>Collaboration</strong>",
+      '<button type="button" id="shellCollabCloseBtn" class="shell-pane-close" aria-label="Close">&times;</button>',
+      "</div>",
+      '<div class="shell-pane-section">',
+      "<h3>My agenda</h3>",
+      '<div id="shellMyAgenda" class="shell-agenda-list"></div>',
+      '<form id="shellAgendaForm" class="shell-row">',
+      '<input id="shellAgendaText" placeholder="Add a discussion topic">',
+      '<button type="submit">Add</button>',
+      "</form>",
+      "</div>",
+      '<div class="shell-pane-section">',
+      "<h3>Integrated agenda</h3>",
+      '<div id="shellMergedAgenda" class="shell-agenda-list"></div>',
+      "</div>",
+      '<div class="shell-pane-section">',
+      '<h3 id="shellNotAlignedTitle">Not yet in agreement</h3>',
+      '<div id="shellDisagreementList" class="shell-disagreement-list"></div>',
+      "</div>",
+      '<div class="shell-pane-section" id="shellCollabSettings" hidden>',
+      "<h3>Settings</h3>",
+      '<div id="shellCollabSettingsBody"></div>',
+      "</div>",
+      "</aside>",
+    ].join("");
+    document.body.append(...host.children);
+    this._collabReady = true;
+
+    document.getElementById("shellCollabCloseBtn").onclick = () => this.closeCollab();
+    document.getElementById("shellCollabOverlay").onclick = () => this.closeCollab();
+    document.getElementById("shellAgendaForm").onsubmit = (event) => {
+      event.preventDefault();
+      this._addAgendaItem();
+    };
+  },
+
+  closeCollab() {
+    const pane = document.getElementById("shellCollabPane");
+    const overlay = document.getElementById("shellCollabOverlay");
+    if (pane) pane.hidden = true;
+    if (overlay) overlay.hidden = true;
+  },
+
+  _agendaRoutes() {
+    return this._options.agendaRoutes || null;
+  },
+
+  async _addAgendaItem() {
+    const routes = this._agendaRoutes();
+    const field = document.getElementById("shellAgendaText");
+    const text = field.value.trim();
+    const topic = this._topic();
+    if (!routes || !text || !topic) return;
+    try {
+      await this._post(routes.create, { [routes.topicKey]: topic, text });
+      field.value = "";
+      await this._changed();
+      this.openCollab();
+    } catch (error) {
+      showToast(error.message, true);
+    }
+  },
+
+  _agendaRow(item, mine) {
+    const routes = this._agendaRoutes();
+    const row = document.createElement("div");
+    row.className = "shell-agenda-item";
+    row.dataset.priority = item.data.priority || "";
+
+    const text = document.createElement("span");
+    text.className = "shell-agenda-text";
+    text.textContent = item.data.text || "";
+    row.append(text);
+
+    // Only the originator may steer their own item; everyone else reads it.
+    // That rule is Session's, and the view simply reflects it.
+    if (mine && routes) {
+      const priority = document.createElement("select");
+      for (const [value, label] of [["", "No priority"], ["high", "High"],
+        ["medium", "Medium"], ["low", "Low"]]) {
+        const option = document.createElement("option");
+        option.value = value;
+        option.textContent = label;
+        priority.append(option);
+      }
+      priority.value = item.data.priority || "";
+      priority.onchange = async () => {
+        try {
+          await this._post(routes.setPriority, {
+            item_uuid: item.uuid, priority: priority.value || null,
+          });
+          await this._changed();
+        } catch (error) { showToast(error.message, true); }
+      };
+      const remove = document.createElement("button");
+      remove.type = "button";
+      remove.className = "shell-agenda-delete";
+      remove.textContent = "Delete";
+      remove.onclick = async () => {
+        try {
+          await this._post(routes.delete, { item_uuid: item.uuid });
+          await this._changed();
+          this.openCollab();
+        } catch (error) { showToast(error.message, true); }
+      };
+      row.append(priority, remove);
+    } else {
+      const author = document.createElement("span");
+      author.className = "shell-note";
+      const described = this._options.describeAuthor
+        ? this._options.describeAuthor(item.data.author) : "";
+      author.textContent = described || "";
+      row.append(author);
+    }
+    return row;
+  },
+
+  _renderAgenda() {
+    const state = this._options.state ? this._options.state() : {};
+    const items = state.agenda_items || [];
+    const me = state.identity_uuid
+      || (state.user_profile && state.user_profile.uuid) || "";
+    const mine = document.getElementById("shellMyAgenda");
+    const merged = document.getElementById("shellMergedAgenda");
+    mine.replaceChildren();
+    merged.replaceChildren();
+
+    const own = items.filter((item) => item.data.author === me);
+    if (!own.length) {
+      const empty = document.createElement("p");
+      empty.className = "shell-note";
+      empty.textContent = "Nothing from you yet.";
+      mine.append(empty);
+    }
+    for (const item of own) mine.append(this._agendaRow(item, true));
+
+    if (!items.length) {
+      const empty = document.createElement("p");
+      empty.className = "shell-note";
+      empty.textContent = "No discussion topics on this topic yet.";
+      merged.append(empty);
+    }
+    for (const item of items) {
+      merged.append(this._agendaRow(item, false));
+    }
+
+    document.getElementById("shellAgendaForm").hidden = !this._agendaRoutes();
+  },
+
+  openCollab() {
+    this._ensureCollabPane();
+    this._renderAgenda();
+    this._renderDisagreementList(
+      document.getElementById("shellDisagreementList"),
+    );
+
+    // An application may hang its own topic settings here - auto-adopt is
+    // Kanban's today - without the shell knowing what they are.
+    const settings = document.getElementById("shellCollabSettings");
+    const body = document.getElementById("shellCollabSettingsBody");
+    body.replaceChildren();
+    const supplied = this._options.collabSettings
+      && this._options.collabSettings();
+    settings.hidden = !supplied;
+    if (supplied) body.append(supplied);
+
+    document.getElementById("shellCollabOverlay").hidden = false;
+    document.getElementById("shellCollabPane").hidden = false;
   },
 });
