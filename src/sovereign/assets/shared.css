@@ -159,8 +159,27 @@ dialog menu .danger:not(:last-child) {
 }
 
 /* Sovereign host shell - navigation, connection, and relay targets.
-   Colour-neutral on purpose: each application's own stylesheet sets the
-   surrounding palette, and the shell inherits it. */
+
+   The shell styles itself completely rather than inheriting each page's
+   palette. Inheriting looked tidy but guaranteed divergence: the same relay
+   dialog rendered three different ways, because Kanban styles `input`,
+   Personal Cockpit styles `dialog input`, and a minimal application styles
+   neither and falls through to browser defaults. Core owns this
+   functionality, so Core owns its appearance.
+
+   The tokens below are overridable. An application that deliberately wants
+   the shell in its own palette redefines them on .shell-dialog; doing
+   nothing yields the same dialog everywhere. */
+.shell-dialog,
+.shell-bar {
+  --shell-surface: #161b22;
+  --shell-field: #0d1117;
+  --shell-text: #e6edf3;
+  --shell-muted: #9aa4b2;
+  --shell-border: #30363d;
+  --shell-accent: #2f6feb;
+  --shell-danger: #b91c1c;
+}
 .shell-bar {
   display: flex;
   align-items: center;
@@ -352,4 +371,91 @@ dialog menu .danger:not(:last-child) {
   padding: 0;
   cursor: pointer;
   line-height: 0;
+}
+
+/* Self-contained appearance for every shell dialog.
+
+   Specificity matters here. `.shell-dialog input` (0,1,1) beats an
+   application's `dialog input` (0,0,2) and its bare `input` (0,0,1), so
+   these rules win without !important wherever the shell is used. */
+.shell-dialog {
+  background: var(--shell-surface);
+  color: var(--shell-text);
+  border: 1px solid var(--shell-border);
+  font: 14px system-ui, sans-serif;
+}
+.shell-dialog h2 {
+  color: var(--shell-text);
+  font-size: 17px;
+  font-weight: 600;
+}
+.shell-dialog label,
+.shell-dialog legend,
+.shell-dialog .shell-note {
+  color: var(--shell-muted);
+  font-size: 12px;
+  font-weight: 400;
+}
+.shell-dialog input,
+.shell-dialog select,
+.shell-dialog textarea {
+  font: inherit;
+  color: var(--shell-text);
+  background: var(--shell-field);
+  border: 1px solid var(--shell-border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-height: 36px;
+  box-sizing: border-box;
+}
+.shell-dialog input::placeholder {
+  color: var(--shell-muted);
+  opacity: 0.8;
+}
+.shell-dialog input:focus,
+.shell-dialog select:focus,
+.shell-dialog textarea:focus {
+  outline: 2px solid var(--shell-accent);
+  outline-offset: 1px;
+  border-color: var(--shell-accent);
+}
+/* Chrome paints autofilled fields near-white, which broke the dark dialog
+   in one application and not the others. Repaint them by hand. */
+.shell-dialog input:-webkit-autofill,
+.shell-dialog input:-webkit-autofill:hover,
+.shell-dialog input:-webkit-autofill:focus {
+  -webkit-text-fill-color: var(--shell-text);
+  -webkit-box-shadow: 0 0 0 1000px var(--shell-field) inset;
+  caret-color: var(--shell-text);
+}
+.shell-dialog button {
+  font: inherit;
+  color: var(--shell-text);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--shell-border);
+  border-radius: 6px;
+  padding: 8px 12px;
+  min-height: 36px;
+  cursor: pointer;
+}
+.shell-dialog button:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.12);
+}
+.shell-dialog button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.shell-dialog button.primary {
+  background: var(--shell-accent);
+  border-color: var(--shell-accent);
+  color: #fff;
+}
+.shell-dialog button.danger {
+  background: var(--shell-danger);
+  border-color: var(--shell-danger);
+  color: #fff;
+}
+.shell-dialog fieldset {
+  border: 1px solid var(--shell-border);
+  border-radius: 8px;
 }
