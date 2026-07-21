@@ -1828,6 +1828,33 @@ class Session:
             )
         return self._transition_event(event_type, peer_addr, local_node, peer_node)
 
+    # How much sovereignty to exercise on a topic: adopt a peer's changes
+    # automatically, or hold them for a decision. Every application needs the
+    # choice, so the policy and its storage are Session's.
+    #
+    # Only "always" and "never" are universal. An application may offer more
+    # by passing its own allowed set - modes judged against an ownership or
+    # membership model Core has no concept of. Core stores the string and
+    # never interprets an application's extra modes.
+    AUTO_ADOPT_MODES = ("always", "never")
+
+    def auto_adopt_mode(self, topic_uuid: str, default: str = "always") -> str:
+        stored = self.app_metadata.get("auto_adopt_by_topic", {})
+        value = stored.get(topic_uuid) if isinstance(stored, dict) else None
+        return value if isinstance(value, str) and value else default
+
+    def set_auto_adopt_mode(self, topic_uuid: str, mode: str,
+                            allowed: tuple[str, ...] | None = None) -> SessionResult:
+        permitted = allowed or self.AUTO_ADOPT_MODES
+        if mode not in permitted:
+            return SessionResult("error", reason=f"unknown auto-adopt mode: {mode}")
+        stored = self.app_metadata.setdefault("auto_adopt_by_topic", {})
+        if not isinstance(stored, dict):
+            stored = {}
+            self.app_metadata["auto_adopt_by_topic"] = stored
+        stored[topic_uuid] = mode
+        return SessionResult("ok", value=mode)
+
     # An agenda is what a topic's participants want to talk about, merged
     # across everyone discussing it. That is a collaboration primitive, not a
     # property of boards, and it needs no new storage: an agenda item is

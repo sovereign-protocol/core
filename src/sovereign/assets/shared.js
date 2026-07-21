@@ -1186,6 +1186,44 @@ Object.assign(SovereignShell, {
     document.getElementById("shellAgendaForm").hidden = !this._agendaRoutes();
   },
 
+  // Labels for the two universal modes. An application offering more supplies
+  // its own labels; Core shows the raw mode rather than inventing wording for
+  // a policy it does not interpret.
+  AUTO_ADOPT_LABELS: { always: "Adopt automatically", never: "Hold for me to decide" },
+
+  _autoAdoptControl() {
+    const route = this._options.autoAdoptRoute;
+    const topic = this._topic();
+    if (!route || !topic) return null;
+    const state = this._options.state ? this._options.state() : {};
+    const modes = state.auto_adopt_modes || ["always", "never"];
+    const labels = Object.assign(
+      {}, this.AUTO_ADOPT_LABELS, this._options.autoAdoptLabels || {},
+    );
+
+    const wrap = document.createElement("label");
+    wrap.className = "shell-setting";
+    wrap.textContent = "Peer changes on this topic";
+    const select = document.createElement("select");
+    for (const mode of modes) {
+      const option = document.createElement("option");
+      option.value = mode;
+      option.textContent = labels[mode] || mode;
+      select.append(option);
+    }
+    select.value = state.auto_adopt_mode || "always";
+    select.onchange = async () => {
+      try {
+        await this._post(route.path, {
+          [route.topicKey]: topic, mode: select.value,
+        });
+        await this._changed();
+      } catch (error) { showToast(error.message, true); }
+    };
+    wrap.append(select);
+    return wrap;
+  },
+
   openCollab() {
     this._ensureCollabPane();
     this._renderAgenda();
@@ -1193,15 +1231,18 @@ Object.assign(SovereignShell, {
       document.getElementById("shellDisagreementList"),
     );
 
-    // An application may hang its own topic settings here - auto-adopt is
-    // Kanban's today - without the shell knowing what they are.
     const settings = document.getElementById("shellCollabSettings");
     const body = document.getElementById("shellCollabSettingsBody");
     body.replaceChildren();
+    // How much sovereignty to exercise on this topic is Session's policy, so
+    // the shell renders the control. An application supplies the route and,
+    // if it has an ownership model, extra modes Core does not interpret.
+    const adopt = this._autoAdoptControl();
+    if (adopt) body.append(adopt);
     const supplied = this._options.collabSettings
       && this._options.collabSettings();
-    settings.hidden = !supplied;
     if (supplied) body.append(supplied);
+    settings.hidden = !adopt && !supplied;
 
     document.getElementById("shellCollabOverlay").hidden = false;
     document.getElementById("shellCollabPane").hidden = false;
