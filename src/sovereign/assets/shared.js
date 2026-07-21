@@ -243,14 +243,15 @@ const SovereignShell = {
     this._options = options;
     const nav = this._buildHeader(options.container, options);
     for (const app of await this.applications()) {
+      if (app.application_id === options.applicationId) {
+        // The application you are in is named, not linked to itself.
+        document.getElementById("shellAppName").textContent = app.display_name;
+        continue;
+      }
       const link = document.createElement("a");
       link.className = "shell-nav-link";
       link.href = app.asset_prefix;
       link.textContent = app.display_name;
-      if (app.application_id === options.applicationId) {
-        link.classList.add("current");
-        link.setAttribute("aria-current", "page");
-      }
       nav.append(link);
     }
 
@@ -330,6 +331,7 @@ const SovereignShell = {
       '<div class="shell-row"><button type="button" id="shellCopyTokenBtn">Copy share token</button></div>',
       '<label for="shellTokenInput">Paste a share token</label>',
       '<div class="shell-row"><input id="shellTokenInput" placeholder="Paste a share token"><button type="button" id="shellConnectBtn">Connect</button></div>',
+      '<div class="shell-row"><button type="button" id="shellManageChannelsBtn">Add or edit channels</button></div>',
       '<div id="shellConnectionExtras" class="shell-row"></div>',
       '<p id="shellConnectionNote" class="shell-note"></p>',
       '<menu><button type="button" id="shellConnectionCloseBtn">Close</button></menu>',
@@ -366,6 +368,13 @@ const SovereignShell = {
       document.getElementById("shellTargetsModal").close();
     document.getElementById("shellTargetSelect").onchange = (event) =>
       this._assignTarget(event.target.value);
+    // Channel management lives inside the connection pane, not the header:
+    // adding a relay target is something you do while connecting, not a
+    // standing top-level action.
+    document.getElementById("shellManageChannelsBtn").onclick = () => {
+      document.getElementById("shellConnectionModal").close();
+      this.openRelayTargets();
+    };
     document.getElementById("shellCopyTokenBtn").onclick = () => this._copyToken();
     document.getElementById("shellConnectBtn").onclick = () => this._connect();
     document.getElementById("shellAddTargetBtn").onclick = () => this._saveTarget();
@@ -673,10 +682,18 @@ const SovereignShell = {
   The header has stable regions so every application looks the same and
   nothing jumps as state changes:
 
-    [brand] [topic] [app slot] ....... [disagreements] [peers] [avatar]
+    LEFT    collaboration, topic name, topic switcher, topic status
+    MIDDLE  application icon and name, navigation, [+] new topic
+    RIGHT   connect area, own avatar
 
-  The topic region is filled by the application for now. When Core owns
-  topic selection, the shell fills it instead and nothing else moves.
+  The topic comes first because the topic is what you are working on; the
+  application is only where you are. Topic status sits beside the topic name
+  rather than off in the actions, so agreement state is read where the topic
+  is read.
+
+  The topic region is filled by the application until Core owns topic
+  selection. When Core owns it, the shell fills the same region and nothing
+  else moves.
 */
 Object.assign(SovereignShell, {
   _profileReady: false,
@@ -685,35 +702,61 @@ Object.assign(SovereignShell, {
     container.classList.add("shell-bar");
     container.replaceChildren();
 
-    const brand = document.createElement("div");
-    brand.className = "shell-brand";
-    const nav = document.createElement("nav");
-    nav.className = "shell-nav";
-    brand.append(nav);
+    // ---- left: this topic --------------------------------------------
+    const left = document.createElement("div");
+    left.className = "shell-left";
+
+    const collaboration = document.createElement("button");
+    collaboration.type = "button";
+    collaboration.id = "shellDisagreementBtn";
+    collaboration.className = "shell-collab-btn";
+    collaboration.textContent = "Collaboration";
+    collaboration.onclick = () => this.openDisagreements();
 
     const topic = document.createElement("div");
     topic.className = "shell-topic";
     topic.id = "shellTopicRegion";
 
-    const slot = document.createElement("div");
-    slot.className = "shell-slot";
-    slot.id = "shellSlot";
+    const status = document.createElement("span");
+    status.id = "shellTopicStatus";
+    status.className = "shell-topic-status";
 
+    left.append(collaboration, topic, status);
+
+    // ---- middle: which application -----------------------------------
+    const middle = document.createElement("div");
+    middle.className = "shell-middle";
+
+    const brand = document.createElement("span");
+    brand.className = "shell-brand";
+    const mark = document.createElement("span");
+    mark.className = "shell-app-mark";
+    mark.textContent = (options.applicationId || "?").slice(0, 1).toUpperCase();
+    const name = document.createElement("span");
+    name.className = "shell-app-name";
+    name.id = "shellAppName";
+    brand.append(mark, name);
+
+    const nav = document.createElement("nav");
+    nav.className = "shell-nav";
+
+    const create = document.createElement("button");
+    create.type = "button";
+    create.id = "shellCreateTopicBtn";
+    create.className = "shell-create-btn";
+    create.textContent = "+";
+    create.title = "New topic";
+    create.setAttribute("aria-label", "New topic");
+    // Creating a topic is application-specific - a board needs default
+    // columns, an agreement a title - so the shell only offers the button.
+    create.hidden = !options.onCreateTopic;
+    create.onclick = () => options.onCreateTopic && options.onCreateTopic();
+
+    middle.append(brand, nav, create);
+
+    // ---- right: who is here ------------------------------------------
     const actions = document.createElement("div");
     actions.className = "shell-actions";
-
-    const disagreements = document.createElement("button");
-    disagreements.type = "button";
-    disagreements.id = "shellDisagreementBtn";
-    disagreements.className = "shell-disagreement-btn";
-    disagreements.textContent = "In agreement";
-    disagreements.onclick = () => this.openDisagreements();
-
-    const relay = document.createElement("button");
-    relay.type = "button";
-    relay.className = "shell-relay-btn";
-    relay.textContent = "Relay targets";
-    relay.onclick = () => this.openRelayTargets();
 
     const connection = document.createElement("button");
     connection.type = "button";
@@ -729,9 +772,15 @@ Object.assign(SovereignShell, {
     avatar.title = "Edit your profile";
     avatar.onclick = () => this.openProfile();
 
-    actions.append(disagreements, relay, connection, avatar);
-    container.append(brand, topic, slot, actions);
+    actions.append(connection, avatar);
+    container.append(left, middle, actions);
     return nav;
+  },
+
+  // The application slot is gone from the header; an application that needs
+  // its own control puts it in the topic region beside the switcher.
+  slot() {
+    return document.getElementById("shellTopicRegion");
   },
 
   // The topic region belongs to the application until Core owns selection.
@@ -740,10 +789,6 @@ Object.assign(SovereignShell, {
     if (!region) return;
     region.replaceChildren();
     if (node) region.append(node);
-  },
-
-  slot() {
-    return document.getElementById("shellSlot");
   },
 
   // ---- profile -----------------------------------------------------------
@@ -896,25 +941,32 @@ Object.assign(SovereignShell, {
 
   refreshDisagreements() {
     const button = document.getElementById("shellDisagreementBtn");
+    const status = document.getElementById("shellTopicStatus");
     if (!button) return;
     // Agreement state is a property of one topic. An application that shows
-    // many at once - an overview - has no single answer, so it says nothing
-    // rather than claiming everything is settled.
+    // many at once - an overview - has no single answer, so the whole left
+    // region collapses rather than claiming one.
     if (!this._options.topicUuid) {
       button.hidden = true;
+      if (status) status.hidden = true;
       return;
     }
     button.hidden = false;
     const items = this._disagreements();
     const diverged = items.filter((item) => item.type === "divergence").length;
-    button.textContent = items.length
-      ? items.length + (diverged ? " to resolve" : " in transition")
-      : "In agreement";
     button.classList.toggle("has-divergence", diverged > 0);
     button.classList.toggle("has-items", items.length > 0);
     button.title = items.length
       ? "Open what is not yet in agreement"
       : "Everything on this topic is in agreement";
+    if (!status) return;
+    status.hidden = false;
+    status.textContent = items.length
+      ? items.length + (diverged ? " to resolve" : " in transition")
+      : "In agreement";
+    status.dataset.state = diverged
+      ? "divergence" : (items.length ? "in_transition" : "in_agreement");
+    status.title = button.title;
   },
 
   _ensureDisagreementDialog() {

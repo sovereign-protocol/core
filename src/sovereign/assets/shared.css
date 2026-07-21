@@ -292,11 +292,19 @@ dialog menu .danger:not(:last-child) {
   padding: 0;
 }
 
-/* Header regions. Fixed order and fixed alignment so the bar never
-   reshuffles as state arrives: brand, topic, application slot, actions. */
-.shell-brand {
+/* Header regions. Fixed order so the bar never reshuffles as state arrives:
+   left is this topic, middle is which application, right is who is here. */
+.shell-left,
+.shell-middle {
   display: flex;
   align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.shell-left {
+  flex: 1 1 auto;
+}
+.shell-middle {
   flex: 0 0 auto;
 }
 .shell-topic {
@@ -304,14 +312,57 @@ dialog menu .danger:not(:last-child) {
   align-items: center;
   gap: 6px;
   min-width: 0;
-  flex: 0 1 auto;
 }
-.shell-slot {
-  display: flex;
+.shell-topic-status {
+  font-size: 12px;
+  padding: 3px 8px;
+  border-radius: 999px;
+  white-space: nowrap;
+  background: rgba(127, 127, 127, 0.18);
+  color: var(--shell-muted, #9aa4b2);
+}
+.shell-topic-status[data-state="in_transition"] {
+  color: #f59e0b;
+}
+.shell-topic-status[data-state="divergence"] {
+  color: #f87171;
+  font-weight: 600;
+}
+.shell-brand {
+  display: inline-flex;
   align-items: center;
-  gap: 8px;
-  min-width: 0;
-  flex: 1 1 auto;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+.shell-app-mark {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  font-size: 12px;
+  font-weight: 700;
+  background: rgba(127, 127, 127, 0.28);
+}
+.shell-app-name {
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.shell-create-btn {
+  min-width: 28px;
+  min-height: 28px;
+  padding: 0 8px;
+  border-radius: 6px;
+  font-size: 16px;
+  line-height: 1;
+}
+.shell-collab-btn {
+  padding: 6px 10px;
+  border-radius: 6px;
+  font-size: 13px;
+  flex: 0 0 auto;
 }
 .shell-actions {
   flex: 0 0 auto;
