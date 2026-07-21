@@ -62,6 +62,14 @@ class ApplicationManifest:
     asset_package: str | None = None
     ui_file: str | None = None
     css_file: str | None = None
+    # Inner SVG markup for the application's mark, drawn in the shared header
+    # and in other applications' navigation. Without one the shell falls back
+    # to the first letter of the identifier.
+    icon: str | None = None
+    # "aggregator" means this application reaches other applications' topics
+    # through its own content. The shell gives it no navigation, because its
+    # tiles already are the navigation.
+    role: str | None = None
 
     def __post_init__(self) -> None:
         if not _APPLICATION_ID_RE.fullmatch(self.application_id):

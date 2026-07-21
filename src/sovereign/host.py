@@ -100,6 +100,8 @@ class ApplicationHost:
                 "display_name": instance.manifest.display_name,
                 "asset_prefix": instance.manifest.asset_prefix,
                 "primary": instance.manifest.application_id == primary,
+                "icon": instance.manifest.icon,
+                "role": instance.manifest.role,
             }
             for instance in self.instances.values()
         ]

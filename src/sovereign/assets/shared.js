@@ -28,6 +28,14 @@ const ICON_SHARE =
   '<circle cx="18" cy="19" r="3"></circle>' +
   '<path d="M8.59 13.51 15.42 17.49"></path><path d="M15.41 6.51 8.59 10.49"></path>';
 
+// Two people in conversation - the collaboration pane's mark, kept as an icon
+// rather than a word so the header reads at a glance in every application.
+const ICON_COLLABORATION =
+  '<path d="M8 11a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"></path>' +
+  '<path d="M16 10a2.5 2.5 0 1 0 0-5 2.5 2.5 0 0 0 0 5Z"></path>' +
+  '<path d="M3.5 19c.6-3 2.3-5 4.5-5s3.9 2 4.5 5"></path>' +
+  '<path d="M12.5 18c.5-2.3 1.8-3.8 3.5-3.8s3 1.5 3.5 3.8"></path>';
+
 function iconButton(svgInner, label, action) {
   const button = document.createElement("button");
   button.type = "button";
@@ -242,17 +250,41 @@ const SovereignShell = {
   async mount(options) {
     this._options = options;
     const nav = this._buildHeader(options.container, options);
-    for (const app of await this.applications()) {
-      if (app.application_id === options.applicationId) {
-        // The application you are in is named, not linked to itself.
-        document.getElementById("shellAppName").textContent = app.display_name;
-        continue;
+    const applications = await this.applications();
+    const current = applications.find(
+      (app) => app.application_id === options.applicationId,
+    );
+    if (current) {
+      // The application you are in is named, not linked to itself.
+      document.getElementById("shellAppName").textContent = current.display_name;
+      if (current.icon) {
+        const mark = document.getElementById("shellAppMark");
+        mark.textContent = "";
+        mark.innerHTML =
+          '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
+          + current.icon + "</svg>";
       }
-      const link = document.createElement("a");
-      link.className = "shell-nav-link";
-      link.href = app.asset_prefix;
-      link.textContent = app.display_name;
-      nav.append(link);
+    }
+    // An aggregator reaches other applications through its own content - its
+    // tiles are the navigation - so it is given none, and nothing links to a
+    // second way of doing the same thing.
+    if (!current || current.role !== "aggregator") {
+      for (const app of applications) {
+        if (app.application_id === options.applicationId) continue;
+        const link = document.createElement("a");
+        link.className = "shell-nav-link icon-btn";
+        link.href = app.asset_prefix;
+        link.title = app.display_name;
+        link.setAttribute("aria-label", app.display_name);
+        if (app.icon) {
+          link.innerHTML =
+            '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
+            + app.icon + "</svg>";
+        } else {
+          link.textContent = app.display_name.slice(0, 1).toUpperCase();
+        }
+        nav.append(link);
+      }
     }
 
     this._ensureDialogs();
@@ -706,12 +738,11 @@ Object.assign(SovereignShell, {
     const left = document.createElement("div");
     left.className = "shell-left";
 
-    const collaboration = document.createElement("button");
-    collaboration.type = "button";
+    const collaboration = iconButton(
+      ICON_COLLABORATION, "Collaboration", () => this.openCollab(),
+    );
     collaboration.id = "shellDisagreementBtn";
-    collaboration.className = "shell-collab-btn";
-    collaboration.textContent = "Collaboration";
-    collaboration.onclick = () => this.openDisagreements();
+    collaboration.classList.add("shell-collab-btn");
 
     const topic = document.createElement("div");
     topic.className = "shell-topic";
@@ -731,6 +762,7 @@ Object.assign(SovereignShell, {
     brand.className = "shell-brand";
     const mark = document.createElement("span");
     mark.className = "shell-app-mark";
+    mark.id = "shellAppMark";
     mark.textContent = (options.applicationId || "?").slice(0, 1).toUpperCase();
     const name = document.createElement("span");
     name.className = "shell-app-name";
@@ -747,8 +779,6 @@ Object.assign(SovereignShell, {
     create.textContent = "+";
     create.title = "New topic";
     create.setAttribute("aria-label", "New topic");
-    // Creating a topic is application-specific - a board needs default
-    // columns, an agreement a title - so the shell only offers the button.
     create.hidden = !options.onCreateTopic;
     create.onclick = () => options.onCreateTopic && options.onCreateTopic();
 
@@ -757,6 +787,12 @@ Object.assign(SovereignShell, {
     // ---- right: who is here ------------------------------------------
     const actions = document.createElement("div");
     actions.className = "shell-actions";
+
+    // An application's own header controls go here rather than beside the
+    // shell, so the bar has one owner and one order everywhere.
+    const appActions = document.createElement("div");
+    appActions.className = "shell-app-actions";
+    appActions.id = "shellAppActions";
 
     const connection = document.createElement("button");
     connection.type = "button";
@@ -772,15 +808,25 @@ Object.assign(SovereignShell, {
     avatar.title = "Edit your profile";
     avatar.onclick = () => this.openProfile();
 
-    actions.append(connection, avatar);
+    actions.append(appActions, connection, avatar);
     container.append(left, middle, actions);
     return nav;
   },
 
-  // The application slot is gone from the header; an application that needs
-  // its own control puts it in the topic region beside the switcher.
-  slot() {
-    return document.getElementById("shellTopicRegion");
+  // The topic region and the application-actions slot are the two places an
+  // application puts its own controls. Everything else in the bar is Core's.
+  setTopicRegion(node) {
+    const region = document.getElementById("shellTopicRegion");
+    if (!region) return;
+    region.replaceChildren();
+    if (node) region.append(node);
+  },
+
+  setAppActions(...nodes) {
+    const region = document.getElementById("shellAppActions");
+    if (!region) return;
+    region.replaceChildren();
+    for (const node of nodes) if (node) region.append(node);
   },
 
   // The topic region belongs to the application until Core owns selection.
@@ -1078,6 +1124,7 @@ Object.assign(SovereignShell, {
     const overlay = document.getElementById("shellCollabOverlay");
     if (pane) pane.hidden = true;
     if (overlay) overlay.hidden = true;
+    document.body.classList.remove("shell-pane-open");
   },
 
   _agendaRoutes() {
@@ -1246,5 +1293,7 @@ Object.assign(SovereignShell, {
 
     document.getElementById("shellCollabOverlay").hidden = false;
     document.getElementById("shellCollabPane").hidden = false;
+    // The page insets beside the pane instead of being covered by it.
+    document.body.classList.add("shell-pane-open");
   },
 });

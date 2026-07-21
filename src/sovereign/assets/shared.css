@@ -180,12 +180,15 @@ dialog menu .danger:not(:last-child) {
   --shell-accent: #2f6feb;
   --shell-danger: #b91c1c;
 }
+/* Three real columns, not a flex row. With flex the middle drifted wherever
+   the left column's width put it; a 1fr auto 1fr grid centres the middle
+   against the viewport regardless of what the sides hold. */
 .shell-bar {
-  display: flex;
+  display: grid;
+  grid-template-columns: 1fr auto 1fr;
   align-items: center;
-  justify-content: space-between;
   gap: 12px;
-  flex-wrap: wrap;
+  width: 100%;
 }
 .shell-nav {
   display: flex;
@@ -301,12 +304,8 @@ dialog menu .danger:not(:last-child) {
   gap: 8px;
   min-width: 0;
 }
-.shell-left {
-  flex: 1 1 auto;
-}
-.shell-middle {
-  flex: 0 0 auto;
-}
+.shell-left { justify-self: start; }
+.shell-middle { justify-self: center; }
 .shell-topic {
   display: flex;
   align-items: center;
@@ -365,8 +364,12 @@ dialog menu .danger:not(:last-child) {
   flex: 0 0 auto;
 }
 .shell-actions {
-  flex: 0 0 auto;
-  margin-left: auto;
+  justify-self: end;
+}
+.shell-app-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
 }
 .shell-disagreement-btn {
   padding: 6px 10px;
@@ -615,4 +618,32 @@ dialog menu .danger:not(:last-child) {
   gap: 6px;
   font-size: 12px;
   color: var(--shell-muted, #9aa4b2);
+}
+
+/* [hidden] is a UA rule of the lowest priority, so a class that sets display
+   silently defeats it - which is why the pane's close button appeared to do
+   nothing. State the hidden case explicitly. */
+.shell-pane[hidden],
+.shell-pane-overlay[hidden] {
+  display: none;
+}
+
+/* The pane insets the page rather than covering it, and the page slides
+   rather than jumping, so what you were reading stays readable beside it. */
+body {
+  transition: padding-left 0.18s ease;
+}
+/* A plain length, not min(): a transitioned property cannot interpolate to
+   a min() value, so the padding never actually moved off zero. */
+body.shell-pane-open {
+  padding-left: 380px;
+}
+@media (max-width: 420px) {
+  body.shell-pane-open { padding-left: 92vw; }
+}
+.shell-pane {
+  transition: transform 0.18s ease;
+}
+@media (prefers-reduced-motion: reduce) {
+  body, .shell-pane { transition: none; }
 }
