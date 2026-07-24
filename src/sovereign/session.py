@@ -42,6 +42,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable
 
+from .blob_store import avatar_attachment
 from .protocol import (
     ProtocolNode, ProtocolState, collect_subtree_uuids,
     protocol_tree_envelope, stable_hash,
@@ -1925,6 +1926,38 @@ class Session:
         if node is None or node.data.get("type") != "agenda_item":
             return None
         return node
+
+    def known_identities(self) -> list[dict]:
+        """Every identity this session can currently put a name and picture to.
+
+        Agenda authorship, and anything else that names a participant by
+        identity uuid rather than peer address, needs this to render
+        generically - identity is Core's, not an application's, and an
+        application without a richer user model of its own still needs to
+        show *some* name for "who wrote this".
+        """
+        def describe(uuid: str, data: dict, address: str) -> dict:
+            attachment = avatar_attachment(data)
+            return {
+                "uuid": uuid,
+                "address": address,
+                "name": data.get("display_name") or "",
+                "picture": (
+                    f"/api/blob/{attachment['blob_id']}" if attachment
+                    else data.get("picture") or ""
+                ),
+            }
+
+        out = [describe(self.identity.uuid, self.identity.data, self.address)]
+        seen = {self.identity.uuid}
+        addrs = (self.members | set(self.peer_perspectives)) - {self.address}
+        for addr in sorted(addrs):
+            profile = self.peer_identity(addr)
+            if not profile or profile.uuid in seen:
+                continue
+            seen.add(profile.uuid)
+            out.append(describe(profile.uuid, profile.data, addr))
+        return out
 
     def reaction_for_event(self, event: dict) -> str:
         """Which reaction resolves this transition: "adopt" or "rollback".

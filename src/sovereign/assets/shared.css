@@ -525,7 +525,6 @@ dialog menu .danger:not(:last-child) {
 .shell-pane {
   position: fixed;
   top: 0;
-  left: 0;
   bottom: 0;
   width: min(380px, 92vw);
   z-index: 901;
@@ -535,13 +534,23 @@ dialog menu .danger:not(:last-child) {
   overflow-y: auto;
   background: var(--shell-surface, #161b22);
   color: var(--shell-text, #e6edf3);
-  border-right: 1px solid var(--shell-border, #30363d);
   font: 14px system-ui, sans-serif;
   --shell-surface: #161b22;
   --shell-field: #0d1117;
   --shell-text: #e6edf3;
   --shell-muted: #9aa4b2;
   --shell-border: #30363d;
+}
+/* Collaboration opens on the left (it is about this topic's content),
+   connections on the right (it is about who this topic reaches) - the same
+   sides as the header buttons that open them. */
+.shell-pane-left {
+  left: 0;
+  border-right: 1px solid var(--shell-border, #30363d);
+}
+.shell-pane-right {
+  right: 0;
+  border-left: 1px solid var(--shell-border, #30363d);
 }
 .shell-pane-header {
   display: flex;
@@ -597,7 +606,7 @@ dialog menu .danger:not(:last-child) {
 }
 .shell-agenda-item {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: 1fr auto;
   gap: 6px;
   align-items: center;
   padding: 7px 9px;
@@ -609,7 +618,35 @@ dialog menu .danger:not(:last-child) {
 .shell-agenda-item[data-priority="medium"] { border-left-color: #fbbf24; }
 .shell-agenda-item[data-priority="low"] { border-left-color: #60a5fa; }
 .shell-agenda-text { min-width: 0; overflow-wrap: anywhere; }
+.shell-agenda-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
 .shell-agenda-delete { color: #f87171; }
+/* Priority and delete stay out of the way until the row is hovered or the
+   controls are focused, so a settled agenda reads as a plain list. */
+.shell-agenda-hover {
+  opacity: 0;
+  transition: opacity 0.12s ease;
+}
+.shell-agenda-item:hover .shell-agenda-hover,
+.shell-agenda-hover:focus,
+.shell-agenda-hover:focus-visible {
+  opacity: 1;
+}
+.shell-peer-avatar {
+  width: 26px;
+  height: 26px;
+  border-radius: 50%;
+  display: inline-grid;
+  place-items: center;
+  background: #073b71 center / cover no-repeat;
+  color: #9dccff;
+  font-size: 11px;
+  font-weight: 700;
+  flex: 0 0 auto;
+}
 .shell-pane .shell-disagreement-list { max-height: none; }
 
 .shell-setting {
@@ -620,6 +657,56 @@ dialog menu .danger:not(:last-child) {
   color: var(--shell-muted, #9aa4b2);
 }
 
+/* Connections pane. Peers at the top, then adoption, then the connection
+   list with connect/disconnect, then + Add connection at the bottom. */
+.shell-peers-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.shell-peer-row {
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 8px;
+  align-items: center;
+}
+.shell-peer-name { min-width: 0; overflow-wrap: anywhere; }
+.shell-peer-status { text-align: right; white-space: nowrap; }
+.shell-target-name { min-width: 0; overflow-wrap: anywhere; }
+.shell-target-status {
+  font-size: 12px;
+  color: var(--shell-muted, #9aa4b2);
+  white-space: nowrap;
+}
+.shell-target-status.is-connected { color: #4ade80; }
+.shell-target-manage {
+  color: var(--shell-text, #e6edf3);
+  min-width: 30px;
+  min-height: 30px;
+}
+.shell-link-btn {
+  align-self: flex-start;
+  background: none !important;
+  border: none !important;
+  color: var(--shell-accent, #2f6feb) !important;
+  padding: 2px 0 !important;
+  cursor: pointer;
+}
+.shell-target-menu {
+  display: flex;
+  gap: 6px;
+  padding: 6px;
+  margin-top: -2px;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.06);
+}
+.shell-target-menu button { font-size: 12px; padding: 4px 8px; }
+.shell-target-menu button.danger {
+  background: var(--shell-danger, #b91c1c);
+  border-color: var(--shell-danger, #b91c1c);
+  color: #fff;
+}
+
 /* [hidden] is a UA rule of the lowest priority, so a class that sets display
    silently defeats it - which is why the pane's close button appeared to do
    nothing. State the hidden case explicitly. */
@@ -628,22 +715,19 @@ dialog menu .danger:not(:last-child) {
   display: none;
 }
 
-/* The pane insets the page rather than covering it, and the page slides
-   rather than jumping, so what you were reading stays readable beside it. */
+/* Each pane insets the page from its own side rather than covering it, so
+   what you were reading stays readable beside it. A plain length, not min():
+   a transitioned property cannot interpolate to a min() value, so the padding
+   would never actually move off zero. */
 body {
-  transition: padding-left 0.18s ease;
+  transition: padding-left 0.18s ease, padding-right 0.18s ease;
 }
-/* A plain length, not min(): a transitioned property cannot interpolate to
-   a min() value, so the padding never actually moved off zero. */
-body.shell-pane-open {
-  padding-left: 380px;
-}
+body.shell-pane-open-left { padding-left: 380px; }
+body.shell-pane-open-right { padding-right: 380px; }
 @media (max-width: 420px) {
-  body.shell-pane-open { padding-left: 92vw; }
-}
-.shell-pane {
-  transition: transform 0.18s ease;
+  body.shell-pane-open-left { padding-left: 92vw; }
+  body.shell-pane-open-right { padding-right: 92vw; }
 }
 @media (prefers-reduced-motion: reduce) {
-  body, .shell-pane { transition: none; }
+  body { transition: none; }
 }
