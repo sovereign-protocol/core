@@ -14,7 +14,8 @@ Offered API:
   leave()
   get_network_info()
   peer_discusses_node(peer_addr, node_uuid)
-  accept_peer_node(peer_addr, node_uuid, adopt_absence=False)
+  accept_peer_node(peer_addr, node_uuid, adopt_absence=False,
+                   adopt_descendants=True)
   reconcile_peer_changes(peer_addr, topic_uuid, node_is_eligible=None)
     Generic peer-content reconciliation (the "adopt incoming changes"
     mechanism): walks a peer's transitions for one topic and adopts each
@@ -179,6 +180,10 @@ class Session:
         self.trace = trace or TraceLogger.disabled()
         self._protocol = ProtocolState(author=address)
         self.protocol = ReadOnlyProtocolView(self._protocol, self.lock)
+        # Persisted origin-local logical clock. Every local protocol mutation
+        # receives a larger value; adopted/forwarded revisions preserve the
+        # originator's value instead of consuming this counter.
+        self.local_revision_seq = 0
         self.members: set[str] = {address}
         self.peer_topics: dict[str, str] = {}
         self.peer_topic_sets: dict[str, set[str]] = {}
@@ -454,6 +459,12 @@ class Session:
         if (data or {}).get("type") == "shared_user_profile":
             return (data or {}).get("identity_key")
         return None
+
+    def _next_local_revision_seq(self, origin: str | None) -> int:
+        if not origin:
+            return 0
+        self.local_revision_seq += 1
+        return self.local_revision_seq
 
     def apply_peer_identity_snapshot(self, peer_addr: str, identity: dict) -> None:
         # A connect token carries the sender's identity inline so it's
@@ -809,11 +820,11 @@ class Session:
         # content_hash is this node's OWN version (no descendants), so a
         # descendant change never re-revisions an ancestor - observation stays
         # aligned with classification (both key on content_hash). parent_uuid
-        # makes moves independently acknowledgeable; origin distinguishes
-        # identical content independently authored by two clients.
+        # makes moves independently acknowledgeable; origin and sequence
+        # distinguish independently authored and successive revisions.
         return (
             f"{node.content_hash}@{node.parent_uuid or ''}"
-            f"@{node.revision_origin or ''}"
+            f"@{node.revision_origin or ''}@{node.revision_seq}"
         )
 
     @classmethod
@@ -1075,6 +1086,7 @@ class Session:
         target.base_parent_uuid = subtree.base_parent_uuid
         target.deleted = subtree.deleted
         target.revision_origin = subtree.revision_origin
+        target.revision_seq = subtree.revision_seq
         target.weights = subtree.weights
         target.data = subtree.data
         target.children = subtree.children
@@ -1190,8 +1202,9 @@ class Session:
             if profile_error:
                 return SessionResult("error", reason=profile_error)
         revision_origin = self._local_revision_origin(data)
+        revision_seq = self._next_local_revision_seq(revision_origin)
         result = self._protocol.create_child(
-            parent_uuid, data, weights, revision_origin,
+            parent_uuid, data, weights, revision_origin, revision_seq,
         )
         if not result.ok:
             return SessionResult("error", reason=result.reason)
@@ -1203,6 +1216,7 @@ class Session:
             node_type=child.data.get("type"),
             state_hash=child.state_hash,
             revision_origin=child.revision_origin,
+            revision_seq=child.revision_seq,
         )
         return SessionResult("ok", value=self._snapshot_node(child),
                              effects=self.sync_effects(parent_uuid))
@@ -1223,8 +1237,9 @@ class Session:
             if revision_origin is _LOCAL_REVISION_ORIGIN
             else revision_origin
         )
+        revision_seq = self._next_local_revision_seq(origin)
         result = self._protocol.modify(
-            node_uuid, data, weights, origin,
+            node_uuid, data, weights, origin, revision_seq,
         )
         after = self._protocol.index.get(node_uuid)
         self.trace_event(
@@ -1235,6 +1250,7 @@ class Session:
             revision_origin=(
                 after.revision_origin if after else None
             ),
+            revision_seq=after.revision_seq if after else None,
             ok=result.ok,
             reason=result.reason,
         )
@@ -1245,9 +1261,9 @@ class Session:
         node = self._protocol.index.get(node_uuid)
         parent_uuid = node.parent_uuid if node else None
         old_state_hash = node.state_hash if node else None
-        result = self._protocol.delete(
-            node_uuid, self._local_revision_origin(),
-        )
+        origin = self._local_revision_origin()
+        revision_seq = self._next_local_revision_seq(origin)
+        result = self._protocol.delete(node_uuid, origin, revision_seq)
         if result.ok:
             self.prune_deleted_nodes()
         self.trace_event(
@@ -1262,8 +1278,10 @@ class Session:
 
     @_session_locked
     def copy(self, source_uuid: str, destination_uuid: str) -> SessionResult:
+        origin = self._local_revision_origin()
+        revision_seq = self._next_local_revision_seq(origin)
         result = self._protocol.copy(
-            source_uuid, destination_uuid, self._local_revision_origin(),
+            source_uuid, destination_uuid, origin, revision_seq,
         )
         if not result.ok:
             return SessionResult("error", reason=result.reason)
@@ -1273,8 +1291,10 @@ class Session:
 
     @_session_locked
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
+        origin = self._local_revision_origin()
+        revision_seq = self._next_local_revision_seq(origin)
         result = self._protocol.move(
-            source_uuid, destination_uuid, self._local_revision_origin(),
+            source_uuid, destination_uuid, origin, revision_seq,
         )
         return self._operation_result(result, source_uuid)
 
@@ -1284,9 +1304,11 @@ class Session:
         node = self._protocol.index.get(source_uuid)
         old_parent_uuid = node.parent_uuid if node else None
         old_state_hash = node.state_hash if node else None
+        origin = self._local_revision_origin()
+        revision_seq = self._next_local_revision_seq(origin)
         result = self._protocol.move_child(
             source_uuid, destination_uuid, index,
-            self._local_revision_origin(),
+            origin, revision_seq,
         )
         moved = self._protocol.index.get(source_uuid)
         self.trace_event(
@@ -1297,6 +1319,8 @@ class Session:
             index=index,
             old_state_hash=old_state_hash,
             state_hash=moved.state_hash if moved else None,
+            revision_origin=moved.revision_origin if moved else None,
+            revision_seq=moved.revision_seq if moved else None,
             ok=result.ok,
             reason=result.reason,
         )
@@ -1333,8 +1357,13 @@ class Session:
                              effects=self.sync_effects(adopted.uuid))
 
     @_session_locked
-    def accept_peer_node(self, peer_addr: str, node_uuid: str,
-                         adopt_absence: bool = False) -> SessionResult:
+    def accept_peer_node(
+        self,
+        peer_addr: str,
+        node_uuid: str,
+        adopt_absence: bool = False,
+        adopt_descendants: bool = True,
+    ) -> SessionResult:
         if adopt_absence:
             return self.delete(node_uuid)
         peer = self.get_cached_peer_subtree(peer_addr, node_uuid)
@@ -1361,11 +1390,21 @@ class Session:
                 reason=result.reason,
             )
             return self._operation_result(result, node_uuid)
-        # Brand-new node the peer has and we don't: graft the whole subtree.
+        # Brand-new node the peer has and we don't: normally graft the whole
+        # subtree. Applications with descendant-specific policy may first
+        # adopt only the missing container, then reconcile its children as
+        # independent decisions.
         parent_uuid = peer.parent_uuid if peer.parent_uuid in self._protocol.index else None
         if not parent_uuid or parent_uuid not in self._protocol.index:
             return SessionResult("error", reason="local parent not found")
-        return self.adopt_subtree(peer, parent_uuid, remove_descendant_duplicates=True)
+        adopted = peer
+        if not adopt_descendants:
+            adopted = copy.deepcopy(peer)
+            adopted.children = []
+            adopted.refresh_hashes()
+        return self.adopt_subtree(
+            adopted, parent_uuid, remove_descendant_duplicates=True,
+        )
 
     def validate_rollback_target(self, peer_addr: str,
                                  node_uuid: str,
@@ -1578,8 +1617,11 @@ class Session:
         return SessionResult("ok", value=True,
                              effects=self.sync_effects(changed_uuid))
 
-    def trace_event(self, kind: str, **fields: Any) -> None:
-        self.trace.event(kind, **fields)
+    def trace_event(self, kind: str, *, trace_level: str = "events",
+                    **fields: Any) -> None:
+        self.trace.event(
+            kind, required_level=trace_level, **fields,
+        )
 
     def sync_summary(self, peer_addr: str) -> dict[str, Any]:
         topics = {}
@@ -1863,22 +1905,78 @@ class Session:
     # root. Only the originator may edit or remove their own item; everyone
     # sees the merged list.
     AGENDA_PRIORITIES = ("high", "medium", "low")
-    AGENDA_PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
-
-    def agenda_items(self, topic_uuid: str) -> list[ProtocolNode]:
-        topic = self._protocol.index.get(topic_uuid)
-        if topic is None:
+    # Fractional-order reordering, generic over node type. A moved node gets an
+    # "order" value midway between its new neighbours, so a single sibling
+    # moves without renumbering the rest. Nodes without an explicit order fall
+    # back to their creation position, so the scheme works before anything has
+    # ever been moved. Agenda items, agreement sections, and agreement clauses
+    # all share this.
+    def _ordered_children(self, parent_uuid: str, node_type: str) -> list[ProtocolNode]:
+        parent = self._protocol.index.get(parent_uuid)
+        if parent is None:
             return []
-        return sorted(
+        items = sorted(
             [
-                child for child in topic.live_children()
-                if child.data.get("type") == "agenda_item"
+                child for child in parent.live_children()
+                if child.data.get("type") == node_type
             ],
+            key=lambda node: node.created_at,
+        )
+        creation_index = {node.uuid: index for index, node in enumerate(items)}
+        return sorted(
+            items,
             key=lambda node: (
-                -self.AGENDA_PRIORITY_RANK.get(node.data.get("priority"), 0),
+                self._child_order(node, creation_index[node.uuid]),
                 node.created_at,
             ),
         )
+
+    @staticmethod
+    def _child_order(node: ProtocolNode, fallback: float) -> float:
+        value = node.data.get("order")
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+        return fallback
+
+    def next_child_order(self, parent_uuid: str, node_type: str) -> float:
+        """The order value that appends a new child after every existing one."""
+        existing = self._ordered_children(parent_uuid, node_type)
+        if not existing:
+            return 0.0
+        return max(
+            self._child_order(node, index)
+            for index, node in enumerate(existing)
+        ) + 1.0
+
+    def move_child_to_index(self, node_uuid: str, index: int) -> SessionResult:
+        node = self._protocol.index.get(node_uuid)
+        if node is None:
+            return SessionResult("error", reason="node not found")
+        ordered = self._ordered_children(
+            node.parent_uuid, node.data.get("type"),
+        )
+        effective_order = {
+            item.uuid: self._child_order(item, position)
+            for position, item in enumerate(ordered)
+        }
+        siblings = [item for item in ordered if item.uuid != node.uuid]
+        bounded = max(0, min(int(index), len(siblings)))
+        low = effective_order[siblings[bounded - 1].uuid] if bounded > 0 else None
+        high = effective_order[siblings[bounded].uuid] if bounded < len(siblings) else None
+        if low is None and high is None:
+            order = 0.0
+        elif low is None:
+            order = high - 1.0
+        elif high is None:
+            order = low + 1.0
+        else:
+            order = (low + high) / 2.0
+        data = dict(node.data)
+        data["order"] = order
+        return self.modify(node.uuid, data, node.weights)
+
+    def agenda_items(self, topic_uuid: str) -> list[ProtocolNode]:
+        return self._ordered_children(topic_uuid, "agenda_item")
 
     def create_agenda_item(self, topic_uuid: str, text: str,
                            priority: str | None = None) -> SessionResult:
@@ -1894,6 +1992,7 @@ class Session:
                 "text": normalized,
                 "priority": priority if priority in self.AGENDA_PRIORITIES else None,
                 "author": self.identity.uuid,
+                "order": self.next_child_order(topic_uuid, "agenda_item"),
             },
             {},
         )
@@ -1920,6 +2019,11 @@ class Session:
         data = dict(item.data)
         data["priority"] = priority if priority in self.AGENDA_PRIORITIES else None
         return self.modify(item.uuid, data, item.weights)
+
+    def move_agenda_item(self, item_uuid: str, index: int) -> SessionResult:
+        if self._agenda_item(item_uuid) is None:
+            return SessionResult("error", reason="agenda item not found")
+        return self.move_child_to_index(item_uuid, index)
 
     def _agenda_item(self, item_uuid: str) -> ProtocolNode | None:
         node = self._protocol.index.get(item_uuid)
@@ -1998,11 +2102,38 @@ class Session:
     }
 
     @staticmethod
+    def _same_origin_sequence_order(local_node: ProtocolNode,
+                                    peer_node: ProtocolNode) -> str | None:
+        """Order two different revisions authored by the same identity.
+
+        Positive logical sequences are authoritative. Sequence zero is the
+        migration value for protocol-v1 nodes, so callers may continue into
+        the legacy base/timestamp classifier only for that case.
+        """
+        origin = local_node.revision_origin
+        if not origin or origin != peer_node.revision_origin:
+            return None
+        if local_node.revision_seq > peer_node.revision_seq:
+            return "local_made_changes"
+        if peer_node.revision_seq > local_node.revision_seq:
+            return "peer_made_changes"
+        if local_node.revision_seq > 0:
+            # One origin/sequence cannot legitimately describe two different
+            # semantic revisions.
+            return "divergence"
+        return None
+
+    @staticmethod
     def _classify_content(local_node: ProtocolNode, peer_node: ProtocolNode,
                           local_identity: str | None = None,
                           peer_identity: str | None = None) -> str:
         if local_node.content_hash == peer_node.content_hash:
             return "in_agreement"
+        sequence_order = Session._same_origin_sequence_order(
+            local_node, peer_node,
+        )
+        if sequence_order:
+            return sequence_order
         if peer_node.content_hash == local_node.base_hash:
             return "local_made_changes"
         if local_node.content_hash == peer_node.base_hash:
@@ -2030,6 +2161,11 @@ class Session:
                        peer_identity: str | None = None) -> str:
         if local_node.parent_uuid == peer_node.parent_uuid:
             return "in_agreement"
+        sequence_order = Session._same_origin_sequence_order(
+            local_node, peer_node,
+        )
+        if sequence_order:
+            return sequence_order
         peer_moved_from_local = local_node.parent_uuid == peer_node.base_parent_uuid
         local_moved_from_peer = peer_node.parent_uuid == local_node.base_parent_uuid
         if peer_moved_from_local and local_moved_from_peer:
@@ -2099,6 +2235,12 @@ class Session:
             "peer_state_hash": peer_node.state_hash if peer_node else None,
             "local_base_hash": local_node.base_hash if local_node else None,
             "peer_base_hash": peer_node.base_hash if peer_node else None,
+            "local_revision_seq": (
+                local_node.revision_seq if local_node else None
+            ),
+            "peer_revision_seq": (
+                peer_node.revision_seq if peer_node else None
+            ),
             "local_revision": (
                 Session.node_revision(local_node) if local_node else None
             ),

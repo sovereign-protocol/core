@@ -172,6 +172,50 @@ class AgreementLogicTests(unittest.TestCase):
         # A section uuid is not an agreement uuid; the type guard must hold.
         self.assertEqual(runtime.logic.rename_agreement(section_uuid, "Nope").status, "error")
 
+    def test_sections_and_clauses_can_be_reordered(self):
+        runtime = self.runtime(9414)
+        agreement_uuid = runtime.logic.create_agreement("Terms").value
+        first = runtime.logic.create_section(agreement_uuid, "First").value
+        second = runtime.logic.create_section(agreement_uuid, "Second").value
+        third = runtime.logic.create_section(agreement_uuid, "Third").value
+
+        def section_titles():
+            payload = runtime.logic.document_payload(agreement_uuid)
+            live = [s for s in payload["agreement"]["children"] if not s["deleted"]]
+            ordered = sorted(live, key=lambda s: s["data"].get("order", 0))
+            return [s["data"]["title"] for s in ordered]
+
+        self.assertEqual(section_titles(), ["First", "Second", "Third"])
+        # Move "Third" to the front.
+        self.assertEqual(runtime.logic.move_section(third, 0).status, "ok")
+        self.assertEqual(section_titles(), ["Third", "First", "Second"])
+        # Move "Third" back down one.
+        self.assertEqual(runtime.logic.move_section(third, 1).status, "ok")
+        self.assertEqual(section_titles(), ["First", "Third", "Second"])
+
+        a = runtime.logic.create_clause(first, "Clause A").value
+        b = runtime.logic.create_clause(first, "Clause B").value
+
+        def clause_texts():
+            payload = runtime.logic.document_payload(agreement_uuid)
+            section = next(s for s in payload["agreement"]["children"] if s["uuid"] == first)
+            live = [c for c in section["children"] if not c["deleted"]]
+            ordered = sorted(live, key=lambda c: c["data"].get("order", 0))
+            return [c["data"]["text"] for c in ordered]
+
+        self.assertEqual(clause_texts(), ["Clause A", "Clause B"])
+        self.assertEqual(runtime.logic.move_clause(b, 0).status, "ok")
+        self.assertEqual(clause_texts(), ["Clause B", "Clause A"])
+
+    def test_move_rejects_wrong_node_types(self):
+        runtime = self.runtime(9415)
+        agreement_uuid = runtime.logic.create_agreement("Terms").value
+        section_uuid = runtime.logic.create_section(agreement_uuid, "S").value
+        clause_uuid = runtime.logic.create_clause(section_uuid, "C").value
+        # A clause is not a section and vice versa; the guards must hold.
+        self.assertEqual(runtime.logic.move_section(clause_uuid, 0).status, "error")
+        self.assertEqual(runtime.logic.move_clause(section_uuid, 0).status, "error")
+
     def test_deleting_a_section_removes_its_clauses(self):
         runtime = self.runtime(9405)
         agreement_uuid = runtime.logic.create_agreement("Draft").value
