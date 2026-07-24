@@ -1493,6 +1493,15 @@ class RelayManager:
             )
         return SessionResult("ok")
 
+    def verify_target_values(self, values: dict) -> SessionResult:
+        """Check that a target's entered values reach a working relay, without
+        persisting it - the "Test" button before a target is saved."""
+        prepared = self._descriptor_from_target_values(values)
+        if prepared.status != "ok":
+            return prepared
+        _descriptor, storage = prepared.value
+        return self._verify_target_storage(storage)
+
     def create_target(self, values: dict, verify: bool = True) -> SessionResult:
         prepared = self._descriptor_from_target_values(values)
         if prepared.status != "ok":

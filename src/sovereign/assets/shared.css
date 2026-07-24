@@ -268,7 +268,7 @@ dialog menu .danger:not(:last-child) {
 }
 .shell-target-row {
   display: grid;
-  grid-template-columns: 1fr auto auto auto auto;
+  grid-template-columns: 1fr auto auto;
   gap: 8px;
   align-items: center;
 }
@@ -287,6 +287,11 @@ dialog menu .danger:not(:last-child) {
 }
 .shell-target-form input {
   min-width: 0;
+}
+/* The help text and the Test/Save/Cancel row span both grid columns instead
+   of being squeezed into one. */
+.shell-target-form-full {
+  grid-column: 1 / -1;
 }
 .shell-panel menu {
   display: flex;

@@ -42,6 +42,17 @@ def build_routes(channel, runtime) -> list[Route]:
         runtime.notify_change("mailbox-target")
         return JSONResponse({"status": "ok", "target_id": result.value})
 
+    async def api_test_target_values(request: Request):
+        # Verify entered values without saving - the "Test" button on the
+        # target form, before the target exists in the registry.
+        data = await request.json()
+        result = await asyncio.to_thread(logic.verify_target_values, data)
+        status = 200 if result.status == "ok" else 409
+        return JSONResponse(
+            {"status": result.status, "reason": result.reason},
+            status_code=status,
+        )
+
     async def api_test_target(request: Request):
         data = await request.json()
         target_id = data.get("target_id", "")
@@ -84,6 +95,7 @@ def build_routes(channel, runtime) -> list[Route]:
         Route(f"{prefix}/blob-gc", api_blob_gc),
         Route(f"{prefix}/targets", api_targets, methods=["GET", "POST"]),
         Route(f"{prefix}/targets/test", api_test_target, methods=["POST"]),
+        Route(f"{prefix}/targets/test-values", api_test_target_values, methods=["POST"]),
         Route(f"{prefix}/targets/delete", api_delete_target, methods=["POST"]),
         Route(f"{prefix}/topics/assign", api_assign_topic, methods=["POST"]),
     ]

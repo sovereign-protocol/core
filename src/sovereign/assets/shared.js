@@ -944,7 +944,6 @@ Object.assign(SovereignShell, {
   _connReady: false,
   _panelTopic: "",
   _panelAssignedTarget: "",
-  _editingTargetId: "",
 
   _topic() {
     if (this._panelTopic) return this._panelTopic;
@@ -966,6 +965,10 @@ Object.assign(SovereignShell, {
       '<div id="shellPeersList" class="shell-peers-list"></div>',
       "</div>",
       '<div class="shell-pane-section" id="shellConnAutoAdopt"></div>',
+      // Application actions (e.g. "stop discussing") sit right under the
+      // adoption control - they are about this topic, not about the relay
+      // endpoints listed below.
+      '<div id="shellConnExtras" class="shell-pane-section"></div>',
       '<div class="shell-pane-section">',
       "<h3>Available connections</h3>",
       '<div id="shellConnTargetList" class="shell-target-list"></div>',
@@ -979,15 +982,15 @@ Object.assign(SovereignShell, {
       '<input id="shellTargetPassword" type="password" placeholder="Password (optional)">',
       '<input id="shellTargetRoot" placeholder="Remote path" value="/">',
       '<input id="shellTargetPoll" type="number" value="3" min="1" max="300" title="Poll every (seconds)">',
-      '<div class="shell-row">',
-      '<button type="button" id="shellSaveTargetBtn">Test &amp; save</button>',
+      '<p class="shell-note shell-target-form-full">Leave the password blank to use key authentication or your SSH agent. A password entered here is stored in this client&#39;s local session data.</p>',
+      '<div class="shell-row shell-target-form-full">',
+      '<button type="button" id="shellTestTargetBtn">Test</button>',
+      '<button type="button" id="shellSaveTargetBtn" class="primary">Save</button>',
       '<button type="button" id="shellCancelTargetBtn">Cancel</button>',
       "</div>",
-      '<p class="shell-note">Leave the password blank to use key authentication or your SSH agent. A password entered here is stored in this client&#39;s local session data.</p>',
       "</fieldset>",
       '<p id="shellTargetsNote" class="shell-note"></p>',
       "</div>",
-      '<div id="shellConnExtras" class="shell-pane-section"></div>',
       '<div class="shell-pane-section">',
       '<button type="button" id="shellAddConnectionBtn" class="primary">+ Add connection</button>',
       '<p id="shellConnNote" class="shell-note"></p>',
@@ -1010,6 +1013,7 @@ Object.assign(SovereignShell, {
     document.getElementById("shellConnOverlay").onclick = () => this.closeConnections();
     document.getElementById("shellNewTargetBtn").onclick = () => this._toggleTargetForm(true);
     document.getElementById("shellCancelTargetBtn").onclick = () => this._toggleTargetForm(false);
+    document.getElementById("shellTestTargetBtn").onclick = () => this._testFormTarget();
     document.getElementById("shellSaveTargetBtn").onclick = () => this._saveTarget();
     document.getElementById("shellAddConnectionBtn").onclick = () => {
       document.getElementById("shellTokenNote").textContent = "";
@@ -1137,33 +1141,40 @@ Object.assign(SovereignShell, {
     }
   },
 
-  async _assignTarget(targetId) {
-    const topic = this._topic();
-    if (!topic) return;
+  // Assignment is implicit: a share token routes through an available relay
+  // so a peer can sync while offline, and sharing the topic through that
+  // relay is what assigns it - there is no separate "connect" step.
+  async _ensureTopicTarget(topic) {
+    if (this._panelAssignedTarget) return this._panelAssignedTarget;
+    let targets = [];
     try {
-      await this._post("/api/channels/mailbox/topics/assign", {
-        topic_uuid: topic,
-        target_id: targetId || null,
-      });
-      this._panelAssignedTarget = targetId || "";
-      this._renderConnTargets();
-      await this._changed();
+      targets = (await (await fetch("/api/channels/mailbox/targets")).json()).targets || [];
     } catch (error) {
-      this._note("shellConnNote", error.message);
+      return "";
     }
+    if (!targets.length) return "";
+    const targetId = targets[0].id;
+    await this._post("/api/channels/mailbox/topics/assign", {
+      topic_uuid: topic, target_id: targetId,
+    });
+    this._panelAssignedTarget = targetId;
+    await this._changed();
+    return targetId;
   },
 
   async _copyToken() {
     const topic = this._topic();
     if (!topic) return;
     try {
+      const targetId = await this._ensureTopicTarget(topic);
       const token = await this._post("/api/connect_token", {
         topic_uuids: [topic],
-        channel_options: this._panelAssignedTarget
-          ? { mailbox: { target_id: this._panelAssignedTarget } } : {},
+        channel_options: targetId ? { mailbox: { target_id: targetId } } : {},
       });
       await navigator.clipboard.writeText(btoa(JSON.stringify(token)));
-      this._note("shellTokenNote", "Token copied to the clipboard.");
+      this._note("shellTokenNote", targetId
+        ? "Token copied - it routes through your relay connection."
+        : "Token copied - direct connection only, no relay configured.");
     } catch (error) {
       this._note("shellTokenNote", error.message);
     }
@@ -1198,6 +1209,9 @@ Object.assign(SovereignShell, {
     }
   },
 
+  // Relay targets are "available connections" - endpoints a topic can be
+  // shared through. The actual connection is with peers (listed above), so a
+  // target's only action here is Discard: stop watching it, remove it.
   async _renderConnTargets() {
     const list = document.getElementById("shellConnTargetList");
     if (!list) return;
@@ -1207,133 +1221,58 @@ Object.assign(SovereignShell, {
       const response = await fetch("/api/channels/mailbox/targets");
       targets = (await response.json()).targets || [];
     } catch (error) {
-      this._note("shellTargetsNote", "Could not read relay targets.");
+      this._note("shellTargetsNote", "Could not read relay connections.");
       return;
     }
     if (!targets.length) {
       const empty = document.createElement("p");
       empty.className = "shell-note";
-      empty.textContent = "No connections configured yet.";
+      empty.textContent = "No relay connections yet.";
       list.append(empty);
       return;
     }
-    const topic = this._topic();
     for (const target of targets) {
       const row = document.createElement("div");
       row.className = "shell-target-row";
       const name = document.createElement("span");
       name.className = "shell-target-name";
       name.textContent = target.name;
-      const connected = target.id === this._panelAssignedTarget;
       const status = document.createElement("span");
       status.className = "shell-target-status";
-      const timing = target.timing || {};
-      status.textContent = connected
-        ? "Connected"
-        : (timing.roundtrip_ms == null ? "Not tested" : "Reachable");
-      status.classList.toggle("is-connected", connected);
-      const toggle = document.createElement("button");
-      toggle.type = "button";
-      toggle.textContent = connected ? "Disconnect" : "Connect";
-      toggle.disabled = !topic;
-      toggle.title = topic ? "" : "Select or create a topic first";
-      toggle.onclick = () => this._assignTarget(connected ? "" : target.id);
-      const manage = document.createElement("button");
-      manage.type = "button";
-      manage.className = "shell-target-manage icon-btn";
-      manage.title = "Test, edit, or delete " + target.name;
-      manage.setAttribute("aria-label", "Manage " + target.name);
-      manage.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
-        + ICON_SETTINGS + "</svg>";
-      manage.onclick = (event) => {
-        event.stopPropagation();
-        this._openTargetManage(target, manage);
-      };
-      row.append(name, status, toggle, manage);
-      list.append(row);
-    }
-  },
-
-  // Testing, editing, and deleting a target definition are rarer than
-  // connecting/disconnecting a topic from one, so they sit behind a small
-  // per-row menu instead of three permanent buttons on every row.
-  _closeTargetMenu() {
-    const open = document.querySelector(".shell-target-menu");
-    if (open) open.remove();
-  },
-
-  _openTargetManage(target, anchor) {
-    const already = document.querySelector(".shell-target-menu");
-    this._closeTargetMenu();
-    if (already && already.dataset.targetId === target.id) return;
-
-    const menu = document.createElement("div");
-    menu.className = "shell-target-menu";
-    menu.dataset.targetId = target.id;
-
-    const test = document.createElement("button");
-    test.type = "button";
-    test.textContent = "Test";
-    test.onclick = () => {
-      this._closeTargetMenu();
-      this._note("shellTargetsNote", "Testing " + target.name + "...");
-      this._post("/api/channels/mailbox/targets/test", { target_id: target.id })
-        .then(() => this._note("shellTargetsNote", target.name + " is reachable."))
-        .catch((error) => this._note("shellTargetsNote", target.name + ": " + error.message));
-    };
-    menu.append(test);
-
-    if (target.host) {
-      const edit = document.createElement("button");
-      edit.type = "button";
-      edit.textContent = "Edit";
-      edit.onclick = () => {
-        this._closeTargetMenu();
-        this._loadTargetIntoForm(target);
-      };
-      menu.append(edit);
-    }
-
-    const remove = document.createElement("button");
-    remove.type = "button";
-    remove.className = "danger";
-    remove.textContent = "Delete";
-    remove.onclick = () => {
-      this._closeTargetMenu();
-      confirmAction(
-        "Delete " + target.name + "?",
-        "Any topic connected through it will need a new connection.",
+      status.textContent = "Available";
+      const discard = document.createElement("button");
+      discard.type = "button";
+      discard.className = "danger";
+      discard.textContent = "Discard";
+      discard.title = "Stop using this connection and remove it";
+      discard.onclick = () => confirmAction(
+        "Discard " + target.name + "?",
+        "It is removed from your connections; any topic shared through it "
+          + "will need another.",
         async () => {
           try {
             await this._post("/api/channels/mailbox/targets/delete", { target_id: target.id });
+            if (this._panelAssignedTarget === target.id) this._panelAssignedTarget = "";
             await this._renderConnTargets();
-            this._note("shellTargetsNote", target.name + " deleted.");
+            this._note("shellTargetsNote", target.name + " discarded.");
             await this._changed();
           } catch (error) {
             this._note("shellTargetsNote", error.message);
           }
         },
       );
-    };
-    menu.append(remove);
-
-    anchor.insertAdjacentElement("afterend", menu);
-    // Close on the next click anywhere else, not this one - a listener
-    // bound during the very click that opened the menu would also catch
-    // that click's own bubble and close it immediately.
-    setTimeout(() => {
-      document.addEventListener("click", () => this._closeTargetMenu(), { once: true });
-    }, 0);
+      row.append(name, status, discard);
+      list.append(row);
+    }
   },
 
   _toggleTargetForm(show) {
     document.getElementById("shellTargetFieldset").hidden = !show;
+    document.getElementById("shellNewTargetBtn").hidden = !!show;
     if (show) this._resetTargetForm();
   },
 
   _resetTargetForm() {
-    this._editingTargetId = "";
-    document.getElementById("shellTargetFormTitle").textContent = "Add an SFTP target";
     const values = {
       shellTargetName: "", shellTargetHost: "", shellTargetPort: "22",
       shellTargetUser: "", shellTargetPassword: "", shellTargetRoot: "/",
@@ -1344,24 +1283,7 @@ Object.assign(SovereignShell, {
     }
   },
 
-  _loadTargetIntoForm(target) {
-    document.getElementById("shellTargetFieldset").hidden = false;
-    this._editingTargetId = target.id;
-    document.getElementById("shellTargetFormTitle").textContent =
-      "Edit " + target.name;
-    document.getElementById("shellTargetName").value = target.name || "";
-    document.getElementById("shellTargetHost").value = target.host || "";
-    document.getElementById("shellTargetPort").value = target.port || 22;
-    document.getElementById("shellTargetUser").value = target.username || "";
-    // The stored password is never sent back to the browser. Leaving this
-    // blank keeps whatever is already saved; typing replaces it.
-    document.getElementById("shellTargetPassword").value = "";
-    document.getElementById("shellTargetRoot").value = target.root || "/";
-    document.getElementById("shellTargetPoll").value =
-      target.poll_interval_seconds || 3;
-  },
-
-  async _saveTarget() {
+  _targetFormValues() {
     const password = document.getElementById("shellTargetPassword").value;
     const values = {
       name: document.getElementById("shellTargetName").value.trim(),
@@ -1374,20 +1296,36 @@ Object.assign(SovereignShell, {
         Number(document.getElementById("shellTargetPoll").value) || 3,
     };
     if (password) values.password = password;
-    if (this._editingTargetId) values.target_id = this._editingTargetId;
+    return values;
+  },
+
+  async _testFormTarget() {
+    const values = this._targetFormValues();
     if (!values.name || !values.host || !values.username) {
       this._note("shellTargetsNote", "Name, host, and username are required.");
       return;
     }
-    const editing = Boolean(this._editingTargetId);
+    this._note("shellTargetsNote", "Testing " + values.name + "...");
+    try {
+      await this._post("/api/channels/mailbox/targets/test-values", values);
+      this._note("shellTargetsNote", values.name + " is reachable.");
+    } catch (error) {
+      this._note("shellTargetsNote", values.name + ": " + error.message);
+    }
+  },
+
+  async _saveTarget() {
+    const values = this._targetFormValues();
+    if (!values.name || !values.host || !values.username) {
+      this._note("shellTargetsNote", "Name, host, and username are required.");
+      return;
+    }
     this._note("shellTargetsNote", "Verifying the target...");
     try {
       await this._post("/api/channels/mailbox/targets", values);
       this._toggleTargetForm(false);
       await this._renderConnTargets();
-      this._note(
-        "shellTargetsNote", values.name + (editing ? " saved." : " added."),
-      );
+      this._note("shellTargetsNote", values.name + " added.");
       await this._changed();
     } catch (error) {
       this._note("shellTargetsNote", error.message);
