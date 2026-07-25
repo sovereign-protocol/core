@@ -1,0 +1,52 @@
+name: Publish
+
+# Publishing is driven by a tag, so what reaches PyPI is always a commit that
+# already exists in public history rather than whatever a maintainer happened
+# to have in their working directory.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: {python-version: "3.12"}
+      - run: python -m pip install build twine
+      - run: python -m build
+      # A wheel that omits its licence payload must not reach an index: the
+      # LGPL travels with the artifact, not only with the repository.
+      - name: Verify licence payload and metadata
+        run: |
+          python -m twine check dist/*
+          python - <<'PY'
+          import pathlib, zipfile
+          wheel = next(pathlib.Path("dist").glob("*.whl"))
+          names = zipfile.ZipFile(wheel).namelist()
+          licences = [n for n in names if "licenses/" in n]
+          assert any(n.endswith("/LICENSE") for n in licences), names
+          assert any("GPL-3.0" in n for n in licences), licences
+          print(f"{wheel.name}: {len(licences)} licence file(s) packaged")
+          PY
+      - uses: actions/upload-artifact@v4
+        with: {name: distributions, path: dist/}
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # Named so the PyPI trusted publisher can be scoped to it, and so the
+    # environment's own protection rules gate the upload.
+    environment: pypi
+    permissions:
+      # Mints the short-lived OIDC token PyPI exchanges for upload rights.
+      # No API token exists to leak, rotate, or commit by accident.
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with: {name: distributions, path: dist/}
+      - uses: pypa/gh-action-pypi-publish@release/v1
