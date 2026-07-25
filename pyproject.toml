@@ -6,13 +6,37 @@ build-backend = "setuptools.build_meta"
 name = "sovereign-protocol"
 version = "0.1.0"
 description = "Application-neutral runtime for the Sovereign Protocol"
+readme = "README.md"
 requires-python = ">=3.10"
+license = "LGPL-3.0-or-later"
+license-files = ["LICENSE", "LICENSES/*"]
+keywords = ["local-first", "collaboration", "crdt-alternative", "protocol", "peer-to-peer"]
+classifiers = [
+  # 0.x promises no stable API or wire compatibility; say so where installers
+  # and package indexes can read it, not only in prose.
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.14",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Software Development :: Libraries :: Application Frameworks",
+  "Topic :: Communications",
+]
 dependencies = [
   "paramiko>=3.4,<6",
   "requests>=2.31,<3",
   "starlette>=0.37,<2",
   "uvicorn>=0.30,<1",
 ]
+
+# A package whose argument is auditability must say where its source is.
+[project.urls]
+Homepage = "https://github.com/sovereign-protocol/core"
+Source = "https://github.com/sovereign-protocol/core"
+Issues = "https://github.com/sovereign-protocol/core/issues"
+Changelog = "https://github.com/sovereign-protocol/core/blob/main/CHANGELOG.md"
+Specification = "https://github.com/sovereign-protocol/core/blob/main/SPECIFICATION_S_PROTOCOL.md"
 
 [project.optional-dependencies]
 test = ["pytest>=8,<10"]
