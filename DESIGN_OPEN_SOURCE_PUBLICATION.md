@@ -143,7 +143,11 @@ A scan was performed against the current history. Findings:
   (`./data/...`) and identity labels. They are usable as-is or trivially
   convertible to `.example` files; they are not a privacy finding.
 - **No absolute personal paths in tracked files.** A tracked-file search for
-  `C:\Data`, `<user-profile path>`, `/home/<user>/` and `/Users/` returned nothing.
+  the workspace root, the founder's Windows user-profile directory, and the
+  POSIX `/home` and `/Users` home prefixes returned nothing. The literal
+  patterns live in `tools/verify_repository_split.py`, which stays in the
+  private working repository: spelling them out here would plant the very
+  strings the scan looks for into a published document.
 
 Remaining real item:
 

@@ -1003,8 +1003,10 @@ repositories, zero remotes each, clean trees, history preserved (68 / 56 / 21
 commits); `LICENSE` is LGPL for Core and Apache-2.0 for both applications, as
 L1/L3 require; 177 distinct historical paths across all repositories contain no
 `.claude/`, `data/`, `traces/`, or non-example `relay_sftp_*`; and a scan of all
-145 commits for private-key blocks, GitHub tokens, and `<user-profile path>` / `<workspace path>`
-paths returned zero hits.
+145 commits for private-key blocks, GitHub tokens, and Windows user-profile or
+workspace-root paths returned zero hits. The literal path patterns are defined
+in `tools/verify_repository_split.py` and are deliberately not reproduced in a
+published document, which would otherwise contain the strings it scans for.
 
 - Reproducibility defect, fixed: the license hosts reject urllib's default
   User-Agent with `HTTP 403`, so a clean-machine rehearsal could not fetch the
