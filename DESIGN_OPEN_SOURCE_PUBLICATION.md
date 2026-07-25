@@ -261,6 +261,49 @@ Kanban:
 
 Do not require an independent approval until a second trusted maintainer exists.
 
+### Branch protection needs a paid plan while a repository is private
+
+Verified against the created repositories: on a **free** organisation the
+branch-protection API answers
+
+```text
+403  Upgrade to GitHub Pro or make this repository public to enable this feature.
+```
+
+So the policy above cannot be applied before §11 makes a repository public,
+and the launch sequence cannot simply protect everything first. Two ways to
+resolve it, both acceptable:
+
+- **Upgrade the organisation** to a paid plan and protect each repository
+  while it is still private, which keeps the documented order intact; or
+- **Accept a short unprotected window**: make the repository public, apply
+  protection immediately, then confirm it took effect. While the founder is
+  the only account with push access the practical risk is small, but this is
+  a deliberate deviation rather than an oversight, and is recorded as one.
+
+Merge behaviour is a *repository* setting rather than branch protection, so
+squash-only merging and branch deletion on merge can be set at any time,
+including while private.
+
+Two protection settings are deliberately weaker than they first look, and
+both follow from the policy above rather than contradicting it. Admin
+enforcement stays **off**, because the founder must be able to merge their
+own work while sole maintainer; turning it on locks the only maintainer out.
+The required approval count stays **zero**, because no second reviewer
+exists yet - a pull request is still required, but nobody has to approve it.
+
+### Required status checks: read the names, do not predict them
+
+A required check whose name never appears blocks every merge permanently,
+which is worse than requiring none. Matrix jobs produce generated names, so
+add them only after observing a real pull request rather than deriving them
+from the workflow file.
+
+Core's Linux job is `experimental: true` with `continue-on-error`, so it
+reports success even when it fails. Requiring it would produce a green check
+that means nothing, matching O2's position that Linux is unverified: require
+the Windows jobs only.
+
 ## 7. Contribution workflow
 
 ### Discussions
@@ -404,8 +447,12 @@ and records the outcome as `site_redactions` in `R8_VERIFICATION.json`.
 2. Complete license/security/reproducibility gates.
 3. Create GitHub organization or final owner account.
 4. Push all three repositories privately for one release rehearsal if desired.
-5. Enable branch/security settings and CI.
-6. Make Sovereign Core public first.
+5. Enable branch/security settings and CI. On a free organisation only the
+   repository-level settings (squash-only merging, branch deletion on merge)
+   can be applied at this point; branch protection is rejected while the
+   repository is private, so it moves to immediately after each step that
+   makes one public. See §6.
+6. Make Sovereign Core public first, then protect its `main` at once.
 7. Publish its `0.1.0` source/wheel artifact.
 8. Make S-Kanban public against that exact Core release.
 9. Tag S-Kanban `0.1.0-alpha.1`.
