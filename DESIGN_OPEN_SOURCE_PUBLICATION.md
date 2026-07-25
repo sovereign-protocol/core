@@ -1,6 +1,7 @@
 # Open-source publication and collaboration plan
 
-Status: **DESIGN FOR REVIEW — no public repository created**
+Status: **IN EXECUTION — Sovereign Core is public; the applications are pushed
+and still private pending Core's `0.1.0` release**
 
 This document begins after the architecture and license decisions are approved.
 It defines when the work is safe and understandable enough to publish, how the
@@ -463,11 +464,12 @@ and records the outcome as `site_redactions` in `R8_VERIFICATION.json`.
 
 ## 12. Publication decisions
 
-- **O1 — PROVISIONAL:** lead initially with the useful Kanban application and
-  provide a clear path into Core architecture. Revisit immediately before launch:
-  S-Agreement may become the lead application if it offers the clearer,
-  demonstrable expression of sovereign perspectives by then. Changing the lead
-  application does not reopen architecture or repository decisions.
+- **O1 — RESOLVED at launch:** lead with **S-Kanban**, as the more mature of
+  the two, and provide a clear path into the Core architecture behind it. The
+  revisit this decision reserved has been taken: S-Agreement remains the
+  conformance proof that keeps Core honest about being application-neutral,
+  not the product the announcement leads with. This closes the last
+  provisional decision; it reopened no architecture or repository choice.
 - **O2 — ACCEPTED:** support Windows 10/11 explicitly; label Linux/macOS
   experimental/unverified until CI and manual checks justify a stronger claim.
 - **O3 — ACCEPTED:** publish Core source/wheel and application source alpha first;

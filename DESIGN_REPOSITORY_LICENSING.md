@@ -300,9 +300,26 @@ alpha first. Add the Windows executable afterward, once a focused review confirm
 LGPL notices, exact Core source availability, and library replacement/recombination
 requirements.
 
-**ACCEPTED G5:** complete one professional review of the code/documentation/
-contribution license package before public contribution, and a second focused
-review before distributing a frozen executable.
+**AMENDED G5.** The pre-publication professional review of the code,
+documentation and contribution licence package is **waived** by the founder,
+deliberately and with the risk accepted, rather than deferred or forgotten.
+Publication proceeded without it.
+
+What that review would have covered, and what therefore rests on the
+founder's own judgement: that `LGPL-3.0-or-later` for Core and `Apache-2.0`
+for the applications are correctly applied and mutually compatible as
+combined; that DCO-1.1 without a CLA is sufficient for inbound
+contributions; and that the notices as shipped satisfy both licences. The
+technical parts are verified and re-checkable - licence texts are fetched
+against pinned SHA-256 digests, and every wheel is asserted to carry its
+payload - but neither is a legal opinion.
+
+**The second review still stands.** A focused review of LGPL notices, exact
+Core source availability, and library replacement/recombination remains
+mandatory before a frozen executable is distributed to anyone. That gate is
+untouched by this amendment: building the executable for personal use is not
+distribution and never required it, which is why G4 sequences source and
+wheels first.
 
 `S-Kanban.spec` may be committed and exercised for reproducible build testing.
 That technical verification is not a release artifact and does not open the

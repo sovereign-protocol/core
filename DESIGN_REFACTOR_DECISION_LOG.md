@@ -1,6 +1,6 @@
 # Architecture/publication decision log
 
-Status: **DECISIONS RESOLVED — O1 lead application remains intentionally provisional**
+Status: **ALL DECISIONS RESOLVED — O1 settled at launch; G5 amended**
 
 This is the short review index for the three detailed plans. Record accepted
 answers here; the detailed documents remain the source of rationale and scope.
@@ -110,7 +110,7 @@ version negotiation. All are deferred past `1.0`.
 
 | ID | Question | Recommendation | Status/decision |
 |---|---|---|---|
-| L1 | Exact Core license? | `LGPL-3.0-or-later`, subject to professional review | **ACCEPTED** |
+| L1 | Exact Core license? | `LGPL-3.0-or-later`. The professional review this was made subject to has since been waived under G5, so the choice rests on the founder's own judgement | **ACCEPTED — review waived, see G5** |
 | L2 | Inbound contribution model? | No planned proprietary dual-license; DCO 1.1, no CLA | **ACCEPTED** |
 | L3 | Profile/UI license boundary? | Minimal profile and host shell follow Core’s LGPL; application UIs follow their application license | **ACCEPTED** |
 | L4 | Documentation license? | Documentation and normative S-Protocol specification use `CC-BY-4.0`; code/fixtures retain repository software license | **ACCEPTED** |
@@ -142,13 +142,13 @@ that is unlikely in practice. P4 permits changing it before `1.0`, so it is
 recorded as a known limitation rather than fixed now.
 | G3 | Initial versions? | Core `0.1.0`; Kanban tag `v0.1.0-alpha.1` / Python `0.1.0a1`, with explicit Core range | **ACCEPTED** |
 | G4 | Executable compliance? | Publish Core wheel/source and Kanban source first; add Windows executable after focused LGPL packaging review | **ACCEPTED** |
-| G5 | Legal review timing? | License/contribution review before publication; frozen-executable review before executable distribution | **ACCEPTED** |
+| G5 | Legal review timing? | Pre-publication licence/contribution review **waived** by the founder with the risk accepted; the frozen-executable review before executable distribution still stands | **AMENDED — see `DESIGN_REPOSITORY_LICENSING.md` §11.1** |
 
 ## 3. Decisions that block public announcement
 
 | ID | Question | Recommendation | Status/decision |
 |---|---|---|---|
-| O1 | First audience/lead application? | Provisionally lead with useful Kanban and a path to Core; reconsider S-Agreement once demonstrable | **PROVISIONALLY ACCEPTED — may change before launch** |
+| O1 | First audience/lead application? | Lead with S-Kanban, the more mature of the two, and provide a clear path into Core | **RESOLVED at launch — S-Kanban leads; S-Agreement stays the conformance proof** |
 | O2 | Supported platforms? | Explicit Windows 10/11 support; label Linux/macOS experimental/unverified until tested | **ACCEPTED** |
 | O3 | Initial artifact? | Core source/wheel and Kanban source alpha first; executable later | **ACCEPTED** |
 | O4 | Community channel? | GitHub Discussions first; no additional chat initially | **ACCEPTED** |
