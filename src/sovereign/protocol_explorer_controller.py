@@ -21,28 +21,6 @@ def build_routes(logic, runtime, config: dict) -> list[Route]:
             runtime, logic.start_discussion(data.get("topic_uuid")),
         )
 
-    async def api_invite(request: Request):
-        try:
-            data = await request.json()
-            topic_uuid = data.get("topic_uuid")
-            result = logic.start_discussion(topic_uuid)
-            if result.status != "ok":
-                return await _json_result(runtime, result)
-            invite = await asyncio.to_thread(
-                runtime.channel_manager.invite_to_discuss,
-                data["address"].strip().rstrip("/"),
-                topic_uuid,
-                read_only=bool(data.get("read_only")),
-            )
-            if invite.get("status") == "ok":
-                runtime.notify_change()
-                return JSONResponse(invite)
-            return JSONResponse(invite, status_code=409)
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "error", "reason": str(exc)}, status_code=500,
-            )
-
     async def api_create_child(request: Request):
         try:
             data = await request.json()
@@ -95,7 +73,6 @@ def build_routes(logic, runtime, config: dict) -> list[Route]:
         Route("/api/protocol-explorer/state", api_state),
         Route("/api/protocol-explorer/start_discussion", api_start_discussion,
               methods=["POST"]),
-        Route("/api/protocol-explorer/invite", api_invite, methods=["POST"]),
         Route("/api/protocol-explorer/create_child", api_create_child,
               methods=["POST"]),
         Route("/api/protocol-explorer/modify", api_modify, methods=["POST"]),
@@ -111,7 +88,7 @@ async def _json_result(runtime, result) -> JSONResponse:
     deliveries = []
     if result.status == "ok":
         deliveries = await asyncio.to_thread(
-            runtime.channel_manager.execute_effects, result.effects,
+            runtime.deliver_effects, result.effects,
         )
         runtime.notify_change()
     view = application_result_view(result, deliveries)

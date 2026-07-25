@@ -72,6 +72,47 @@ class DirectHttpChannel:
             "accept_enabled": self.accept_enabled,
         }
 
+    def management_descriptor(self) -> dict:
+        available = bool(self.offer_enabled or self.accept_enabled)
+        return {
+            "types": [{
+                "id": "direct",
+                "kind": self.kind,
+                "name": "Direct connection",
+                "description": "Live device-to-device connection using an invite token.",
+                "action": "accept_invitation",
+            }],
+            "instances": [{
+                "ref": self.kind,
+                "kind": self.kind,
+                "type": "direct",
+                "name": "Direct",
+                "description": "Live device-to-device channel",
+                "available": available,
+                "built_in": True,
+                "removable": False,
+                "topic_uuids": [],
+            }],
+        }
+
+    def topic_bindings(self, topic_uuid: str) -> list[dict]:
+        session = self.adapter.session
+        in_use = any(
+            topic_uuid in topics and session.peer_channel.get(peer_addr) == self.kind
+            for peer_addr, topics in session.peer_topic_sets.items()
+        )
+        return [{
+            "ref": self.kind,
+            "kind": self.kind,
+            "type": "direct",
+            "name": "Direct",
+            "description": "Live device-to-device channel",
+            "available": bool(self.offer_enabled or self.accept_enabled),
+            "in_use": in_use,
+            "built_in": True,
+            "removable": False,
+        }]
+
     def execute_effect(self, effect):
         return self.adapter.execute_effect(effect)
 

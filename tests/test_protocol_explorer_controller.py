@@ -19,20 +19,6 @@ class FakeAdapter:
             for effect in effects
         ]
 
-    def invite_to_discuss(self, peer_addr, topic_uuid, read_only=False):
-        return {
-            "status": "ok",
-            "peer_addr": peer_addr,
-            "topic_uuid": topic_uuid,
-            "read_only": read_only,
-        }
-
-
-class FailingInviteAdapter(FakeAdapter):
-    def invite_to_discuss(self, peer_addr, topic_uuid, read_only=False):
-        raise RuntimeError("invite exploded")
-
-
 class FakeRequest:
     def __init__(self, payload):
         self.payload = payload
@@ -44,7 +30,8 @@ class FakeRequest:
 class FakeRuntime:
     def __init__(self, session):
         self.session = session
-        self.channel_manager = FakeAdapter()
+        self.adapter = FakeAdapter()
+        self.deliver_effects = self.adapter.execute_effects
         self.config = {}
         self.notified = False
 
@@ -60,29 +47,7 @@ class ProtocolExplorerControllerTests(unittest.TestCase):
         paths = {route.path for route in routes}
         self.assertIn("/api/protocol-explorer/state", paths)
         self.assertIn("/api/protocol-explorer/create_child", paths)
-        self.assertIn("/api/protocol-explorer/invite", paths)
         self.assertIn("/api/protocol-explorer/accept_peer_node", paths)
-
-    def test_invite_route_returns_json_error_on_exception(self):
-        session = Session("http://a")
-        logic = ManualLogic(session, {})
-        topic = logic.create_child(
-            session.protocol.root.uuid, {"name": "topic"}, {},
-        ).value
-        runtime = FakeRuntime(session)
-        runtime.channel_manager = FailingInviteAdapter()
-        endpoint = self._endpoint(
-            build_routes(logic, runtime, {}), "/api/protocol-explorer/invite",
-        )
-
-        response = asyncio.run(endpoint(FakeRequest({
-            "address": "http://b", "topic_uuid": topic.uuid,
-        })))
-
-        payload = json.loads(response.body)
-        self.assertEqual(response.status_code, 500)
-        self.assertEqual(payload["status"], "error")
-        self.assertEqual(payload["reason"], "invite exploded")
 
     def test_modify_route_rejects_invalid_weight_as_json_error(self):
         session = Session("http://a")
@@ -104,28 +69,6 @@ class ProtocolExplorerControllerTests(unittest.TestCase):
         payload = json.loads(response.body)
         self.assertEqual(response.status_code, 400)
         self.assertEqual(payload["reason"], "weight 'r' must be a number")
-
-    def test_invite_can_add_another_active_topic(self):
-        session = Session("http://a")
-        logic = ManualLogic(session, {})
-        first = logic.create_child(
-            session.protocol.root.uuid, {"name": "first"}, {},
-        ).value
-        second = logic.create_child(
-            session.protocol.root.uuid, {"name": "second"}, {},
-        ).value
-        runtime = FakeRuntime(session)
-        logic.start_discussion(first.uuid)
-        endpoint = self._endpoint(
-            build_routes(logic, runtime, {}), "/api/protocol-explorer/invite",
-        )
-
-        response = asyncio.run(endpoint(FakeRequest({
-            "address": "http://b", "topic_uuid": second.uuid,
-        })))
-
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(session.active_topic_uuids, {first.uuid, second.uuid})
 
     @staticmethod
     def _endpoint(routes, path):

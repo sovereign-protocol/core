@@ -245,8 +245,6 @@ const SovereignShell = {
   },
 
   // options: { container, applicationId, topicUuid(), state(), onChanged() }
-  // state() returns { network, channel_targets, channel_target_id } so the
-  // shell never reaches into an application's own payload shape.
   async mount(options) {
     this._options = options;
     const nav = this._buildHeader(options.container, options);
@@ -296,6 +294,7 @@ const SovereignShell = {
     const button = document.getElementById("shellConnectionBtn");
     const state = this._options.state ? this._options.state() : {};
     if (!button || !state) return;
+    button.disabled = !this._topic();
     // Every session peer by default. An application whose view is scoped to
     // one topic - a board, an agreement - says which addresses belong to it,
     // so the cluster shows who is on *this* thing rather than everyone.
@@ -306,8 +305,8 @@ const SovereignShell = {
     button.replaceChildren();
     button.className = peers.length ? "peer-cluster" : "peer-cluster local";
     if (!peers.length) {
-      button.textContent = "local";
-      button.title = "No peers on this topic";
+      button.textContent = "Sharing";
+      button.title = "Private — no one else is involved";
       return;
     }
     for (const entry of peers.slice(0, 4)) {
@@ -445,7 +444,7 @@ Object.assign(SovereignShell, {
     connection.type = "button";
     connection.id = "shellConnectionBtn";
     connection.className = "peer-cluster local";
-    connection.textContent = "local";
+    connection.textContent = "Sharing";
     connection.onclick = () => this.openConnectionPanel();
 
     const avatar = document.createElement("button");
@@ -639,11 +638,15 @@ Object.assign(SovereignShell, {
     // Agreement state is a property of one topic. An application that shows
     // many at once - an overview - has no single answer, so the whole left
     // region collapses rather than claiming one.
-    if (!this._options.topicUuid) {
-      button.hidden = true;
+    if (!this._options.topicUuid || !this._topic()) {
+      button.hidden = false;
+      button.disabled = true;
+      button.classList.remove("has-divergence", "has-items");
+      button.title = "Select a topic first";
       if (status) status.hidden = true;
       return;
     }
+    button.disabled = false;
     button.hidden = false;
     const items = this._disagreements();
     const diverged = items.filter((item) => item.type === "divergence").length;
@@ -772,7 +775,8 @@ Object.assign(SovereignShell, {
   },
 
   _agendaRoutes() {
-    return this._options.agendaRoutes || null;
+    const routes = this._options.agendaRoutes;
+    return typeof routes === "function" ? routes() : routes || null;
   },
 
   async _addAgendaItem() {
@@ -1003,7 +1007,9 @@ Object.assign(SovereignShell, {
   },
 
   _autoAdoptControl() {
-    const route = this._options.autoAdoptRoute;
+    const configured = this._options.autoAdoptRoute;
+    const route = typeof configured === "function"
+      ? configured() : configured;
     const topic = this._topic();
     if (!route || !topic) return null;
     const state = this._options.state ? this._options.state() : {};
@@ -1079,11 +1085,10 @@ Object.assign(SovereignShell, {
   // ---- connections: the right-hand pane -----------------------------
 
   _connReady: false,
-  _panelTopic: "",
-  _panelAssignedTarget: "",
+  _sharing: { people: [], channels: [] },
+  _channelCatalog: { types: [], channels: [] },
 
   _topic() {
-    if (this._panelTopic) return this._panelTopic;
     return this._options.topicUuid ? this._options.topicUuid() : "";
   },
 
@@ -1098,7 +1103,7 @@ Object.assign(SovereignShell, {
       '<button type="button" id="shellConnCloseBtn" class="shell-pane-close" aria-label="Close">&times;</button>',
       "</div>",
       '<div class="shell-pane-section">',
-      "<h3>People involved</h3>",
+      "<h3>Involved Individuals</h3>",
       '<div id="shellPeersList" class="shell-peers-list"></div>',
       "</div>",
       '<div class="shell-pane-section" id="shellConnAutoAdopt">',
@@ -1110,7 +1115,7 @@ Object.assign(SovereignShell, {
       '<div id="shellConnTargetList" class="shell-target-list"></div>',
       '<div id="shellChannelActions" class="shell-row shell-channel-actions">',
       '<button type="button" id="shellUseTokenBtn">Use invite token</button>',
-      '<button type="button" id="shellNewTargetBtn">+ New target</button>',
+      '<button type="button" id="shellManageChannelsBtn">Manage channels</button>',
       "</div>",
       '<fieldset id="shellTokenFieldset" class="shell-token-form" hidden>',
       "<legend>Use an invite token</legend>",
@@ -1122,25 +1127,30 @@ Object.assign(SovereignShell, {
       "</div>",
       '<p id="shellTokenNote" class="shell-note"></p>',
       "</fieldset>",
-      '<fieldset id="shellTargetFieldset" class="shell-target-form" hidden>',
-      '<legend id="shellTargetFormTitle">Add an SFTP target</legend>',
-      '<input id="shellTargetName" placeholder="Name">',
-      '<input id="shellTargetHost" placeholder="Host">',
-      '<input id="shellTargetPort" type="number" value="22" min="1" max="65535">',
-      '<input id="shellTargetUser" placeholder="Username">',
-      '<input id="shellTargetPassword" type="password" placeholder="Password (optional)">',
-      '<input id="shellTargetRoot" placeholder="Remote path" value="/">',
-      '<input id="shellTargetPoll" type="number" value="3" min="1" max="300" title="Poll every (seconds)">',
-      '<p class="shell-note shell-target-form-full">Leave the password blank to use key authentication or your SSH agent. A password entered here is stored in this client&#39;s local session data.</p>',
-      '<div class="shell-row shell-target-form-full">',
-      '<button type="button" id="shellTestTargetBtn">Test</button>',
-      '<button type="button" id="shellSaveTargetBtn" class="primary">Save</button>',
-      '<button type="button" id="shellCancelTargetBtn">Cancel</button>',
-      "</div>",
-      "</fieldset>",
       '<p id="shellTargetsNote" class="shell-note"></p>',
       "</div>",
       "</aside>",
+      '<dialog id="shellChannelManager" class="shell-dialog">',
+      '<div class="shell-pane-header">',
+      "<strong>Manage Channels</strong>",
+      '<button type="button" id="shellChannelManagerClose" class="shell-pane-close" aria-label="Close">&times;</button>',
+      "</div>",
+      '<p class="shell-note">Channels belong to this session and are available to every topic.</p>',
+      '<div id="shellManagedChannelList" class="shell-target-list"></div>',
+      '<button type="button" id="shellAddChannelBtn">+ Add channel</button>',
+      '<fieldset id="shellChannelForm" class="shell-target-form" hidden>',
+      '<legend>Add channel</legend>',
+      '<label for="shellChannelType">Channel type</label>',
+      '<select id="shellChannelType"></select>',
+      '<div id="shellChannelFields" class="shell-target-form-full"></div>',
+      '<div class="shell-row shell-target-form-full">',
+      '<button type="button" id="shellTestChannelBtn">Test</button>',
+      '<button type="button" id="shellSaveChannelBtn" class="primary">Save</button>',
+      '<button type="button" id="shellCancelChannelBtn">Cancel</button>',
+      "</div>",
+      "</fieldset>",
+      '<p id="shellChannelManagerNote" class="shell-note"></p>',
+      "</dialog>",
     ].join("");
     document.body.append(...host.children);
     this._connReady = true;
@@ -1149,10 +1159,14 @@ Object.assign(SovereignShell, {
     document.getElementById("shellConnOverlay").onclick = () => this.closeConnections();
     document.getElementById("shellUseTokenBtn").onclick = () => this._toggleTokenForm(true);
     document.getElementById("shellCancelTokenBtn").onclick = () => this._toggleTokenForm(false);
-    document.getElementById("shellNewTargetBtn").onclick = () => this._toggleTargetForm(true);
-    document.getElementById("shellCancelTargetBtn").onclick = () => this._toggleTargetForm(false);
-    document.getElementById("shellTestTargetBtn").onclick = () => this._testFormTarget();
-    document.getElementById("shellSaveTargetBtn").onclick = () => this._saveTarget();
+    document.getElementById("shellManageChannelsBtn").onclick = () => this._openChannelManager();
+    document.getElementById("shellChannelManagerClose").onclick = () =>
+      document.getElementById("shellChannelManager").close();
+    document.getElementById("shellAddChannelBtn").onclick = () => this._toggleChannelForm(true);
+    document.getElementById("shellCancelChannelBtn").onclick = () => this._toggleChannelForm(false);
+    document.getElementById("shellChannelType").onchange = () => this._renderChannelFields();
+    document.getElementById("shellTestChannelBtn").onclick = () => this._testChannelForm();
+    document.getElementById("shellSaveChannelBtn").onclick = () => this._saveChannel();
     document.getElementById("shellConnectBtn").onclick = () => this._connect();
   },
 
@@ -1168,19 +1182,8 @@ Object.assign(SovereignShell, {
     document.getElementById(id).textContent = message;
   },
 
-  // topicUuid overrides the mounted default, so a multi-topic view such as a
-  // board overview can open the pane for one specific topic; targetId is
-  // that topic's already-assigned target, since a multi-topic view has no
-  // single state().channel_target_id to fall back on.
-  openConnectionPanel(panel) {
-    const request = panel || {};
+  async openConnectionPanel() {
     this._ensureConnectionsPane();
-    this._panelTopic = request.topicUuid || "";
-    const state = this._options.state ? this._options.state() : {};
-    this._panelAssignedTarget = request.topicUuid
-      ? (request.targetId || "") : (state.channel_target_id || "");
-
-    this._renderPeersList();
 
     const autoAdoptSection = document.getElementById("shellConnAutoAdopt");
     const autoAdoptControl = document.getElementById(
@@ -1192,26 +1195,43 @@ Object.assign(SovereignShell, {
     autoAdoptSection.hidden = !adopt;
 
     this._toggleTokenForm(false);
-    this._toggleTargetForm(false);
-    this._renderConnTargets();
+    await this._loadSharing();
 
     document.getElementById("shellConnOverlay").hidden = false;
     document.getElementById("shellConnPane").hidden = false;
     document.body.classList.add("shell-pane-open-right");
   },
 
-  // Every session peer by default. An application whose view is scoped to
-  // one topic says which addresses belong to it, so the list shows who is on
-  // *this* thing rather than everyone the identity has ever talked to.
+  async _loadSharing() {
+    const topic = this._topic();
+    if (!topic) {
+      this._sharing = { people: [], channels: [] };
+      this._renderPeersList();
+      this._renderConnTargets();
+      this._note("shellTargetsNote", "Select a topic to manage sharing.");
+      return;
+    }
+    try {
+      const response = await fetch(
+        `/api/core/topics/${encodeURIComponent(topic)}/sharing`,
+      );
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.reason || "Could not read sharing.");
+      this._sharing = payload;
+      this._note("shellTargetsNote", "");
+    } catch (error) {
+      this._sharing = { people: [], channels: [] };
+      this._note("shellTargetsNote", error.message);
+    }
+    this._renderPeersList();
+    this._renderConnTargets();
+  },
+
   _renderPeersList() {
     const list = document.getElementById("shellPeersList");
     if (!list) return;
     list.replaceChildren();
-    const state = this._options.state ? this._options.state() : {};
-    const all = (state.network && state.network.peers) || {};
-    const peers = this._options.peerAddresses
-      ? this._options.peerAddresses().map((addr) => [addr, all[addr] || {}])
-      : Object.entries(all);
+    const peers = this._sharing.people || [];
     if (!peers.length) {
       const empty = document.createElement("p");
       empty.className = "shell-note";
@@ -1219,68 +1239,60 @@ Object.assign(SovereignShell, {
       list.append(empty);
       return;
     }
-    for (const [addr, info] of peers) {
-      const described = this._options.describePeer
-        ? this._options.describePeer(addr) || {} : {};
-      const online = described.online !== undefined
-        ? described.online
-        : !info.status || info.status.state !== "offline";
+    for (const info of peers) {
+      const addr = info.address || "";
+      const online = !info.status || info.status.state !== "offline";
       const row = document.createElement("div");
       row.className = "shell-peer-row";
       const avatar = document.createElement("span");
       avatar.className = "header-avatar shell-peer-avatar "
         + (online ? "status-online" : "status-offline");
-      if (described.picture) {
-        avatar.style.backgroundImage = 'url("' + described.picture + '")';
-      } else {
-        const source = described.label || addr.replace(/^relay:/, "");
+      if (info.picture) {
+        avatar.style.backgroundImage = 'url("' + info.picture + '")';
+      } else if (!channel.built_in) {
+        const source = info.name || addr.replace(/^relay:/, "");
         avatar.textContent = (source.slice(0, 2) || "?").toUpperCase();
       }
       const name = document.createElement("span");
       name.className = "shell-peer-name";
-      name.textContent = described.label || addr;
+      name.textContent = info.name || addr;
       const status = document.createElement("span");
       status.className = "shell-note shell-peer-status";
-      status.textContent = described.status
-        || (online ? "Online" : "Offline")
+      status.textContent = (online ? "Online" : "Offline")
         + (info.channel ? " (" + info.channel + ")" : "");
       row.append(avatar, name, status);
       list.append(row);
     }
   },
 
-  async _assignTopicTarget(targetId) {
+  async _setTopicChannel(channelRef, action) {
     const topic = this._topic();
     if (!topic) throw new Error("Select a topic first.");
-    await this._post("/api/channels/mailbox/topics/assign", {
-      topic_uuid: topic, target_id: targetId || null,
-    });
-    this._panelAssignedTarget = targetId || "";
+    await this._post(
+      `/api/core/topics/${encodeURIComponent(topic)}/channels`,
+      { channel_ref: channelRef, action },
+    );
     await this._changed();
+    await this._loadSharing();
   },
 
-  async _copyToken(targetId = "", targetName = "Direct") {
+  async _copyToken(channelRef = "http", channelName = "Direct") {
     const topic = this._topic();
     if (!topic) {
       this._note("shellTargetsNote", "Select a topic before creating a token.");
       return;
     }
     try {
-      if (targetId && this._panelAssignedTarget !== targetId) {
-        await this._assignTopicTarget(targetId);
-      }
-      const token = await this._post("/api/connect_token", {
-        topic_uuids: [topic],
-        channel_options: targetId ? { mailbox: { target_id: targetId } } : {},
+      const token = await this._post("/api/core/invitations", {
+        topic_uuid: topic,
+        channel_ref: channelRef,
       });
       await navigator.clipboard.writeText(btoa(JSON.stringify(token)));
       this._note(
         "shellTargetsNote",
-        targetId
-          ? `Invite token copied. ${targetName} is now in use for this topic.`
-          : "Direct invite token copied.",
+        `${channelName} invite token copied.`,
       );
-      await this._renderConnTargets();
+      await this._loadSharing();
     } catch (error) {
       this._note("shellTargetsNote", error.message);
     }
@@ -1306,12 +1318,12 @@ Object.assign(SovereignShell, {
       return;
     }
     try {
-      await this._post("/api/connect", { token });
+      await this._post("/api/core/invitations/accept", { token });
       field.value = "";
       this._note("shellTokenNote", "Connected.");
       await this._changed();
       this._toggleTokenForm(false);
-      await this._renderConnTargets();
+      await this._loadSharing();
     } catch (error) {
       this._note("shellTokenNote", error.message);
     }
@@ -1337,92 +1349,62 @@ Object.assign(SovereignShell, {
     const list = document.getElementById("shellConnTargetList");
     if (!list) return;
     list.replaceChildren();
-    let targets = [];
-    try {
-      const response = await fetch("/api/channels/mailbox/targets");
-      targets = (await response.json()).targets || [];
-    } catch (error) {
-      this._note("shellTargetsNote", "Could not read channel targets.");
+    const channels = this._sharing.channels || [];
+    if (!channels.length) {
+      const empty = document.createElement("p");
+      empty.className = "shell-note";
+      empty.textContent = this._topic()
+        ? "No channels are available." : "Select a topic first.";
+      list.append(empty);
       return;
     }
-
-    const direct = document.createElement("div");
-    direct.className = "shell-target-row";
-    const directName = document.createElement("div");
-    directName.className = "shell-target-identity";
-    directName.innerHTML = (
-      '<span class="shell-target-name">Direct</span>'
-      + '<span class="shell-note">Live device-to-device channel</span>'
-    );
-    const directStatuses = document.createElement("div");
-    directStatuses.className = "shell-channel-statuses";
-    directStatuses.append(this._targetStatus("Available", "is-available"));
-    const state = this._options.state ? this._options.state() : {};
-    const allPeers = (state.network && state.network.peers) || {};
-    const panelPeers = this._options.peerAddresses
-      ? this._options.peerAddresses().map((addr) => allPeers[addr] || {})
-      : Object.values(allPeers);
-    if (panelPeers.some((peer) => peer.channel === "http")) {
-      directStatuses.append(this._targetStatus("In use", "is-in-use"));
-    }
-    const directActions = document.createElement("div");
-    directActions.className = "shell-target-actions";
-    directActions.append(this._channelAction(
-      "Get token", () => this._copyToken(),
-    ));
-    direct.append(directName, directStatuses, directActions);
-    list.append(direct);
-
-    for (const target of targets) {
+    for (const channel of channels) {
       const row = document.createElement("div");
       row.className = "shell-target-row";
       const identity = document.createElement("div");
       identity.className = "shell-target-identity";
       const name = document.createElement("span");
       name.className = "shell-target-name";
-      name.textContent = target.name;
+      name.textContent = channel.name;
       const kind = document.createElement("span");
       kind.className = "shell-note";
-      kind.textContent = "Mailbox channel";
+      kind.textContent = channel.description || channel.type;
       identity.append(name, kind);
-      const inUse = (
-        this._panelAssignedTarget === target.id
-        || (target.topic_uuids || []).includes(this._topic())
-      );
       const statuses = document.createElement("div");
       statuses.className = "shell-channel-statuses";
-      statuses.append(this._targetStatus("Available", "is-available"));
-      if (inUse) {
+      statuses.append(this._targetStatus(
+        channel.available ? "Available" : "Unavailable",
+        channel.available ? "is-available" : "",
+      ));
+      if (channel.in_use) {
         statuses.append(this._targetStatus("In use", "is-in-use"));
       }
       const actions = document.createElement("div");
       actions.className = "shell-target-actions";
-      if (inUse) {
+      if (channel.in_use) {
         actions.append(this._channelAction(
           "Stop using",
           async () => {
             try {
-              await this._assignTopicTarget("");
-              await this._renderConnTargets();
+              await this._setTopicChannel(channel.ref, "stop");
               this._note(
                 "shellTargetsNote",
-                `${target.name} is no longer used for this topic.`,
+                `${channel.name} is no longer used for this topic.`,
               );
             } catch (error) {
               this._note("shellTargetsNote", error.message);
             }
           },
         ));
-      } else {
+      } else if (channel.type !== "direct") {
         actions.append(this._channelAction(
           "Use for this topic",
           async () => {
             try {
-              await this._assignTopicTarget(target.id);
-              await this._renderConnTargets();
+              await this._setTopicChannel(channel.ref, "use");
               this._note(
                 "shellTargetsNote",
-                `${target.name} is now in use for this topic.`,
+                `${channel.name} is now in use for this topic.`,
               );
             } catch (error) {
               this._note("shellTargetsNote", error.message);
@@ -1431,27 +1413,10 @@ Object.assign(SovereignShell, {
         ));
       }
       actions.append(this._channelAction(
-        "Get token", () => this._copyToken(target.id, target.name), "primary",
+        "Get token",
+        () => this._copyToken(channel.ref, channel.name),
+        "primary",
       ));
-      const discard = this._channelAction("Discard", () => {}, "danger");
-      discard.title = "Stop using this connection and remove it";
-      discard.onclick = () => confirmAction(
-        "Discard " + target.name + "?",
-        "It is removed from your connections; any topic shared through it "
-          + "will need another.",
-        async () => {
-          try {
-            await this._post("/api/channels/mailbox/targets/delete", { target_id: target.id });
-            if (this._panelAssignedTarget === target.id) this._panelAssignedTarget = "";
-            await this._renderConnTargets();
-            this._note("shellTargetsNote", target.name + " discarded.");
-            await this._changed();
-          } catch (error) {
-            this._note("shellTargetsNote", error.message);
-          }
-        },
-      );
-      actions.append(discard);
       row.append(identity, statuses, actions);
       list.append(row);
     }
@@ -1462,81 +1427,178 @@ Object.assign(SovereignShell, {
     fieldset.hidden = !show;
     document.getElementById("shellUseTokenBtn").hidden = !!show;
     if (show) {
-      this._toggleTargetForm(false);
       document.getElementById("shellTokenInput").value = "";
       this._note("shellTokenNote", "");
       document.getElementById("shellTokenInput").focus();
     }
   },
 
-  _toggleTargetForm(show) {
-    document.getElementById("shellTargetFieldset").hidden = !show;
-    document.getElementById("shellNewTargetBtn").hidden = !!show;
-    if (show) {
-      this._toggleTokenForm(false);
-      this._resetTargetForm();
-      document.getElementById("shellTargetName").focus();
-    }
-  },
-
-  _resetTargetForm() {
-    const values = {
-      shellTargetName: "", shellTargetHost: "", shellTargetPort: "22",
-      shellTargetUser: "", shellTargetPassword: "", shellTargetRoot: "/",
-      shellTargetPoll: "3",
-    };
-    for (const id of Object.keys(values)) {
-      document.getElementById(id).value = values[id];
-    }
-  },
-
-  _targetFormValues() {
-    const password = document.getElementById("shellTargetPassword").value;
-    const values = {
-      name: document.getElementById("shellTargetName").value.trim(),
-      backend: "sftp",
-      host: document.getElementById("shellTargetHost").value.trim(),
-      port: Number(document.getElementById("shellTargetPort").value) || 22,
-      username: document.getElementById("shellTargetUser").value.trim(),
-      root: document.getElementById("shellTargetRoot").value.trim() || "/",
-      poll_interval_seconds:
-        Number(document.getElementById("shellTargetPoll").value) || 3,
-    };
-    if (password) values.password = password;
-    return values;
-  },
-
-  async _testFormTarget() {
-    const values = this._targetFormValues();
-    if (!values.name || !values.host || !values.username) {
-      this._note("shellTargetsNote", "Name, host, and username are required.");
-      return;
-    }
-    this._note("shellTargetsNote", "Testing " + values.name + "...");
+  async _openChannelManager() {
     try {
-      await this._post("/api/channels/mailbox/targets/test-values", values);
-      this._note("shellTargetsNote", values.name + " is reachable.");
-    } catch (error) {
-      this._note("shellTargetsNote", values.name + ": " + error.message);
-    }
-  },
-
-  async _saveTarget() {
-    const values = this._targetFormValues();
-    if (!values.name || !values.host || !values.username) {
-      this._note("shellTargetsNote", "Name, host, and username are required.");
-      return;
-    }
-    this._note("shellTargetsNote", "Verifying the target...");
-    try {
-      await this._post("/api/channels/mailbox/targets", values);
-      this._toggleTargetForm(false);
-      await this._renderConnTargets();
-      this._note("shellTargetsNote", values.name + " added.");
-      await this._changed();
+      const response = await fetch("/api/core/channels");
+      const payload = await response.json();
+      if (!response.ok) throw new Error(payload.reason || "Could not read channels.");
+      this._channelCatalog = payload;
+      this._renderManagedChannels();
+      this._populateChannelTypes();
+      this._toggleChannelForm(false);
+      this._note("shellChannelManagerNote", "");
+      document.getElementById("shellChannelManager").showModal();
     } catch (error) {
       this._note("shellTargetsNote", error.message);
     }
+  },
+
+  _renderManagedChannels() {
+    const list = document.getElementById("shellManagedChannelList");
+    list.replaceChildren();
+    for (const channel of this._channelCatalog.channels || []) {
+      const row = document.createElement("div");
+      row.className = "shell-target-row";
+      const identity = document.createElement("div");
+      identity.className = "shell-target-identity";
+      const name = document.createElement("span");
+      name.className = "shell-target-name";
+      name.textContent = channel.name;
+      const kind = document.createElement("span");
+      kind.className = "shell-note";
+      kind.textContent = channel.description || channel.type;
+      identity.append(name, kind);
+      const status = document.createElement("div");
+      status.className = "shell-channel-statuses";
+      status.append(this._targetStatus(
+        channel.available ? "Available" : "Unavailable",
+        channel.available ? "is-available" : "",
+      ));
+      const actions = document.createElement("div");
+      actions.className = "shell-target-actions";
+      if (channel.removable) {
+        actions.append(this._channelAction(
+          "Delete",
+          () => confirmAction(
+            `Delete ${channel.name}?`,
+            "A channel can be deleted only when no topic uses it.",
+            () => this._deleteChannel(channel),
+          ),
+          "danger",
+        ));
+      }
+      row.append(identity, status, actions);
+      list.append(row);
+    }
+  },
+
+  _populateChannelTypes() {
+    const select = document.getElementById("shellChannelType");
+    select.replaceChildren();
+    for (const type of (this._channelCatalog.types || []).filter(
+      (item) => item.action === "configure",
+    )) {
+      const option = document.createElement("option");
+      option.value = `${type.kind}:${type.id}`;
+      option.textContent = type.name;
+      select.append(option);
+    }
+    this._renderChannelFields();
+  },
+
+  _selectedChannelType() {
+    const value = document.getElementById("shellChannelType").value;
+    return (this._channelCatalog.types || []).find(
+      (item) => `${item.kind}:${item.id}` === value,
+    );
+  },
+
+  _renderChannelFields() {
+    const host = document.getElementById("shellChannelFields");
+    host.replaceChildren();
+    const type = this._selectedChannelType();
+    for (const field of (type && type.fields) || []) {
+      const label = document.createElement("label");
+      label.textContent = field.label;
+      const input = document.createElement("input");
+      input.dataset.channelField = field.name;
+      input.type = field.type || "text";
+      input.required = !!field.required;
+      if (field.default !== undefined) input.value = field.default;
+      label.append(input);
+      host.append(label);
+    }
+  },
+
+  _toggleChannelForm(show) {
+    const form = document.getElementById("shellChannelForm");
+    form.hidden = !show;
+    document.getElementById("shellAddChannelBtn").hidden = !!show;
+    if (show) {
+      this._populateChannelTypes();
+      const first = document.querySelector("[data-channel-field]");
+      if (first) first.focus();
+    }
+  },
+
+  _channelFormValues() {
+    const type = this._selectedChannelType();
+    if (!type) throw new Error("Choose a channel type.");
+    const values = { kind: type.kind, type: type.id };
+    for (const input of document.querySelectorAll("[data-channel-field]")) {
+      if (input.required && !input.value.trim()) {
+        throw new Error(`${input.parentElement.firstChild.textContent} is required.`);
+      }
+      if (input.value) {
+        values[input.dataset.channelField] = input.type === "number"
+          ? Number(input.value) : input.value;
+      }
+    }
+    return values;
+  },
+
+  async _testChannelForm() {
+    try {
+      const values = this._channelFormValues();
+      this._note("shellChannelManagerNote", `Testing ${values.name || "channel"}...`);
+      await this._post("/api/core/channels/test", values);
+      this._note("shellChannelManagerNote", "Channel is reachable.");
+    } catch (error) {
+      this._note("shellChannelManagerNote", error.message);
+    }
+  },
+
+  async _saveChannel() {
+    try {
+      const values = this._channelFormValues();
+      this._note("shellChannelManagerNote", "Verifying the channel...");
+      await this._post("/api/core/channels", values);
+      this._toggleChannelForm(false);
+      await this._refreshChannelManager();
+      await this._loadSharing();
+      this._note("shellChannelManagerNote", `${values.name} added.`);
+      await this._changed();
+    } catch (error) {
+      this._note("shellChannelManagerNote", error.message);
+    }
+  },
+
+  async _deleteChannel(channel) {
+    try {
+      await this._post(
+        "/api/core/channels/delete", { channel_ref: channel.ref },
+      );
+      await this._refreshChannelManager();
+      await this._loadSharing();
+      this._note("shellChannelManagerNote", `${channel.name} deleted.`);
+      await this._changed();
+    } catch (error) {
+      this._note("shellChannelManagerNote", error.message);
+    }
+  },
+
+  async _refreshChannelManager() {
+    const response = await fetch("/api/core/channels");
+    const payload = await response.json();
+    if (!response.ok) throw new Error(payload.reason || "Could not read channels.");
+    this._channelCatalog = payload;
+    this._renderManagedChannels();
   },
 
   async _changed() {

@@ -25,7 +25,8 @@ class _Adapter:
 def _services(session):
     return ApplicationServices(
         session=session,
-        channel_manager=_Adapter(),
+        collaboration=object(),
+        deliver_effects=_Adapter().execute_effects,
         blob_store=object(),
         trace=None,
         notify_change=lambda _kind: None,

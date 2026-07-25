@@ -246,7 +246,7 @@ class ApplicationHost:
                 continue
             effects = getattr(result, "effects", ())
             if effects:
-                self.services.channel_manager.execute_effects(effects)
+                self.services.deliver_effects(effects)
             changed = bool(getattr(result, "value", False)) or changed
         return changed
 

@@ -297,7 +297,8 @@ dialog menu .danger:not(:last-child) {
   grid-column: 1 / -1;
 }
 .shell-target-form[hidden],
-.shell-token-form[hidden] {
+.shell-token-form[hidden],
+.shell-pane-section[hidden] {
   display: none;
 }
 .shell-token-form {

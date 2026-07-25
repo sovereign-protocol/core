@@ -45,7 +45,7 @@ Functionality:
 Offered API:
   RelayManager(session, config, blob_store)
   RelayManager.channel_descriptor()
-    Advertises relay as a connectable channel for /api/connect_token, if
+    Advertises relay as a connectable channel for Core invitations, if
     configured - {"type": "relay", "descriptor_version": 1, "root": ...,
     "identity": ...}.
   RelayLogic
@@ -60,7 +60,7 @@ Offered API:
       list the first time it shows up in the relay, instead of merely
       caching it as an (invisible, unowned) peer perspective forever. This
       is how two peers can share a topic via relay alone, with no live HTTP
-      join ever required - called by the unified /api/connect accept flow
+      join ever required - called by the unified invitation accept flow
       (app_server.py) once it decides the relay channel is usable, same as
       the HTTP channel's own accept path is called for the http channel.
     delete_topic(topic_uuid) -> SessionResult

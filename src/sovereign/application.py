@@ -6,13 +6,9 @@ import math
 import re
 from dataclasses import dataclass, replace
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Any, Callable, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 from .topic_registry import ApplicationRegistration
-
-if TYPE_CHECKING:
-    from .channel import ChannelManager
-
 
 _APPLICATION_ID_RE = re.compile(r"^[a-z][a-z0-9-]*$")
 
@@ -25,6 +21,16 @@ class ApplicationFacadeLookup(Protocol):
     """Read-only, late-bound lookup supplied to application consumers."""
 
     def find(self, application_id: str, facade_api_version: int) -> Any | None: ...
+
+
+class ApplicationCollaboration(Protocol):
+    """The intentionally narrow collaboration view available to applications."""
+
+    def network_info(self, topic_uuid: str | None = None) -> dict: ...
+
+    def peer_liveness_for_address(
+        self, peer_addr: str, topic_uuid: str | None = None,
+    ) -> dict | None: ...
 
 
 @dataclass(frozen=True)
@@ -97,7 +103,8 @@ class ApplicationServices:
     """Typed, read-only services supplied to one active application."""
 
     session: Any
-    channel_manager: "ChannelManager"
+    collaboration: ApplicationCollaboration
+    deliver_effects: Callable[[Any], list[Any]]
     blob_store: Any
     trace: Any
     notify_change: Callable[[str], None]

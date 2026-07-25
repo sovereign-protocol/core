@@ -248,28 +248,23 @@ class AgreementLogicTests(unittest.TestCase):
         live = [item["uuid"] for item in clauses if not item["deleted"]]
         self.assertEqual(live, [second_uuid])
 
-    def test_document_payload_carries_mailbox_targets_for_the_sharing_ui(self):
+    def test_document_payload_does_not_expose_channel_management(self):
         runtime = self.runtime(9402)
-        agreement_uuid = runtime.logic.create_agreement("Service terms").value
+        runtime.logic.create_agreement("Service terms")
 
-        empty = runtime.logic.document_payload()
-        self.assertEqual(empty["channel_targets"], [])
-        self.assertIsNone(empty["channel_target_id"])
-
-        target_id = runtime.channel_manager.channel("mailbox").manager.create_target(
-            {"name": "Local folder", "backend": "local",
-             "root": str(Path(runtime._test_tmp.name) / "relay")},
-            verify=False,
-        ).value
-        runtime.channel_manager.channel("mailbox").manager.assign_topic_target(
-            agreement_uuid, target_id,
-        )
         payload = runtime.logic.document_payload()
+        self.assertNotIn("channel_targets", payload)
+        self.assertNotIn("channel_target_id", payload)
 
-        self.assertEqual(
-            [item["id"] for item in payload["channel_targets"]], [target_id],
-        )
-        self.assertEqual(payload["channel_target_id"], target_id)
+    def test_agreement_has_no_automatic_adoption_surface(self):
+        runtime = self.runtime(9412)
+        runtime.logic.create_agreement("Manual decisions")
+
+        payload = runtime.logic.document_payload()
+        self.assertNotIn("auto_adopt_mode", payload)
+        self.assertNotIn("auto_adopt_modes", payload)
+        paths = {route.path for route in app_server.build_app(runtime).routes}
+        self.assertNotIn("/api/agreement/auto_adopt", paths)
 
     def test_direct_http_invitation_and_transition_visibility(self):
         left = self.runtime(9402)

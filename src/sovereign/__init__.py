@@ -8,7 +8,7 @@ from .application import (
 )
 from .blob_store import avatar_attachment
 from .channel import (
-    Channel, ChannelAcceptance, ChannelManager, ChannelResult,
+    Channel, ChannelAcceptance, ChannelResult,
     EffectDeliveryChannel, Invitation, PollingChannel, PollingEndpoint,
 )
 from .protocol import (
@@ -23,7 +23,7 @@ __all__ = [
     "ApplicationFacade", "ApplicationFacadeLookup", "ApplicationInstance",
     "ApplicationManifest", "ApplicationRegistration", "ApplicationResultView",
     "ApplicationServices", "ApplicationSpec", "Channel", "ChannelAcceptance",
-    "ChannelManager", "ChannelResult", "EffectDeliveryChannel",
+    "ChannelResult", "EffectDeliveryChannel",
     "IncompatibleApplicationFacade", "Invitation", "PollingChannel",
     "PollingEndpoint", "ProtocolNode", "ProtocolResult", "ProtocolState",
     "Session", "SessionEffect", "SessionResult", "UnsupportedProtocolVersion",

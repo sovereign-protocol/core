@@ -735,6 +735,21 @@ class Session:
             self._remove_peer_topic(peer, topic_uuid)
         return SessionResult("ok", effects=effects)
 
+    def end_topic_sharing(self, topic_uuid: str) -> SessionResult:
+        """End the Session relationship and ask Core to release all channels.
+
+        Session deliberately knows only the lifecycle effect, never the
+        channel implementations that will execute it.
+        """
+        result = self.leave_topic(topic_uuid)
+        if result.status == "ok":
+            result.effects.append(SessionEffect(
+                "release_topic_channels",
+                topic_uuid,
+                {"topic_uuid": topic_uuid},
+            ))
+        return result
+
     # Incoming session messages
 
     def handle_sync_status(self, message: dict) -> SessionResult:

@@ -1032,7 +1032,7 @@ above.
 | S2f | S1 runtime activation/deactivation had no implementation path (`unregister` never called) | `ApplicationHost.activate()/deactivate()`; deactivation calls `Session.unregister_application`, which unregisters the topic handler |
 | S4f | The mailbox channel hand-appended the identity topic, special-casing a node type | `relay_topic_uuids` now calls `Session.shared_topic_uuids(scoped)`; the channel names no node type |
 | D12 | Route namespacing and collision policy undefined | `ApplicationHost._validate_routes` enforces `api_prefix`/`asset_prefix` and rejects duplicate, cross-application, and Core-reserved collisions with named errors |
-| F1 | Applications read private channel services from host config | R4 injects only `ApplicationServices.channel_manager`; legacy `_relay_manager`/`_channel_manager` config lookup is removed and guarded by `test_package_layout.py` |
+| F1 | Applications read private channel services from host config | Applications receive only a read-only collaboration view and effect-delivery callable; `ChannelManager` is not part of `ApplicationServices` or the public package exports |
 | S3f | Protocol Explorer had no mailbox topic handler despite an overly broad lifecycle claim | A2 was narrowed explicitly: Protocol Explorer is a local/HTTP diagnostic; mailbox conformance belongs to real applications, beginning with S-Agreement |
 
 ### Closed by R6

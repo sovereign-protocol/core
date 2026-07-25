@@ -50,10 +50,11 @@ from starlette.routing import Route
 from .protocol import ProtocolNode, UnsupportedProtocolVersion
 from .application import ApplicationServices
 from .channel import ChannelManager
+from .collaboration import CollaborationService
 from .host import ApplicationHost
 from .http_channel import DirectHttpChannel
 from .mailbox_channel import MailboxChannel
-from .mailbox_controller import build_routes as build_mailbox_routes
+from .collaboration_controller import build_routes as build_collaboration_routes
 from .profile import CoreProfileService
 from .blob_store import (
     BlobStore, SAFE_IMAGE_MIMES, blob_hex, canonical_attachments,
@@ -116,6 +117,7 @@ class AppRuntime:
     profile: CoreProfileService
     relay_manager: RelayManager
     channel_manager: ChannelManager
+    collaboration: CollaborationService
     http_channel: DirectHttpChannel
     mailbox_channel: MailboxChannel
     host: ApplicationHost | None = None
@@ -493,6 +495,7 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
     mailbox_channel = MailboxChannel(relay_manager)
     channel_manager.register(http_channel)
     channel_manager.register(mailbox_channel)
+    collaboration = CollaborationService(session, channel_manager)
     runtime = AppRuntime(
         port=port,
         address=address,
@@ -503,12 +506,14 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         profile=CoreProfileService(session),
         relay_manager=relay_manager,
         channel_manager=channel_manager,
+        collaboration=collaboration,
         http_channel=http_channel,
         mailbox_channel=mailbox_channel,
     )
     services = ApplicationServices(
         session=session,
-        channel_manager=channel_manager,
+        collaboration=collaboration.application_view,
+        deliver_effects=collaboration.execute_effects,
         blob_store=blob_store,
         trace=trace,
         notify_change=runtime.notify_change,
@@ -651,52 +656,6 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
                 runtime.notify_change()
                 return JSONResponse(result)
             return JSONResponse(result, status_code=409)
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "error", "reason": str(exc)},
-                status_code=500,
-            )
-
-    async def api_connect_token(request: Request):
-        # ChannelManager composes every locally offered channel descriptor;
-        # channel-specific options are passed through without server branches.
-        data = await request.json()
-        topic_uuids = sorted({
-            str(value).strip()
-            for value in data.get("topic_uuids", [])
-            if str(value).strip()
-        })
-        if not topic_uuids:
-            return JSONResponse(
-                {"status": "error", "reason": "choose at least one topic"},
-                status_code=400,
-            )
-        channel_options = data.get("channel_options") or {}
-        result = runtime.channel_manager.compose_token(
-            topic_uuids, channel_options,
-        )
-        if not result.ok:
-            return JSONResponse(
-                {"status": "error", "reason": result.reason},
-                status_code=result.status_code,
-            )
-        runtime.notify_change("connect-token")
-        return JSONResponse(result.value)
-
-    async def api_connect(request: Request):
-        try:
-            data = await request.json()
-            token = data.get("token") or {}
-            accepted = await asyncio.to_thread(
-                runtime.channel_manager.accept_token, token,
-            )
-            if accepted.ok:
-                runtime.notify_change()
-                return JSONResponse(accepted.value)
-            payload = {"status": "error", "reason": accepted.reason}
-            if isinstance(accepted.value, dict):
-                payload.update(accepted.value)
-            return JSONResponse(payload, status_code=accepted.status_code)
         except Exception as exc:
             return JSONResponse(
                 {"status": "error", "reason": str(exc)},
@@ -938,8 +897,6 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             methods=["POST"],
         ),
         Route("/api/join_discussion", api_join_discussion, methods=["POST"]),
-        Route("/api/connect_token", api_connect_token, methods=["POST"]),
-        Route("/api/connect", api_connect, methods=["POST"]),
         Route("/api/observe_topic", api_observe_topic, methods=["POST"]),
         Route("/api/unwatch_topic", api_unwatch_topic, methods=["POST"]),
         Route("/api/invite_discuss", api_invite_discuss, methods=["POST"]),
@@ -1009,15 +966,15 @@ def build_app(runtime: AppRuntime) -> Starlette:
             runtime.persist()
 
     core_routes = build_core_routes(runtime)
-    mailbox_routes = build_mailbox_routes(runtime.mailbox_channel, runtime)
+    collaboration_routes = build_collaboration_routes(runtime)
     application_routes = runtime.host.controller_routes() if runtime.host else []
     app = Starlette(
         debug=bool(runtime.config.get("debug", True)),
-        routes=core_routes + mailbox_routes + application_routes,
+        routes=core_routes + collaboration_routes + application_routes,
         lifespan=lifespan,
     )
     if runtime.host:
-        runtime.host.bind_starlette(app, [*core_routes, *mailbox_routes])
+        runtime.host.bind_starlette(app, [*core_routes, *collaboration_routes])
     return app
 
 

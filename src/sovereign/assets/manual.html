@@ -14,7 +14,6 @@
       </div>
       <div class="toolbar">
         <span id="statusText" class="top-status">Loading</span>
-        <button id="inviteBtn">Invite</button>
         <button id="buildTokenBtn">Build token for topic</button>
         <button id="connectTokenBtn">Connect via token</button>
         <button id="leaveBtn">Leave</button>
@@ -920,29 +919,6 @@
           log(error.message, true);
         }
       };
-
-      el("inviteBtn").onclick = () =>
-        openModal(
-          "Invite",
-          [
-            { name: "address", label: "Peer address", value: "http://127.0.0.1:8002" },
-            { name: "topic", label: "Topic UUID", value: selectedUuid || "" },
-            {
-              name: "readOnly",
-              label: "read-only",
-              type: "checkbox",
-            },
-          ],
-          async (form) => {
-            const readOnly = form.get("readOnly") === "on";
-            await api("/api/protocol-explorer/invite", {
-              address: form.get("address").trim(),
-              topic_uuid: form.get("topic").trim(),
-              read_only: readOnly,
-            });
-            log(readOnly ? "Read-only invite sent" : "Invite sent");
-          },
-        );
 
       el("buildTokenBtn").onclick = () =>
         openModal(

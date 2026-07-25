@@ -14,7 +14,7 @@ details unless this document explicitly says otherwise.
 The current exports are: `ApplicationFacade`, `ApplicationFacadeLookup`,
 `ApplicationInstance`, `ApplicationManifest`, `ApplicationRegistration`,
 `ApplicationResultView`, `ApplicationServices`, `ApplicationSpec`, `Channel`,
-`ChannelAcceptance`, `ChannelManager`, `ChannelResult`,
+`ChannelAcceptance`, `ChannelResult`,
 `EffectDeliveryChannel`, `IncompatibleApplicationFacade`, `Invitation`,
 `PollingChannel`, `PollingEndpoint`, `ProtocolNode`, `ProtocolResult`,
 `ProtocolState`, `Session`, `SessionEffect`, `SessionResult`,
@@ -29,6 +29,10 @@ An application module exports:
 Applications may register shared topic roots through `ApplicationRegistration`.
 They return domain mutations as `SessionResult` and `SessionEffect`; Core owns
 effect delivery.
+
+`ApplicationServices` deliberately exposes no channel manager. Applications
+receive a read-only collaboration view and an effect-delivery callable; channel
+configuration, invitations and topic/channel bindings are Core-only.
 
 ## Optional application facades
 
@@ -57,8 +61,8 @@ Cockpit consumes it without declaring S-Kanban as a package dependency.
 ## Channel extension API
 
 `Channel`, `EffectDeliveryChannel`, `PollingChannel`, and `PollingEndpoint` are
-the supported extension contracts. `ChannelManager` owns registration,
-descriptor negotiation, token composition, effect routing, and polling.
+the supported extension contracts. Core owns registration, descriptor
+negotiation, invitation composition, effect routing, and polling.
 Concrete HTTP, mailbox, relay-manager, storage, Starlette controller, and server
 modules are Core implementation details in `0.x`.
 
