@@ -7,6 +7,7 @@ from .application import (
     json_value,
 )
 from .blob_store import avatar_attachment, canonical_attachments
+from .desktop import desktop_main, run_desktop
 from .channel import (
     Channel, ChannelAcceptance, ChannelResult,
     EffectDeliveryChannel, Invitation, PollingChannel, PollingEndpoint,
@@ -28,6 +29,6 @@ __all__ = [
     "PollingEndpoint", "ProtocolNode", "ProtocolResult", "ProtocolState",
     "Session", "SessionEffect", "SessionResult", "UnsupportedProtocolVersion",
     "__version__", "application_result_view", "avatar_attachment",
-    "canonical_attachments", "json_value",
-    "protocol_node_from_envelope", "protocol_tree_envelope",
+    "canonical_attachments", "desktop_main", "json_value",
+    "protocol_node_from_envelope", "protocol_tree_envelope", "run_desktop",
 ]

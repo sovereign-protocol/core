@@ -19,8 +19,8 @@ The current exports are: `ApplicationFacade`, `ApplicationFacadeLookup`,
 `PollingChannel`, `PollingEndpoint`, `ProtocolNode`, `ProtocolResult`,
 `ProtocolState`, `Session`, `SessionEffect`, `SessionResult`,
 `UnsupportedProtocolVersion`, `application_result_view`, `avatar_attachment`,
-`canonical_attachments`, `json_value`, `protocol_node_from_envelope`, and
-`protocol_tree_envelope`.
+`canonical_attachments`, `desktop_main`, `json_value`,
+`protocol_node_from_envelope`, `protocol_tree_envelope`, and `run_desktop`.
 
 An application module exports:
 
@@ -46,6 +46,20 @@ adds a new kind of attachment - a card's file, a document's exhibit - without
 any Core change. Bytes are uploaded to Core's `/api/blob` endpoint, which owns
 the size limit and content addressing; only the reference reaches the
 application.
+
+## Desktop window
+
+Serving a host into its own window is Core's work, not an application's: it
+owns the runtime, the server and the shutdown. `run_desktop` starts the host
+on loopback and shows the window until it is closed; `desktop_main` wraps it
+as a command line. An application supplies only what is its own - which module
+to start and what to title the window - and declares the `pywebview`
+dependency itself, so a headless install stays headless.
+
+Because the port is chosen at start-up, the session file is not derived from
+it and is not placed under the working directory. It goes to a per-user
+application directory, so state survives a different port or launch location.
+An explicit `storage_file` still wins.
 
 ## Optional application facades
 
