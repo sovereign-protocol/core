@@ -680,7 +680,7 @@ Exit: editable installation and clean installation both pass.
 
 | Distribution | Import package | Monorepo source root |
 |---|---|---|
-| `sovereign-core 0.1.0` | `sovereign` | `src/sovereign` |
+| `sovereign-protocol 0.1.0` | `sovereign` | `src/sovereign` |
 | `s-kanban 0.1.0a1` | `s_kanban` | `applications/s-kanban/src/s_kanban` |
 | `personal-cockpit 0.1.0a1` | `personal_cockpit` | `applications/personal-cockpit/src/personal_cockpit` |
 
@@ -971,7 +971,7 @@ rehearsal:
   package before public contribution; a second focused review before any frozen
   executable. A green rehearsal is evidence for that review, not a substitute.
 - **G2 name availability.** Repository, distribution, domain, and trademark
-  checks for `sovereign-core`, `s-kanban`, `personal-cockpit`.
+  checks for `sovereign-protocol`, `s-kanban`, `personal-cockpit`.
 - **Credential rotation.** The scanner proves no secret is *present*; it cannot
   prove no credential ever needs rotating.
 - **O1 lead-application choice**, still provisional.
@@ -992,7 +992,7 @@ Windows 11, Python 3.14.2, after the User-Agent fix below.
 | Check | Result |
 |---|---|
 | Distributions built | 4 wheels — `sovereign_core-0.1.0`, `s_agreement-0.1.0a1`, `s_kanban-0.1.0a1`, `personal_cockpit-0.1.0a1` |
-| Cross-repository install | pinned (`sovereign-core==0.1.0`) and editable, both green |
+| Cross-repository install | pinned (`sovereign-protocol==0.1.0`) and editable, both green |
 | Per-repository tests | passed in all three isolated repositories |
 | Packaged license payloads | present in every wheel |
 | Remotes | absent in all three clones |

@@ -115,7 +115,31 @@ version negotiation. All are deferred past `1.0`.
 | L3 | Profile/UI license boundary? | Minimal profile and host shell follow Core’s LGPL; application UIs follow their application license | **ACCEPTED** |
 | L4 | Documentation license? | Documentation and normative S-Protocol specification use `CC-BY-4.0`; code/fixtures retain repository software license | **ACCEPTED** |
 | G1 | Repository owner? | Sovereign Protocol GitHub organization; founder is sole initial owner/merger | **ACCEPTED** |
-| G2 | Names? | Organization repos `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; distribution `sovereign-core`; import `sovereign` | **ACCEPTED, subject to availability/trademark checks** |
+| G2 | Names? | Organization repos `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; distribution `sovereign-protocol`; import `sovereign` | **ACCEPTED — availability check fired, see below** |
+
+### G2 availability outcome — the distribution was renamed
+
+The check G2 was made conditional on found a conflict, so the decision is
+recorded here rather than silently applied.
+
+`sovereign-core` is taken on PyPI by an unrelated, actively maintained
+project (1.1.1, released 2026-06-30, itself redirecting to
+`sovereign-sdk-core`). Publishing under it is impossible, and every
+application declares `sovereign-core>=0.1.0,<0.2`, so a released S-Kanban
+would resolve that requirement against a stranger's package, find only
+1.1.1, and fail to install with no indication why.
+
+The Core distribution is therefore **`sovereign-protocol`**, which is free on
+PyPI and matches the GitHub organisation. Repository names are unaffected.
+
+The **import namespace stays `sovereign`** for `0.x`, even though that name is
+also taken on PyPI, by an Envoy control plane. A distribution name and an
+import name are independent, so this blocks nothing; the only consequence is
+that the two packages cannot be installed together, since both would own a
+top-level `sovereign` module. Renaming the namespace would touch every
+application, the public API document and the specification, for a collision
+that is unlikely in practice. P4 permits changing it before `1.0`, so it is
+recorded as a known limitation rather than fixed now.
 | G3 | Initial versions? | Core `0.1.0`; Kanban tag `v0.1.0-alpha.1` / Python `0.1.0a1`, with explicit Core range | **ACCEPTED** |
 | G4 | Executable compliance? | Publish Core wheel/source and Kanban source first; add Windows executable after focused LGPL packaging review | **ACCEPTED** |
 | G5 | Legal review timing? | License/contribution review before publication; frozen-executable review before executable distribution | **ACCEPTED** |

@@ -272,11 +272,26 @@ owned and merged solely by the founder.
 **ACCEPTED G2, subject to availability/trademark checks:**
 
 - Repositories: `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`.
-- Core distribution: `sovereign-core`; Python import namespace: `sovereign`.
+- Core distribution: `sovereign-protocol`; Python import namespace: `sovereign`.
 - Application distribution/executable: `s-kanban`; product name: `S-Kanban`.
 
 Check repository, package, domain, and trademark availability before creation;
 only availability conflicts reopen the naming decision.
+
+**Availability outcome, checked before the first release.** The Core
+distribution was going to be `sovereign-core`; that name is taken on PyPI by
+an unrelated, actively maintained project, so it became `sovereign-protocol`,
+which is free and matches the organisation. Every application's dependency
+declaration moved with it - had they shipped naming `sovereign-core`,
+installing an application would have resolved the requirement against a
+stranger's package and failed. Verified free at the same time: `s-kanban`,
+`personal-cockpit`, `s-agreement`.
+
+The import namespace `sovereign` is also taken on PyPI, by an Envoy control
+plane, but distribution and import names are independent so nothing is
+blocked. The two simply cannot be installed side by side, since each would
+own a top-level `sovereign` module. Kept for `0.x` under P4 and recorded in
+`DESIGN_REFACTOR_DECISION_LOG.md` under G2.
 
 ## 11.1 Source and executable release order
 

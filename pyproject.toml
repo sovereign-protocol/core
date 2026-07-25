@@ -3,7 +3,7 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "sovereign-core"
+name = "sovereign-protocol"
 version = "0.1.0"
 description = "Application-neutral runtime for the Sovereign Protocol"
 requires-python = ">=3.10"
