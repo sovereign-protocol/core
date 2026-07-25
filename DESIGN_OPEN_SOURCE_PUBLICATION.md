@@ -371,6 +371,35 @@ Repository-specific labels can be added after real usage shows a need.
 
 ## 11. Launch sequence
 
+### Site-specific redaction, before step 1
+
+The split rewrites history, and that rewrite is the only chance to remove a
+value that a commit *message* carries. A scan of file contents will not find
+one: a real relay hostname reached the filtered repositories that way and was
+caught only by comparing the live relay configuration against every object and
+message.
+
+The strings cannot be listed in this repository - naming them here would plant
+permanently what is being removed. They go in an untracked file, which
+`.gitignore` refuses to track under any `release-redactions*.txt` name:
+
+```text
+literal:relay.example.org==>relay.example.com
+literal:real-user==>relay-user
+```
+
+Both tools require a decision rather than defaulting to silence:
+
+```powershell
+python tools/rehearse_repository_split.py <out> --redactions release-redactions.local.txt
+python tools/verify_repository_split.py  <out> --redactions release-redactions.local.txt
+```
+
+`--no-redactions` asserts there is genuinely nothing site-specific to remove.
+The verifier does not take the flag on trust: it re-reads the rules and proves
+each literal is absent from every object and every commit and tag message,
+and records the outcome as `site_redactions` in `R8_VERIFICATION.json`.
+
 1. Create private/local split repositories.
 2. Complete license/security/reproducibility gates.
 3. Create GitHub organization or final owner account.
