@@ -98,7 +98,8 @@ class DirectHttpChannel:
     def topic_bindings(self, topic_uuid: str) -> list[dict]:
         session = self.adapter.session
         in_use = any(
-            topic_uuid in topics and session.peer_channel.get(peer_addr) == self.kind
+            topic_uuid in topics
+            and session.peer_channel_for_topic(peer_addr, topic_uuid) == self.kind
             for peer_addr, topics in session.peer_topic_sets.items()
         )
         return [{
@@ -144,25 +145,33 @@ class DirectHttpChannel:
     def leave(self):
         return self.adapter.leave_discussion()
 
-    def read_blob(self, blob_id: str, allow_remote: bool = True):
-        if not allow_remote:
+    def read_blob(
+        self, blob_id: str, allow_remote: bool = True, *,
+        peer_addr: str | None = None, topic_uuid: str | None = None,
+    ):
+        if (
+            not allow_remote
+            or not peer_addr
+            or not topic_uuid
+            or peer_addr not in self.adapter.session.members
+            or self.adapter.session.peer_channel_for_topic(
+                peer_addr, topic_uuid,
+            ) != self.kind
+        ):
             return None
         import requests
-        for peer in sorted(
-            self.adapter.session.members - {self.adapter.session.address}
-        ):
-            if not peer.startswith(("http://", "https://")):
-                continue
-            try:
-                response = requests.get(
-                    f"{peer.rstrip('/')}/api/blob/{blob_id}",
-                    headers={"X-Sovereign-Blob-Hop": "1"},
-                    timeout=10,
-                )
-                if response.status_code == 200:
-                    return response.content
-            except Exception:
-                continue
+        if not peer_addr.startswith(("http://", "https://")):
+            return None
+        try:
+            response = requests.get(
+                f"{peer_addr.rstrip('/')}/api/blob/{blob_id}",
+                headers={"X-Sovereign-Blob-Hop": "1"},
+                timeout=10,
+            )
+            if response.status_code == 200:
+                return response.content
+        except Exception:
+            pass
         return None
 
     def close(self) -> None:

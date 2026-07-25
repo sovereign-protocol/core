@@ -321,6 +321,17 @@ class AgreementLogicTests(unittest.TestCase):
         clause = left.logic.create_clause(section_uuid, "Nested clause")
         clause_uuid = clause.value
         left.channel_manager.execute_effects(clause.effects)
+        proposals = {
+            entry["node"]["uuid"]: entry
+            for entry in right.logic.document_payload(
+                agreement_uuid,
+            )["proposed_nodes"]
+        }
+        self.assertIn(section_uuid, proposals)
+        self.assertIn(clause_uuid, proposals)
+        self.assertEqual(
+            proposals[section_uuid]["node"]["data"]["title"], "New section",
+        )
         events = right.session.analyze_peer_transitions(
             left.address, agreement_uuid,
         )

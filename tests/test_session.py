@@ -71,6 +71,7 @@ class SessionTests(unittest.TestCase):
         ).value
         session.start_discussion(topic.uuid)
         session.add_peer("si-b", topic.uuid)
+        session.bind_peer_topic_channel("si-b", topic.uuid, "http")
 
         result = session.create_child(topic.uuid, {"name": "child"}, {})
 
@@ -177,6 +178,7 @@ class SessionTests(unittest.TestCase):
         # as "fall back to some other list" is exactly the bug that let a
         # peer from an unrelated topic leak into this one.
         session = Session("si-a")
+        session.bind_peer_topic_channel("si-b", "topic-1", "http")
 
         result = session.handle_join({
             "from_addr": "si-b",
@@ -197,6 +199,9 @@ class SessionTests(unittest.TestCase):
 
     def test_handle_join_uses_members_per_topic(self):
         session = Session("si-a")
+        session.bind_peer_topics_channel(
+            "si-b", {"topic-1", "topic-2"}, "http",
+        )
 
         result = session.handle_join({
             "from_addr": "si-b",
@@ -223,6 +228,9 @@ class SessionTests(unittest.TestCase):
 
     def test_handle_join_can_limit_pull_topics(self):
         session = Session("si-a")
+        session.bind_peer_topics_channel(
+            "si-b", {"owned-by-a", "owned-by-b"}, "http",
+        )
 
         result = session.handle_join({
             "from_addr": "si-b",
@@ -251,6 +259,7 @@ class SessionTests(unittest.TestCase):
         session = Session("si-a")
         cached = ProtocolNode({"name": "cached-topic"})
         session.apply_peer_subtree("si-b", cached, None)
+        session.bind_peer_topic_channel("si-b", "topic-1", "http")
 
         result = session.handle_join({
             "from_addr": "si-b",
@@ -281,8 +290,8 @@ class SessionTests(unittest.TestCase):
             "si-b",
             cached.uuid,
         ))
-        self.assertEqual(result.effects[0].type, "pull_subtree")
-        self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
+        self.assertEqual(result.effects, [])
+        self.assertNotIn("si-b", session.members)
 
     def test_accept_topic_invitation_attaches_topic_under_other_perspectives(self):
         inviter = Session("si-a")
@@ -469,6 +478,58 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(Session._classify_move(local_node, peer_node), "peer_made_changes")
 
+    def test_move_direction_disambiguates_content_hash_cycle(self):
+        local_node = self._node(
+            "local-content", "peer-content", "todo", "backlog",
+            "identity-a", 19,
+        )
+        peer_node = self._node(
+            "peer-content", "local-content", "doing", "todo",
+            "identity-c", 46,
+        )
+        local_node.content_hash = "local-content"
+        peer_node.content_hash = "peer-content"
+
+        self.assertEqual(
+            Session._classify_content(local_node, peer_node),
+            "local_made_changes",
+        )
+        self.assertEqual(
+            Session._classify_move(local_node, peer_node),
+            "peer_made_changes",
+        )
+        self.assertEqual(
+            Session._classify_node(local_node, peer_node),
+            "peer_made_changes",
+        )
+
+    def test_content_direction_disambiguates_parent_cycle(self):
+        local_node = self._node(
+            "local-content", "base-content", "todo", "doing",
+            "identity-a", 19,
+        )
+        peer_node = self._node(
+            "peer-content", "local-content", "doing", "todo",
+            "identity-c", 46,
+        )
+        local_node.content_hash = "local-content"
+        peer_node.content_hash = "peer-content"
+        local_node.updated_at = "2026-01-01T00:00:01.000+00:00"
+        peer_node.updated_at = "2026-01-01T00:00:00.000+00:00"
+
+        self.assertEqual(
+            Session._classify_content(local_node, peer_node),
+            "peer_made_changes",
+        )
+        self.assertEqual(
+            Session._classify_move(local_node, peer_node),
+            "local_made_changes",
+        )
+        self.assertEqual(
+            Session._classify_node(local_node, peer_node),
+            "peer_made_changes",
+        )
+
     def test_same_origin_sequence_orders_content_without_clock_comparison(self):
         local_node = self._node(
             "local", "base", "doing", "done", "origin-b", 10,
@@ -616,6 +677,8 @@ class SessionTests(unittest.TestCase):
         session = Session("si-a")
         session.add_peer("si-b", "topic-1")
         session.add_peer("si-c", "topic-1")
+        session.bind_peer_topic_channel("si-b", "topic-1", "http")
+        session.bind_peer_topic_channel("si-c", "topic-1", "http")
 
         result = session.leave()
 
@@ -690,6 +753,10 @@ class SessionTests(unittest.TestCase):
         session.add_peer("si-b", "topic-1")
         session.add_peer("si-b", "topic-2")
         session.add_peer("si-c", "topic-1")
+        session.bind_peer_topics_channel(
+            "si-b", {"topic-1", "topic-2"}, "http",
+        )
+        session.bind_peer_topic_channel("si-c", "topic-1", "http")
 
         result = session.leave_topic("topic-1")
 
@@ -735,7 +802,9 @@ class SessionTests(unittest.TestCase):
         bob_session = Session("si-b")
         bob_session.set_identity("Bob")
         session.apply_peer_identity_snapshot("si-b", bob_session.identity.to_dict())
-        session.note_peer_channel("si-b", "http")
+        session.bind_peer_topics_channel(
+            "si-b", {"topic-1", "topic-2"}, "http",
+        )
 
         session.remove_peer("si-b")
 
@@ -746,7 +815,7 @@ class SessionTests(unittest.TestCase):
         self.assertNotIn("si-b", session.peer_perspectives)
         self.assertNotIn("si-b", session.peer_status)
         self.assertNotIn("si-b", session.peer_sync_state)
-        self.assertNotIn("si-b", session.peer_channel)
+        self.assertNotIn("si-b", session.peer_topic_channel)
         # Unrelated peer untouched.
         self.assertIn("si-c", session.members)
         self.assertEqual(session.peer_topic_sets["si-c"], {"topic-1"})

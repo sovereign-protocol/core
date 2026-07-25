@@ -6,7 +6,7 @@ from .application import (
     ApplicationSpec, IncompatibleApplicationFacade, application_result_view,
     json_value,
 )
-from .blob_store import avatar_attachment
+from .blob_store import avatar_attachment, canonical_attachments
 from .channel import (
     Channel, ChannelAcceptance, ChannelResult,
     EffectDeliveryChannel, Invitation, PollingChannel, PollingEndpoint,
@@ -27,6 +27,7 @@ __all__ = [
     "IncompatibleApplicationFacade", "Invitation", "PollingChannel",
     "PollingEndpoint", "ProtocolNode", "ProtocolResult", "ProtocolState",
     "Session", "SessionEffect", "SessionResult", "UnsupportedProtocolVersion",
-    "__version__", "application_result_view", "avatar_attachment", "json_value",
+    "__version__", "application_result_view", "avatar_attachment",
+    "canonical_attachments", "json_value",
     "protocol_node_from_envelope", "protocol_tree_envelope",
 ]

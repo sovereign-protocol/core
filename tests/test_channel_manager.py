@@ -22,6 +22,7 @@ class _Channel:
         self.offered = offered
         self.accept_result = accept
         self.accepted = []
+        self.blob_reads = []
         self.closed = False
 
     def offer_descriptor(self, topics, options):
@@ -44,6 +45,12 @@ class _Channel:
 
     def close(self):
         self.closed = True
+
+    def read_blob(
+        self, blob_id, allow_remote=True, *, peer_addr=None, topic_uuid=None,
+    ):
+        self.blob_reads.append((blob_id, peer_addr, topic_uuid))
+        return self.kind.encode()
 
 
 class _DeliveryChannel(_Channel):
@@ -87,7 +94,7 @@ class ChannelManagerTests(unittest.TestCase):
         }))
         manager.register(_Channel("mailbox", "relay"))
 
-        result = manager.compose_token(["topic-1"])
+        result = manager.compose_token(["topic-1"], {"http": {}})
 
         self.assertTrue(result.ok)
         self.assertEqual(
@@ -118,7 +125,18 @@ class ChannelManagerTests(unittest.TestCase):
         self.assertFalse(result.ok)
         self.assertEqual(result.status_code, 400)
 
-    def test_accept_uses_registration_order_and_falls_back(self):
+    def test_compose_token_requires_an_explicit_channel(self):
+        manager = ChannelManager(Session("http://a"))
+        manager.register(_Channel("http", "http"))
+
+        result = manager.compose_token(["topic-1"])
+
+        self.assertFalse(result.ok)
+        self.assertEqual(
+            result.reason, "select exactly one channel for the invitation",
+        )
+
+    def test_accept_rejects_ambiguous_multi_channel_token(self):
         session = Session("http://a")
         peer = Session("http://b")
         manager = ChannelManager(session)
@@ -136,10 +154,32 @@ class ChannelManagerTests(unittest.TestCase):
             ],
         )
 
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "token must select exactly one channel")
+        self.assertEqual(len(direct.accepted), 0)
+        self.assertEqual(len(mailbox.accepted), 0)
+
+    def test_accept_uses_the_single_selected_channel(self):
+        session = Session("http://a")
+        peer = Session("http://b")
+        manager = ChannelManager(session)
+        mailbox = _Channel("mailbox", "relay", accept=ChannelResult.success(
+            ChannelAcceptance("relay:B", {"status": "ok"}),
+        ))
+        manager.register(_Channel("http", "http"))
+        manager.register(mailbox)
+
+        result = manager.accept_invitation(
+            peer.identity.to_dict(), ["topic-1"], [
+                {"type": "relay", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION},
+            ],
+        )
+
         self.assertTrue(result.ok)
         self.assertEqual(result.value["channels_used"], ["mailbox"])
-        self.assertEqual(session.peer_channel["relay:B"], "mailbox")
-        self.assertEqual(len(direct.accepted), 1)
+        self.assertEqual(
+            session.peer_channel_for_topic("relay:B", "topic-1"), "mailbox",
+        )
         self.assertEqual(len(mailbox.accepted), 1)
 
     def test_accept_replaces_prior_address_for_same_identity(self):
@@ -159,8 +199,39 @@ class ChannelManagerTests(unittest.TestCase):
 
         self.assertTrue(result.ok)
         self.assertNotIn("http://b-old", session.members)
-        self.assertNotIn("http://b-old", session.peer_identity_key)
-        self.assertEqual(session.peer_channel["http://b-new"], "http")
+        self.assertIn("http://b-old", session.peer_identity_key)
+        self.assertEqual(
+            session.peer_channel_for_topic("http://b-new", "topic-1"), "http",
+        )
+
+    def test_accept_replaces_only_overlapping_topics_for_same_identity(self):
+        session = Session("http://a")
+        peer = Session("http://b")
+        identity = peer.identity.to_dict()
+        session.note_indirect_peer_topic("relay:B", "topic-relay")
+        session.apply_peer_identity_snapshot("relay:B", identity)
+        session.bind_peer_topic_channel("relay:B", "topic-relay", "mailbox")
+        manager = ChannelManager(session)
+        manager.register(_Channel(
+            "http", "http",
+            accept=ChannelResult.success(ChannelAcceptance(
+                "http://b", {"status": "ok"},
+            )),
+        ))
+
+        result = manager.accept_invitation(identity, ["topic-http"], [{
+            "type": "http", "descriptor_version": CHANNEL_DESCRIPTOR_VERSION,
+        }])
+
+        self.assertTrue(result.ok)
+        self.assertEqual(
+            session.peer_channel_for_topic("relay:B", "topic-relay"),
+            "mailbox",
+        )
+        self.assertEqual(
+            session.peer_channel_for_topic("http://b", "topic-http"),
+            "http",
+        )
 
     def test_accept_preserves_identity_knowledge_for_indirect_old_address(self):
         session = Session("http://a")
@@ -196,7 +267,11 @@ class ChannelManagerTests(unittest.TestCase):
         manager.register(_DeliveryChannel("http", "http"))
         manager.register(_PollingChannel("mailbox", "relay"))
 
-        self.assertEqual(manager.execute_effects(["x"]), [("many", "x")])
+        effect = SessionEffect(
+            "pull_subtree", "peer-b", {"topic_uuid": "topic-1"},
+            channel_kind="http",
+        )
+        self.assertEqual(manager.execute_effects([effect]), [("many", effect)])
         self.assertEqual(manager.polling_endpoints(), ["poller"])
 
         manager.close()
@@ -209,11 +284,15 @@ class ChannelManagerTests(unittest.TestCase):
         manager = ChannelManager(session)
         manager.register(direct)
         manager.register(alternate)
-        session.note_peer_channel("peer-b", "http")
-        session.note_peer_channel("peer-c", "alternate")
         effects = [
-            SessionEffect("pull_subtree", "peer-c", {}),
-            SessionEffect("pull_subtree", "peer-b", {}),
+            SessionEffect(
+                "pull_subtree", "peer-c", {"topic_uuid": "topic-1"},
+                channel_kind="alternate",
+            ),
+            SessionEffect(
+                "pull_subtree", "peer-b", {"topic_uuid": "topic-1"},
+                channel_kind="http",
+            ),
         ]
 
         deliveries = manager.execute_effects(effects)
@@ -221,6 +300,54 @@ class ChannelManagerTests(unittest.TestCase):
         self.assertEqual(alternate.delivered, [effects[0]])
         self.assertEqual(direct.delivered, [effects[1]])
         self.assertEqual([item[1] for item in deliveries], effects)
+
+    def test_effect_without_explicit_channel_is_rejected(self):
+        manager = ChannelManager(Session("http://a"))
+        manager.register(_DeliveryChannel("http", "http"))
+
+        with self.assertRaisesRegex(RuntimeError, "no explicit channel"):
+            manager.execute_effects([
+                SessionEffect("pull_subtree", "peer-b", {"topic_uuid": "topic-1"}),
+            ])
+
+    def test_blob_read_uses_only_the_explicit_topic_route(self):
+        session = Session("http://a")
+        direct = _Channel("http", "http")
+        mailbox = _Channel("mailbox", "relay")
+        manager = ChannelManager(session)
+        manager.register(direct)
+        manager.register(mailbox)
+        session.bind_peer_topic_channel("relay:B", "topic-1", "mailbox")
+
+        data = manager.read_topic_blob(
+            "sha256:" + "0" * 64, "relay:B", "topic-1",
+        )
+
+        self.assertEqual(data, b"mailbox")
+        self.assertEqual(direct.blob_reads, [])
+        self.assertEqual(len(mailbox.blob_reads), 1)
+        self.assertIsNone(manager.read_topic_blob(
+            "sha256:" + "0" * 64, "http://b", "topic-1",
+        ))
+
+    def test_presence_is_topic_scoped_and_unrouted_means_offline(self):
+        session = Session("http://a")
+        manager = ChannelManager(session)
+        manager.register(_DeliveryChannel("http", "http"))
+        peer_tree = Session("http://b").identity
+        session.apply_peer_subtree("http://b", peer_tree, None)
+        session.note_indirect_peer_topic("http://b", "topic-1")
+        session.bind_peer_topic_channel("http://b", "topic-2", "http")
+
+        unrouted = manager.network_info("topic-1")["peers"]["http://b"]
+        routed = manager.network_info("topic-2")["peers"]["http://b"]
+
+        self.assertEqual(unrouted["status"]["state"], "offline")
+        self.assertEqual(
+            unrouted["channel_liveness"]["state"], "unrouted",
+        )
+        self.assertEqual(routed["status"]["state"], "online")
+        self.assertEqual(routed["channel"], "http")
 
     def test_direct_channel_enforces_policy_and_preserves_read_only_invite(self):
         class Adapter:

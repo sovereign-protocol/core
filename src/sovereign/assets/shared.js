@@ -220,6 +220,8 @@ const SovereignShell = {
   _applications: null,
   _dialogs: false,
   _options: {},
+  _headerSharingTopic: "",
+  _headerSharingPendingTopic: "",
 
   async applications() {
     if (this._applications) return this._applications;
@@ -263,26 +265,23 @@ const SovereignShell = {
           + current.icon + "</svg>";
       }
     }
-    // An aggregator reaches other applications through its own content - its
-    // tiles are the navigation - so it is given none, and nothing links to a
-    // second way of doing the same thing.
-    if (!current || current.role !== "aggregator") {
-      for (const app of applications) {
-        if (app.application_id === options.applicationId) continue;
-        const link = document.createElement("a");
-        link.className = "shell-nav-link icon-btn";
-        link.href = app.asset_prefix;
-        link.title = app.display_name;
-        link.setAttribute("aria-label", app.display_name);
-        if (app.icon) {
-          link.innerHTML =
-            '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
-            + app.icon + "</svg>";
-        } else {
-          link.textContent = app.display_name.slice(0, 1).toUpperCase();
-        }
-        nav.append(link);
+    // Topic applications return through the Cockpit instead of forming a
+    // second navigation mesh among themselves.
+    const cockpit = applications.find((app) => app.role === "aggregator");
+    if (cockpit && cockpit.application_id !== options.applicationId) {
+      const link = document.createElement("a");
+      link.className = "shell-nav-link icon-btn";
+      link.href = cockpit.asset_prefix;
+      link.title = cockpit.display_name;
+      link.setAttribute("aria-label", cockpit.display_name);
+      if (cockpit.icon) {
+        link.innerHTML =
+          '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
+          + cockpit.icon + "</svg>";
+      } else {
+        link.textContent = cockpit.display_name.slice(0, 1).toUpperCase();
       }
+      nav.append(link);
     }
 
     this.refresh();
@@ -291,61 +290,83 @@ const SovereignShell = {
 
   refresh() {
     this.refreshDisagreements();
+    this.refreshSharingHeader();
+    this.refreshCollaborationPane();
+  },
+
+  _renderSharingHeader(people, errorMessage = "") {
     const button = document.getElementById("shellConnectionBtn");
-    const state = this._options.state ? this._options.state() : {};
-    if (!button || !state) return;
+    if (!button) return;
     button.disabled = !this._topic();
-    // Every session peer by default. An application whose view is scoped to
-    // one topic - a board, an agreement - says which addresses belong to it,
-    // so the cluster shows who is on *this* thing rather than everyone.
-    const all = (state.network && state.network.peers) || {};
-    const peers = this._options.peerAddresses
-      ? this._options.peerAddresses().map((addr) => [addr, all[addr] || {}])
-      : Object.entries(all);
     button.replaceChildren();
-    button.className = peers.length ? "peer-cluster" : "peer-cluster local";
-    if (!peers.length) {
-      button.textContent = "Sharing";
-      button.title = "Private — no one else is involved";
+    button.className = people.length ? "peer-cluster" : "peer-cluster local";
+    if (!people.length) {
+      button.textContent = errorMessage ? "Sharing" : "Private";
+      button.title = errorMessage || "Private — no one else is involved";
       return;
     }
-    for (const entry of peers.slice(0, 4)) {
-      const addr = entry[0];
-      const info = entry[1] || {};
-      // An application that models people - names, avatars - can describe a
-      // peer far better than an address allows. Core knows identities, not
-      // faces, so it asks and falls back to initials of the address.
-      const described = this._options.describePeer
-        ? this._options.describePeer(addr) || {} : {};
+    for (const info of people.slice(0, 4)) {
+      const addr = info.address || "";
       const avatar = document.createElement("span");
-      const online = described.online !== undefined
-        ? described.online
-        : !info.status || info.status.state !== "offline";
+      const online = !info.status || info.status.state !== "offline";
       avatar.className = "header-avatar " + (online ? "status-online" : "status-offline");
-      if (described.picture) {
-        avatar.style.backgroundImage = 'url("' + described.picture + '")';
+      if (info.picture) {
+        avatar.style.backgroundImage = 'url("' + info.picture + '")';
       } else {
-        const source = described.label || addr.replace(/^relay:/, "");
+        const source = info.name || addr.replace(/^relay:/, "");
         avatar.textContent = (source.slice(0, 2) || "?").toUpperCase();
       }
-      const label = described.label || addr;
+      const label = info.name || addr;
       avatar.title = info.channel ? label + " (" + info.channel + ")" : label;
       button.append(avatar);
     }
-    if (peers.length > 4) {
+    if (people.length > 4) {
       const more = document.createElement("span");
       more.className = "header-avatar more";
-      more.textContent = "+" + (peers.length - 4);
+      more.textContent = "+" + (people.length - 4);
       button.append(more);
     }
-    button.title = peers
-      .map((entry) => {
-        const described = this._options.describePeer
-          ? this._options.describePeer(entry[0]) || {} : {};
-        const channel = entry[1] && entry[1].channel;
-        return (described.label || entry[0]) + (channel ? " [" + channel + "]" : "");
+    button.title = people
+      .map((info) => {
+        const label = info.name || info.address || "Unknown";
+        return label + (info.channel ? " [" + info.channel + "]" : "");
       })
       .join("\n");
+  },
+
+  async refreshSharingHeader() {
+    const topic = this._topic();
+    if (!topic) {
+      this._headerSharingTopic = "";
+      this._renderSharingHeader([]);
+      return;
+    }
+    if (this._headerSharingTopic !== topic) {
+      this._headerSharingTopic = topic;
+      this._renderSharingHeader([]);
+    }
+    if (this._headerSharingPendingTopic === topic) return;
+    this._headerSharingPendingTopic = topic;
+    try {
+      const response = await fetch(
+        `/api/core/topics/${encodeURIComponent(topic)}/sharing`,
+      );
+      const payload = await response.json();
+      if (!response.ok) {
+        throw new Error(payload.reason || "Could not read sharing status.");
+      }
+      if (this._topic() === topic) {
+        this._renderSharingHeader(payload.people || []);
+      }
+    } catch (error) {
+      if (this._topic() === topic) {
+        this._renderSharingHeader([], error.message);
+      }
+    } finally {
+      if (this._headerSharingPendingTopic === topic) {
+        this._headerSharingPendingTopic = "";
+      }
+    }
   },
 
   async _changed() {
@@ -418,17 +439,7 @@ Object.assign(SovereignShell, {
     const nav = document.createElement("nav");
     nav.className = "shell-nav";
 
-    const create = document.createElement("button");
-    create.type = "button";
-    create.id = "shellCreateTopicBtn";
-    create.className = "shell-create-btn";
-    create.textContent = "+";
-    create.title = "New topic";
-    create.setAttribute("aria-label", "New topic");
-    create.hidden = !options.onCreateTopic;
-    create.onclick = () => options.onCreateTopic && options.onCreateTopic();
-
-    middle.append(brand, nav, create);
+    middle.append(brand, nav);
 
     // ---- right: who is here ------------------------------------------
     const actions = document.createElement("div");
@@ -444,7 +455,7 @@ Object.assign(SovereignShell, {
     connection.type = "button";
     connection.id = "shellConnectionBtn";
     connection.className = "peer-cluster local";
-    connection.textContent = "Sharing";
+    connection.textContent = "Private";
     connection.onclick = () => this.openConnectionPanel();
 
     const avatar = document.createElement("button");
@@ -468,19 +479,129 @@ Object.assign(SovereignShell, {
     if (node) region.append(node);
   },
 
+  setTopicSelector(options) {
+    const region = document.getElementById("shellTopicRegion");
+    if (!region) return;
+    let picker = region.querySelector(".shell-topic-picker");
+    if (!picker) {
+      region.replaceChildren();
+      picker = document.createElement("div");
+      picker.className = "shell-topic-picker";
+
+      const title = document.createElement("input");
+      title.className = "shell-topic-title";
+
+      const toggle = iconButton(
+        '<path d="M6 9l6 6 6-6"></path>',
+        "Switch topic",
+        () => picker.classList.toggle("open"),
+      );
+      toggle.classList.add("shell-topic-switch-btn");
+
+      const menu = document.createElement("div");
+      menu.className = "shell-topic-menu";
+      picker.append(title, toggle, menu);
+      region.append(picker);
+
+      title.oninput = () => this._sizeTopicTitle(title);
+      title.onkeydown = (event) => {
+        if (event.key === "Enter") {
+          event.preventDefault();
+          title.blur();
+        } else if (event.key === "Escape") {
+          title.value = title.dataset.original || "";
+          this._sizeTopicTitle(title);
+          title.blur();
+        }
+      };
+      title.onchange = async () => {
+        const value = title.value.trim();
+        const currentOptions = picker._options || {};
+        if (!value || !currentOptions.onRename) {
+          title.value = title.dataset.original || "";
+          this._sizeTopicTitle(title);
+          return;
+        }
+        try {
+          await currentOptions.onRename(value);
+        } catch (error) {
+          title.value = title.dataset.original || "";
+          this._sizeTopicTitle(title);
+          showToast(error.message, true);
+        }
+      };
+
+      if (!this._topicPickerEventsReady) {
+        document.addEventListener("keydown", (event) => {
+          if (event.key === "Escape") {
+            document.querySelectorAll(".shell-topic-picker.open").forEach(
+              (entry) => entry.classList.remove("open"),
+            );
+          }
+        });
+        document.addEventListener("click", (event) => {
+          const target = event.target instanceof Element
+            ? event.target : event.target.parentElement;
+          if (!target?.closest(".shell-topic-picker")) {
+            document.querySelectorAll(".shell-topic-picker.open").forEach(
+              (entry) => entry.classList.remove("open"),
+            );
+          }
+        });
+        this._topicPickerEventsReady = true;
+      }
+    }
+
+    picker._options = options || {};
+    const topics = options.topics || [];
+    const selected = topics.find(
+      (topic) => topic.uuid === options.selectedUuid,
+    ) || null;
+    const title = picker.querySelector(".shell-topic-title");
+    if (document.activeElement !== title) {
+      title.value = selected?.title || "";
+      title.dataset.original = title.value;
+      this._sizeTopicTitle(title);
+    }
+    title.readOnly = !selected || !options.onRename;
+    title.setAttribute("aria-label", options.label || "Topic");
+
+    const menu = picker.querySelector(".shell-topic-menu");
+    menu.replaceChildren();
+    for (const topic of topics) {
+      const choice = document.createElement("button");
+      choice.type = "button";
+      choice.className = "shell-topic-option";
+      choice.textContent = topic.title || "Untitled";
+      choice.disabled = topic.uuid === options.selectedUuid;
+      choice.onclick = async () => {
+        picker.classList.remove("open");
+        if (!options.onSelect || choice.disabled) return;
+        try {
+          await options.onSelect(topic.uuid);
+        } catch (error) {
+          showToast(error.message, true);
+        }
+      };
+      menu.append(choice);
+    }
+    picker.querySelector(".shell-topic-switch-btn").hidden = topics.length < 2;
+  },
+
+  _sizeTopicTitle(input) {
+    const canvas = (this._topicTitleCanvas ??= document.createElement("canvas"));
+    const context = canvas.getContext("2d");
+    const style = getComputedStyle(input);
+    context.font = `${style.fontWeight} ${style.fontSize} ${style.fontFamily}`;
+    const width = context.measureText(input.value || "").width;
+    input.style.width = `${Math.ceil(Math.max(28, width) + 18)}px`;
+  },
+
   setAppActions(...nodes) {
     const region = document.getElementById("shellAppActions");
     if (!region) return;
     region.replaceChildren();
     for (const node of nodes) if (node) region.append(node);
-  },
-
-  // The topic region belongs to the application until Core owns selection.
-  setTopicRegion(node) {
-    const region = document.getElementById("shellTopicRegion");
-    if (!region) return;
-    region.replaceChildren();
-    if (node) region.append(node);
   },
 
   // ---- profile -----------------------------------------------------------
@@ -986,6 +1107,7 @@ Object.assign(SovereignShell, {
     const state = this._options.state ? this._options.state() : {};
     const items = state.agenda_items || [];
     const list = document.getElementById("shellAgendaList");
+    if (!list) return;
     list.replaceChildren();
     if (!items.length) {
       const empty = document.createElement("p");
@@ -995,6 +1117,20 @@ Object.assign(SovereignShell, {
     }
     for (const item of items) list.append(this._agendaRow(item));
     document.getElementById("shellAgendaForm").hidden = !this._agendaRoutes();
+  },
+
+  refreshCollaborationPane() {
+    const pane = document.getElementById("shellCollabPane");
+    if (!pane || pane.hidden) return;
+
+    const agenda = document.getElementById("shellAgendaList");
+    const agendaIsActive = this._dragAgendaUuid
+      || (agenda && agenda.contains(document.activeElement));
+    if (!agendaIsActive) this._renderAgenda();
+
+    this._renderDisagreementList(
+      document.getElementById("shellDisagreementList"),
+    );
   },
 
   // Labels for the two universal modes. An application offering more supplies
@@ -1195,11 +1331,14 @@ Object.assign(SovereignShell, {
     autoAdoptSection.hidden = !adopt;
 
     this._toggleTokenForm(false);
-    await this._loadSharing();
-
     document.getElementById("shellConnOverlay").hidden = false;
     document.getElementById("shellConnPane").hidden = false;
     document.body.classList.add("shell-pane-open-right");
+    try {
+      await this._loadSharing();
+    } catch (error) {
+      this._note("shellTargetsNote", error.message);
+    }
   },
 
   async _loadSharing() {
@@ -1218,6 +1357,10 @@ Object.assign(SovereignShell, {
       const payload = await response.json();
       if (!response.ok) throw new Error(payload.reason || "Could not read sharing.");
       this._sharing = payload;
+      if (this._topic() === topic) {
+        this._headerSharingTopic = topic;
+        this._renderSharingHeader(payload.people || []);
+      }
       this._note("shellTargetsNote", "");
     } catch (error) {
       this._sharing = { people: [], channels: [] };
@@ -1249,7 +1392,7 @@ Object.assign(SovereignShell, {
         + (online ? "status-online" : "status-offline");
       if (info.picture) {
         avatar.style.backgroundImage = 'url("' + info.picture + '")';
-      } else if (!channel.built_in) {
+      } else {
         const source = info.name || addr.replace(/^relay:/, "");
         avatar.textContent = (source.slice(0, 2) || "?").toUpperCase();
       }

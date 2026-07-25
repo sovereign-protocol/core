@@ -203,7 +203,9 @@ class CollaborationService:
         options = {}
         if instance_id:
             options[channel.kind] = {"target_id": instance_id}
-        elif channel.kind != "http":
+        elif channel.kind == "http":
+            options[channel.kind] = {}
+        else:
             return ChannelResult.error("channel instance is required", 400)
         return self._channels.compose_token((topic_uuid,), options)
 

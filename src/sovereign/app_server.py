@@ -346,7 +346,10 @@ def _session_metadata(session: Session) -> dict:
         },
         "peer_status": dict(sorted(session.peer_status.items())),
         "peer_identity_key": dict(sorted(session.peer_identity_key.items())),
-        "peer_channel": dict(sorted(session.peer_channel.items())),
+        "peer_topic_channel": {
+            addr: dict(sorted(bindings.items()))
+            for addr, bindings in sorted(session.peer_topic_channel.items())
+        },
         "observed_topics": {
             addr: sorted(topics)
             for addr, topics in sorted(session.observed_topics.items())
@@ -372,7 +375,7 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
     session.peer_topic_sets.clear()
     session.peer_status.clear()
     session.peer_sync_state.clear()
-    session.peer_channel.clear()
+    session.peer_topic_channel.clear()
     session.app_metadata = dict(metadata.get("app_metadata") or {})
     session.observed_topics = {
         addr: set(topics)
@@ -394,6 +397,22 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
     session.members = {session.address}
     peer_topic_sets = metadata.get("peer_topic_sets") or {}
     peer_fetch_topic_sets = metadata.get("peer_fetch_topic_sets") or {}
+    session.peer_topic_channel = {
+        addr: {
+            topic_uuid: channel_kind
+            for topic_uuid, channel_kind in bindings.items()
+            if (
+                isinstance(topic_uuid, str)
+                and topic_uuid
+                and isinstance(channel_kind, str)
+                and channel_kind
+            )
+        }
+        for addr, bindings in (
+            metadata.get("peer_topic_channel") or {}
+        ).items()
+        if isinstance(addr, str) and addr and isinstance(bindings, dict)
+    }
     # Only peers that were actually real members before persisting (i.e.
     # went through add_peer, not e.g. Session.note_indirect_peer_topic) get
     # restored via add_peer_topics/set_peer_fetch_topics - those calls are
@@ -407,11 +426,17 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
     for peer in sorted(saved_members | set(peer_topic_sets) | set(peer_fetch_topic_sets)):
         topics = [
             topic for topic in peer_topic_sets.get(peer, [])
-            if session.has_node(topic)
+            if (
+                session.has_node(topic)
+                or session.peer_channel_for_topic(peer, topic)
+            )
         ]
         fetch_topics = [
             topic for topic in peer_fetch_topic_sets.get(peer, [])
-            if session.has_node(topic)
+            if (
+                session.has_node(topic)
+                or session.peer_channel_for_topic(peer, topic)
+            )
         ]
         if peer in saved_members:
             if topics:
@@ -435,10 +460,10 @@ def _restore_session_metadata(session: Session, metadata: dict) -> None:
                 "last_error": status.get("last_error"),
             }
     known_peers = set(session.peer_topic_sets) | (session.members - {session.address})
-    session.peer_channel = {
-        addr: kind
-        for addr, kind in (metadata.get("peer_channel") or {}).items()
-        if addr in known_peers and kind in {"http", "mailbox"}
+    session.peer_topic_channel = {
+        addr: bindings
+        for addr, bindings in session.peer_topic_channel.items()
+        if addr in known_peers and bindings
     }
     # peer_sync_state is deliberately not persisted/restored: it exists only
     # to avoid re-sending a sync_status peers already have. peer_perspectives
@@ -827,28 +852,54 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
                 .split(";", 1)[0].strip().lower(),
         })
 
-    def reference_for_blob(blob_id: str) -> dict | None:
+    def blob_references_and_routes(
+        blob_id: str,
+    ) -> tuple[list[dict], list[tuple[str, str]]]:
+        references = []
+        routes = []
         with runtime.session.lock:
-            roots = [runtime.session.protocol.root, *runtime.session.peer_perspectives.values()]
-            for root in roots:
+            roots = [
+                (None, runtime.session.protocol.root),
+                *runtime.session.peer_perspectives.items(),
+            ]
+            for peer_addr, root in roots:
                 stack = [root]
                 while stack:
                     node = stack.pop()
                     for item in canonical_attachments(node.data.get("attachments")):
                         if item["blob_id"] == blob_id:
-                            return item
+                            references.append(item)
+                            if peer_addr:
+                                for topic_uuid in (
+                                    runtime.session.peer_topics_for_node(
+                                        peer_addr, node.uuid,
+                                    )
+                                ):
+                                    if (
+                                        runtime.session.peer_channel_for_topic(
+                                            peer_addr, topic_uuid,
+                                        )
+                                    ):
+                                        routes.append((peer_addr, topic_uuid))
                     stack.extend(node.children)
-        return None
+        return references, sorted(set(routes))
 
     def resolve_blob(blob_id: str, allow_peer_fetch: bool) -> bytes | None:
         local = runtime.blob_store.read_blob(blob_id)
         if local is not None:
             return local
-        fetched = runtime.channel_manager.read_blob(
-            blob_id, allow_remote=allow_peer_fetch,
-        )
-        if fetched is not None and runtime.blob_store.write_blob(fetched) == blob_id:
-            return fetched
+        if not allow_peer_fetch:
+            return None
+        _references, routes = blob_references_and_routes(blob_id)
+        for peer_addr, topic_uuid in routes:
+            fetched = runtime.channel_manager.read_topic_blob(
+                blob_id, peer_addr, topic_uuid,
+            )
+            if (
+                fetched is not None
+                and runtime.blob_store.write_blob(fetched) == blob_id
+            ):
+                return fetched
         return None
 
     async def api_blob_get(request: Request):
@@ -868,7 +919,8 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             return JSONResponse(
                 {"status": "error", "reason": "blob not found"}, status_code=404,
             )
-        reference = reference_for_blob(blob_id) or {}
+        references, _routes = blob_references_and_routes(blob_id)
+        reference = references[0] if references else {}
         mime = str(reference.get("mime") or "application/octet-stream").lower()
         if mime not in SAFE_IMAGE_MIMES or not is_valid_image(data, mime):
             mime = "application/octet-stream"
@@ -929,13 +981,22 @@ async def drain_peer_update_hook(runtime: AppRuntime, passes: int = 4) -> None:
 async def refresh_shared_peer_topics(runtime: AppRuntime) -> None:
     effects = []
     for peer, topic_uuids in sorted(runtime.session.peer_topic_sets.items()):
-        if peer == runtime.session.address:
+        if (
+            peer == runtime.session.address
+            or peer not in runtime.session.members
+        ):
             continue
         for topic_uuid in sorted(topic_uuids):
+            channel_kind = runtime.session.peer_channel_for_topic(
+                peer, topic_uuid,
+            )
+            if not channel_kind:
+                continue
             effects.append(SessionEffect(
                 "pull_subtree",
                 peer,
                 {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
+                channel_kind=channel_kind,
             ))
     if effects:
         await asyncio.to_thread(runtime.channel_manager.execute_effects, effects)

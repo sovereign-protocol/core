@@ -150,6 +150,7 @@ class HttpTransportAdapter:
                                 "node_uuid": topic_uuid,
                                 "topic_uuid": topic_uuid,
                             },
+                            channel_kind=effect.channel_kind,
                         ))
                     except Exception as fallback_exc:
                         exc = fallback_exc
@@ -343,30 +344,22 @@ class HttpTransportAdapter:
             response.get("topic_members") or {}, response_topic_uuids,
         )
         all_members = set()
-        indirect_members: dict[str, set[str]] = {}
         for current_topic_uuid, members in topic_members.items():
             for member in members:
                 all_members.add(member)
                 if member != self.session.address:
-                    already_known = current_topic_uuid in self.session.peer_topic_sets.get(
-                        member, set(),
-                    )
-                    self.session.add_peer(
-                        member,
-                        current_topic_uuid,
-                        fetch_from_peer=(
-                            member == peer_addr and current_topic_uuid in topic_uuids
-                        ),
-                    )
-                    if (
-                        member != peer_addr
-                        and current_topic_uuid in (
-                            grafted_topic_uuids | pending_topic_uuids
-                        )
-                        and not already_known
-                    ):
-                        indirect_members.setdefault(member, set()).add(
+                    if member == peer_addr:
+                        self.session.add_peer(
+                            member,
                             current_topic_uuid,
+                            fetch_from_peer=current_topic_uuid in topic_uuids,
+                        )
+                    else:
+                        # Membership information is not channel consent.
+                        # Record the participant without creating a reachable
+                        # peer or initiating an implicit HTTP mesh connection.
+                        self.session.note_indirect_peer_topic(
+                            member, current_topic_uuid,
                         )
         if peer_addr != self.session.address:
             # The peer owns the topics we fetched from it. Do not also mark it
@@ -374,23 +367,13 @@ class HttpTransportAdapter:
             # pairwise identity exchange into a global discussion and leaks
             # unrelated peers across otherwise independent application topics.
             self.session.add_peer_topics(peer_addr, topic_uuids)
+            self.session.bind_peer_topics_channel(
+                peer_addr, response_topic_uuids, "http",
+            )
+            self.session.mark_peer_reachable(peer_addr)
             for current_topic_uuid in topic_uuids:
                 all_members.add(peer_addr)
                 topic_members.setdefault(current_topic_uuid, set()).add(peer_addr)
-        for member, topics in sorted(indirect_members.items()):
-            for current_topic_uuid in sorted(topics):
-                self.execute_effect(SessionEffect(
-                    "pull_subtree",
-                    member,
-                    {
-                        "node_uuid": current_topic_uuid,
-                        "topic_uuid": current_topic_uuid,
-                    },
-                ))
-            self.invite_to_discuss(
-                member,
-                topic_uuids=sorted({*topics, *core_topic_uuids}),
-            )
         for current_topic_uuid in response_topic_uuids:
             self.execute_effects(self.session.sync_effects(current_topic_uuid))
         return {
@@ -514,9 +497,25 @@ class HttpTransportAdapter:
 
     def p2p_sync_status(self, payload: dict) -> tuple[dict, int]:
         self.trace.event("transport.p2p_sync_status", payload=payload)
-        result = self.session.handle_sync_status(payload)
         from_addr = payload.get("from_addr")
         incoming_summary = payload.get("summary") or {}
+        incoming_topics = set(
+            (incoming_summary.get("topics") or {}).keys(),
+        )
+        if (
+            from_addr
+            and any(
+                self.session.peer_channel_for_topic(
+                    from_addr, topic_uuid,
+                ) != "http"
+                for topic_uuid in incoming_topics
+            )
+        ):
+            return {
+                "status": "error",
+                "reason": "no direct channel is selected for this topic",
+            }, 409
+        result = self.session.handle_sync_status(payload)
         # my_summary is deliberately recomputed *after* the pulls above run,
         # and replaces the one in result.value (computed before them).
         return self._handle_session_result(
@@ -533,6 +532,13 @@ class HttpTransportAdapter:
 
     def p2p_join(self, payload: dict) -> tuple[dict, int]:
         self.trace.event("transport.p2p_join", payload=payload)
+        from_addr = payload.get("from_addr")
+        if from_addr:
+            self.session.bind_peer_topics_channel(
+                from_addr,
+                set(payload.get("topic_uuids") or []),
+                "http",
+            )
         return self._handle_session_result(self.session.handle_join(payload))
 
     def p2p_announce(self, payload: dict) -> tuple[dict, int]:

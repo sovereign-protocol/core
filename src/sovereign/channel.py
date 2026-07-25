@@ -143,7 +143,9 @@ class ChannelManager:
         topics = self._topics(topic_uuids)
         if not topics:
             return ChannelResult.error("choose at least one topic", 400)
-        options_by_kind = channel_options or {}
+        options_by_kind = (
+            {} if channel_options is None else channel_options
+        )
         if not isinstance(options_by_kind, Mapping):
             return ChannelResult.error("channel_options must be an object", 400)
         channels = self.channels()
@@ -152,14 +154,26 @@ class ChannelManager:
             return ChannelResult.error(
                 f"unknown channel option: {unknown[0]}", 400,
             )
+        if len(options_by_kind) != 1:
+            return ChannelResult.error(
+                "select exactly one channel for the invitation", 400,
+            )
+        offered_channels = tuple(
+            channel for channel in channels
+            if channel.kind in options_by_kind
+        )
+        identity = self.session.identity
+        invitation_topics = self._topics((*topics, identity.uuid))
         descriptors = []
-        for channel in channels:
+        for channel in offered_channels:
             options = options_by_kind.get(channel.kind) or {}
             if not isinstance(options, Mapping):
                 return ChannelResult.error(
                     f"options for channel {channel.kind!r} must be an object", 400,
                 )
-            offered = channel.offer_descriptor(topics, options)
+            # The identity topic must travel over the selected route too. It
+            # is not an out-of-band HTTP fallback.
+            offered = channel.offer_descriptor(invitation_topics, options)
             if not offered.ok:
                 if channel.kind in options_by_kind:
                     return offered
@@ -168,11 +182,10 @@ class ChannelManager:
                 descriptors.append(dict(offered.value))
         if not descriptors:
             return ChannelResult.error("no channel available", 409)
-        identity = self.session.identity
         return ChannelResult.success({
             "token_version": CONNECT_TOKEN_VERSION,
             "identity": identity.to_dict(),
-            "topic_uuids": sorted({*topics, identity.uuid}),
+            "topic_uuids": list(invitation_topics),
             "channels": descriptors,
         })
 
@@ -198,41 +211,43 @@ class ChannelManager:
         offered = [item for item in descriptors if isinstance(item, dict)]
         results: dict[str, Any] = {}
         errors: dict[str, str] = {}
-        selected_channel = None
-        selected = None
-
-        # Registration order is preference order. Direct HTTP is registered
-        # before mailbox, preserving direct-first/fallback behavior without a
-        # channel-type branch in the host.
-        for channel in self.channels():
-            descriptor = next((
-                item for item in offered
-                if item.get("type") in channel.descriptor_types
-                and item.get("descriptor_version") == CHANNEL_DESCRIPTOR_VERSION
-            ), None)
-            if descriptor is None:
-                continue
-            accepted = channel.accept_descriptor(descriptor, invitation)
-            if accepted.ok:
-                selected_channel = channel
-                selected = accepted.value
-                results[channel.kind] = dict(selected.details)
-                break
-            errors[channel.kind] = accepted.reason or "channel unavailable"
-
-        if selected_channel is None or not isinstance(selected, ChannelAcceptance):
-            detail = "; ".join(
-                f"{kind}: {reason}" for kind, reason in sorted(errors.items())
+        candidates = []
+        for descriptor in offered:
+            owner = self._descriptor_owner.get(str(descriptor.get("type") or ""))
+            if (
+                owner
+                and descriptor.get("descriptor_version")
+                == CHANNEL_DESCRIPTOR_VERSION
+            ):
+                candidates.append((self.channel(owner), descriptor))
+        if len(candidates) != 1:
+            reason = (
+                "token must select exactly one channel"
+                if candidates else "no supported channel in token"
             )
-            reason = "no usable channel in token"
-            if detail:
-                reason = f"{reason} ({detail})"
             self.session.trace_event(
                 "transport.connect_token_rejected",
                 offered_channel_types=[item.get("type") for item in offered],
                 errors=errors,
             )
             return ChannelResult.error(reason, 409).with_value({"errors": errors})
+        selected_channel, descriptor = candidates[0]
+        accepted = selected_channel.accept_descriptor(descriptor, invitation)
+        selected = accepted.value
+        if not accepted.ok or not isinstance(selected, ChannelAcceptance):
+            errors[selected_channel.kind] = (
+                accepted.reason or "channel unavailable"
+            )
+            self.session.trace_event(
+                "transport.connect_token_rejected",
+                offered_channel_types=[item.get("type") for item in offered],
+                errors=errors,
+            )
+            return ChannelResult.error(
+                f"{selected_channel.kind}: {errors[selected_channel.kind]}",
+                409,
+            ).with_value({"errors": errors})
+        results[selected_channel.kind] = dict(selected.details)
 
         selected_addr = selected.peer_addr
         identity_key = (
@@ -243,18 +258,17 @@ class ChannelManager:
             for old_addr in self.session.addresses_for_identity(identity_key):
                 if old_addr == selected_addr:
                     continue
-                was_direct_member = old_addr in self.session.members
-                self.session.remove_peer(old_addr)
-                # Direct members are superseded endpoints and may be forgotten.
-                # Indirect observations remain valid identity knowledge used to
-                # suppress redundant channel representations. This is a Session
-                # relationship distinction, not an address-format convention.
-                if was_direct_member:
-                    self.session.peer_identity_key.pop(old_addr, None)
+                # Selection is topic-scoped: a new direct route for one topic
+                # cannot erase an SFTP route for another (or vice versa).
+                self.session.remove_peer_topics(
+                    old_addr, invitation.topic_uuids,
+                )
 
         if isinstance(identity, dict):
             self.session.apply_peer_identity_snapshot(selected_addr, identity)
-        self.session.note_peer_channel(selected_addr, selected_channel.kind)
+        self.session.bind_peer_topics_channel(
+            selected_addr, invitation.topic_uuids, selected_channel.kind,
+        )
         self.session.trace_event(
             "transport.connect_token_selected",
             selected_type=selected_channel.kind,
@@ -267,22 +281,19 @@ class ChannelManager:
         })
 
     def _effect_channel(self, effect):
-        target = str(getattr(effect, "target", "") or "")
-        selected_kind = self.session.peer_channel.get(target)
-        selected = self.channel(selected_kind) if selected_kind else None
+        selected_kind = str(
+            getattr(effect, "channel_kind", "") or ""
+        ).strip()
+        if not selected_kind:
+            raise RuntimeError("Session effect has no explicit channel")
+        selected = self.channel(selected_kind)
         if isinstance(selected, EffectDeliveryChannel):
             return selected
         if selected is not None:
             raise RuntimeError(
                 f"selected channel {selected.kind!r} cannot deliver Session effects"
             )
-        channel = next((
-            item for item in self.channels()
-            if isinstance(item, EffectDeliveryChannel)
-        ), None)
-        if channel is None:
-            raise RuntimeError("no effect-delivery channel is registered")
-        return channel
+        raise RuntimeError(f"selected channel {selected_kind!r} is not registered")
 
     def execute_effect(self, effect):
         return self._effect_channel(effect).execute_effect(effect)
@@ -327,9 +338,36 @@ class ChannelManager:
         """Return Session network state enriched by channel capabilities."""
         info = self.session.get_network_info()
         for addr, peer_info in (info.get("peers") or {}).items():
+            channel_kind = (
+                self.session.peer_channel_for_topic(addr, topic_uuid)
+                if topic_uuid else None
+            )
+            peer_info["channel"] = channel_kind or ""
             liveness = self.peer_liveness_for_address(addr, topic_uuid)
             if liveness is not None:
                 peer_info["channel_liveness"] = liveness
+            if not channel_kind:
+                peer_info["status"] = {
+                    "state": "offline",
+                    "failures": 0,
+                    "last_seen": None,
+                    "last_error": "No channel is selected for this topic",
+                }
+            elif channel_kind == "mailbox":
+                peer_info["status"] = {
+                    "state": (
+                        "online"
+                        if (liveness or {}).get("state") == "alive"
+                        else "offline"
+                    ),
+                    "failures": 0,
+                    "last_seen": None,
+                    "last_error": (
+                        None
+                        if (liveness or {}).get("state") == "alive"
+                        else "Mailbox peer is not currently reachable"
+                    ),
+                }
         if include_channel_status:
             info["channels"] = self.status()
         return info
@@ -337,10 +375,20 @@ class ChannelManager:
     def peer_liveness_for_address(
         self, peer_addr: str, topic_uuid: str | None = None,
     ) -> dict | None:
-        kind = self.session.peer_channel.get(peer_addr)
+        kind = (
+            self.session.peer_channel_for_topic(peer_addr, topic_uuid)
+            if topic_uuid else None
+        )
+        if not kind:
+            return {"state": "unrouted"}
         channel = self.channel(kind) if kind else None
         liveness = getattr(channel, "peer_liveness_for_address", None)
-        return liveness(peer_addr, topic_uuid) if liveness else None
+        if liveness:
+            return liveness(peer_addr, topic_uuid)
+        status = self.session.peer_status.get(peer_addr) or {}
+        return {
+            "state": "alive" if status.get("state") == "online" else "stale",
+        }
 
     def close(self) -> None:
         for channel in reversed(self.channels()):
@@ -355,18 +403,27 @@ class ChannelManager:
                     stack.enter_context(lock)
             yield
 
-    def read_blob(self, blob_id: str, allow_remote: bool = True):
-        # Mailbox is registered after HTTP and is cheaper/more deterministic
-        # for a shared attachment, so consult channel capabilities in reverse
-        # registration order.
-        for channel in reversed(self.channels()):
-            reader = getattr(channel, "read_blob", None)
-            if not reader:
-                continue
-            data = reader(blob_id, allow_remote=allow_remote)
-            if data is not None:
-                return data
-        return None
+    def read_topic_blob(
+        self, blob_id: str, peer_addr: str, topic_uuid: str,
+        allow_remote: bool = True,
+    ):
+        if not allow_remote:
+            return None
+        channel_kind = self.session.peer_channel_for_topic(
+            peer_addr, topic_uuid,
+        )
+        if not channel_kind:
+            return None
+        channel = self.channel(channel_kind)
+        reader = getattr(channel, "read_blob", None)
+        if not reader:
+            return None
+        return reader(
+            blob_id,
+            allow_remote=True,
+            peer_addr=peer_addr,
+            topic_uuid=topic_uuid,
+        )
 
     # Named targets remain a concrete mailbox feature until a genuinely
     # distinct second targeted channel exists. Apps use these manager-level

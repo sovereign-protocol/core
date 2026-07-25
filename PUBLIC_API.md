@@ -19,7 +19,8 @@ The current exports are: `ApplicationFacade`, `ApplicationFacadeLookup`,
 `PollingChannel`, `PollingEndpoint`, `ProtocolNode`, `ProtocolResult`,
 `ProtocolState`, `Session`, `SessionEffect`, `SessionResult`,
 `UnsupportedProtocolVersion`, `application_result_view`, `avatar_attachment`,
-`json_value`, `protocol_node_from_envelope`, and `protocol_tree_envelope`.
+`canonical_attachments`, `json_value`, `protocol_node_from_envelope`, and
+`protocol_tree_envelope`.
 
 An application module exports:
 
@@ -33,6 +34,18 @@ effect delivery.
 `ApplicationServices` deliberately exposes no channel manager. Applications
 receive a read-only collaboration view and an effect-delivery callable; channel
 configuration, invitations and topic/channel bindings are Core-only.
+
+## Attachments
+
+Core owns blob storage, transfer and collection; applications own what an
+attachment *means*. `canonical_attachments` validates and normalizes a list of
+attachment references, and `avatar_attachment` selects the `avatar` role from
+one. Any node whose `data["attachments"]` holds canonical references is found by
+Core's publication, peer-fetch and garbage-collection walkers, so an application
+adds a new kind of attachment - a card's file, a document's exhibit - without
+any Core change. Bytes are uploaded to Core's `/api/blob` endpoint, which owns
+the size limit and content addressing; only the reference reaches the
+application.
 
 ## Optional application facades
 

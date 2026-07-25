@@ -96,6 +96,9 @@ class TransportTests(unittest.TestCase):
             "subtree": remote_topic.to_dict(),
             "parent_uuid": None,
         }
+        session.bind_peer_topic_channel(
+            "http://b", remote_topic.uuid, "http",
+        )
 
         payload, status = adapter.p2p_sync_status({
             "from_addr": "http://b",
@@ -109,6 +112,24 @@ class TransportTests(unittest.TestCase):
             "http://b",
             remote_topic.uuid,
         ))
+
+    def test_sync_status_does_not_create_an_implicit_direct_route(self):
+        session = Session("http://a")
+        adapter = HttpTransportAdapter(
+            session, FakeHttpClient(), logger=lambda _: None,
+        )
+
+        payload, status = adapter.p2p_sync_status({
+            "from_addr": "http://b",
+            "summary": {"topics": {"topic-1": "hash"}},
+        })
+
+        self.assertEqual(status, 409)
+        self.assertEqual(payload["status"], "error")
+        self.assertNotIn("http://b", session.members)
+        self.assertIsNone(
+            session.peer_channel_for_topic("http://b", "topic-1"),
+        )
 
     def test_pull_subtree_effect_updates_session_peer_cache(self):
         session = Session("http://a")
@@ -226,12 +247,15 @@ class TransportTests(unittest.TestCase):
             topic.uuid,
         ))
         c_cached = session.get_cached_peer_subtree("http://c", topic.uuid)
-        self.assertIsNotNone(c_cached)
-        self.assertEqual(c_cached.data["name"], "peer-topic")
+        self.assertIsNone(c_cached)
         self.assertIn(topic.uuid, session.active_topic_uuids)
         self.assertIn(session.identity.uuid, session.active_topic_uuids)
         self.assertIn("http://b", session.members)
-        self.assertIn("http://c", session.members)
+        self.assertNotIn("http://c", session.members)
+        self.assertIn(topic.uuid, session.peer_topic_sets["http://c"])
+        self.assertIsNone(
+            session.peer_channel_for_topic("http://c", topic.uuid),
+        )
         self.assertEqual(http.posts[0][0], "http://b/p2p/join")
 
     def test_join_discussion_does_not_flatten_topic_members(self):
@@ -314,14 +338,22 @@ class TransportTests(unittest.TestCase):
     def test_leave_discussion_executes_leave_effects(self):
         session = Session("http://a")
         session.add_peer("http://b", "topic")
+        session.bind_peer_topic_channel("http://b", "topic", "http")
         http = FakeHttpClient()
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
 
         deliveries = adapter.leave_discussion()
 
         self.assertTrue(all(delivery.ok for delivery in deliveries))
-        self.assertIn(("http://b/p2p/leave", {"from_addr": "http://a"}, 2),
-                      http.posts)
+        self.assertIn((
+            "http://b/p2p/leave",
+            {
+                "from_addr": "http://a",
+                "topic_uuid": "topic",
+                "topic_uuids": ["topic"],
+            },
+            2,
+        ), http.posts)
         self.assertEqual(session.members, {"http://a"})
 
     def test_invite_to_discuss_returns_structured_error_on_http_failure(self):

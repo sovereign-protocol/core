@@ -914,6 +914,25 @@ class RelayLogic:
             self._save_state()
         return published
 
+    def _cache_blobs(self, blob_ids) -> None:
+        # Avatar blobs are small, so the MVP eagerly caches them. Besides
+        # making rendering immediate, this makes a client a safe bridge when
+        # it republishes an adopted profile through a different relay target.
+        # Larger future attachments can add a lazy policy without changing
+        # the manifest format. Callers already hold the io lock.
+        if self.blob_store is None or not self.storage:
+            return
+        for blob_id in blob_ids or []:
+            try:
+                blob_hex(blob_id)
+            except ValueError:
+                continue
+            if self.blob_store.has_blob(blob_id):
+                continue
+            blob_data = self.storage.read_blob(blob_id)
+            if blob_data is not None:
+                self.blob_store.write_blob(blob_data)
+
     @_relay_io_locked
     def read_blob(self, blob_id: str) -> bytes | None:
         if not self.storage:
@@ -968,7 +987,9 @@ class RelayLogic:
             "collectible": sorted(collectible),
         }
 
-    def _is_redundant_relay_peer(self, peer_addr: str) -> bool:
+    def _is_redundant_relay_peer(
+        self, peer_addr: str, topic_uuid: str,
+    ) -> bool:
         # True once peer_addr's identity is *currently* reachable through
         # a live non-relay peer. Pure registry lookup - no content
         # walking, so it's cheap enough to just re-run every poll. The
@@ -986,6 +1007,12 @@ class RelayLogic:
             addr != peer_addr
             and not addr.startswith("relay:")
             and addr in self.session.members
+            and self.session.peer_channel_for_topic(addr, topic_uuid)
+            not in {None, "mailbox"}
+            and (
+                self.session.peer_status.get(addr, {}).get("state")
+                == "online"
+            )
             for addr in self.session.addresses_for_identity(identity_key)
         )
 
@@ -1003,6 +1030,9 @@ class RelayLogic:
         # file is per-identity, not per-topic, so read it once per cycle
         # instead of re-fetching (an SFTP round-trip) for each topic.
         presence_cache: dict[str, tuple[dict | None, float | None]] = {}
+        # A peer's profile arrives on every topic it shares with us, but its
+        # attachments only need fetching once per cycle.
+        profile_blobs_read: set[str] = set()
 
         def read_presence(peer_id: str) -> tuple[dict | None, float | None]:
             if peer_id not in presence_cache:
@@ -1034,8 +1064,17 @@ class RelayLogic:
                 if isinstance(profile, dict):
                     with self._session_lock:
                         self.session.apply_peer_identity_snapshot(peer_addr, profile)
+                    # The heartbeat carries the profile itself, so its avatar
+                    # never passes through the topic-head path that fetches
+                    # blobs. Without this the reference syncs but the bytes
+                    # never arrive, and the peer renders as bare initials.
+                    if peer_id not in profile_blobs_read:
+                        profile_blobs_read.add(peer_id)
+                        self._cache_blobs(sorted(referenced_blob_ids(profile)))
                 with self._session_lock:
-                    redundant = self._is_redundant_relay_peer(peer_addr)
+                    redundant = self._is_redundant_relay_peer(
+                        peer_addr, topic_uuid,
+                    )
                     if redundant:
                         self.session.remove_peer(peer_addr)
                 if redundant:
@@ -1146,22 +1185,7 @@ class RelayLogic:
                 needs_publication_ack = ack_publication_seq > int(
                     observed_publications_for_topic.get(peer_id, 0),
                 )
-                # Avatar blobs are small, so the MVP eagerly caches them.
-                # Besides making rendering immediate, this makes a client a
-                # safe bridge when it republishes the adopted profile through
-                # a different relay target. Larger future attachments can add
-                # a lazy policy without changing the manifest format.
-                if self.blob_store is not None:
-                    for blob_id in head.get("blobs") or []:
-                        try:
-                            blob_hex(blob_id)
-                        except ValueError:
-                            continue
-                        if self.blob_store.has_blob(blob_id):
-                            continue
-                        blob_data = self.storage.read_blob(blob_id)
-                        if blob_data is not None:
-                            self.blob_store.write_blob(blob_data)
+                self._cache_blobs(head.get("blobs"))
                 observed_for_me = (head.get("observed") or {}).get(self.identity, {})
                 state_hash = head.get("hash")
                 if not state_hash:
@@ -1237,7 +1261,9 @@ class RelayLogic:
                 # reconciliation recognize this cache as discussing the topic.
                 with self._session_lock:
                     self.session.note_indirect_peer_topic(peer_addr, topic_uuid)
-                    self.session.note_peer_channel(peer_addr, "mailbox")
+                    self.session.bind_peer_topic_channel(
+                        peer_addr, topic_uuid, "mailbox",
+                    )
                     if wants_graft:
                         # Applications own validation, mounting and defaults.
                         # Unknown types remain visible only as peer cache and

@@ -254,5 +254,15 @@ class MailboxChannel:
     def leave(self):
         return []
 
-    def read_blob(self, blob_id: str, allow_remote: bool = True):
-        return self.manager.read_blob(blob_id)
+    def read_blob(
+        self, blob_id: str, allow_remote: bool = True, *,
+        peer_addr: str | None = None, topic_uuid: str | None = None,
+    ):
+        if not allow_remote or not peer_addr or not topic_uuid:
+            return None
+        target_id = self.target_for_topic(topic_uuid)
+        connection = (
+            self.manager.connection_for_target(target_id)
+            if target_id else None
+        )
+        return connection.read_blob(blob_id) if connection else None
