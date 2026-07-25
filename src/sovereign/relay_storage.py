@@ -93,9 +93,17 @@ class LocalFolderRelayStorage:
             "peer": peer_id,
             "topic": topic_uuid,
             "hash": state_hash,
+            "publication_seq": payload.get("_relay_publication_seq", 0),
+            "ack_requested": bool(payload.get("_relay_ack_requested", False)),
+            "ack_publication_seq": payload.get(
+                "_relay_ack_publication_seq", 0,
+            ),
             "updated_at": now_iso(),
             "snapshot": f"snapshots/{state_hash}.json",
             "observed": payload.get("_relay_observed", {}),
+            "observed_publications": payload.get(
+                "_relay_observed_publications", {},
+            ),
             "blobs": sorted(blob_ids or set()),
             "previous_blobs": sorted(previous.get("blobs") or []),
         }
@@ -303,9 +311,17 @@ class SftpRelayStorage:
             "peer": peer_id,
             "topic": topic_uuid,
             "hash": state_hash,
+            "publication_seq": payload.get("_relay_publication_seq", 0),
+            "ack_requested": bool(payload.get("_relay_ack_requested", False)),
+            "ack_publication_seq": payload.get(
+                "_relay_ack_publication_seq", 0,
+            ),
             "updated_at": now_iso(),
             "snapshot": f"snapshots/{state_hash}.json",
             "observed": payload.get("_relay_observed", {}),
+            "observed_publications": payload.get(
+                "_relay_observed_publications", {},
+            ),
             "blobs": sorted(blob_ids or set()),
             "previous_blobs": sorted(previous.get("blobs") or []),
         }

@@ -4,6 +4,7 @@ from sovereign.protocol import ProtocolNode, stable_hash
 from sovereign.session import Session, SessionEffect
 from sovereign.topic_registry import ApplicationRegistration
 from sovereign.transport import HttpTransportAdapter, TransportHttpError
+from sovereign.versions import PROTOCOL_SCHEMA_VERSION
 
 
 class FakeHttpClient:
@@ -91,7 +92,7 @@ class TransportTests(unittest.TestCase):
         }
         summary["sync_hash"] = stable_hash(summary)
         http.get_responses[f"http://b/p2p/subtree/{remote_topic.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": remote_topic.to_dict(),
             "parent_uuid": None,
         }
@@ -115,7 +116,7 @@ class TransportTests(unittest.TestCase):
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
         topic = ProtocolNode({"name": "topic"})
         http.get_responses["http://b/p2p/subtree/topic"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
@@ -136,7 +137,7 @@ class TransportTests(unittest.TestCase):
         topic = ProtocolNode({"name": "topic"})
         http = MissingChangedHttpClient("http://b/p2p/subtree/missing-child")
         http.get_responses["http://b/p2p/subtree/topic"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
@@ -168,7 +169,7 @@ class TransportTests(unittest.TestCase):
         payload["content_hash"] = "stale"
         payload["state_hash"] = "stale"
         http.get_responses["http://b/p2p/subtree/topic"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": payload,
             "parent_uuid": None,
         }
@@ -199,7 +200,7 @@ class TransportTests(unittest.TestCase):
             mount_invitation=True,
         ))
         http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }
@@ -212,7 +213,7 @@ class TransportTests(unittest.TestCase):
         peer_topic.data["name"] = "peer-topic"
         peer_topic.refresh_hashes()
         http.get_responses[f"http://c/p2p/subtree/{topic.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": peer_topic.to_dict(),
             "parent_uuid": None,
         }
@@ -240,12 +241,12 @@ class TransportTests(unittest.TestCase):
         topic_one = ProtocolNode({"name": "one"})
         topic_two = ProtocolNode({"name": "two"})
         http.get_responses[f"http://b/p2p/subtree/{topic_one.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic_one.to_dict(),
             "parent_uuid": None,
         }
         http.get_responses[f"http://b/p2p/subtree/{topic_two.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic_two.to_dict(),
             "parent_uuid": None,
         }
@@ -258,12 +259,12 @@ class TransportTests(unittest.TestCase):
             },
         }
         http.get_responses[f"http://c/p2p/subtree/{topic_one.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic_one.to_dict(),
             "parent_uuid": None,
         }
         http.get_responses[f"http://d/p2p/subtree/{topic_two.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic_two.to_dict(),
             "parent_uuid": None,
         }
@@ -283,7 +284,7 @@ class TransportTests(unittest.TestCase):
         adapter = HttpTransportAdapter(session, http, logger=lambda _: None)
         topic = ProtocolNode({"name": "topic"})
         http.get_responses[f"http://b/p2p/subtree/{topic.uuid}"] = {
-            "protocol_schema_version": 1,
+            "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
             "subtree": topic.to_dict(),
             "parent_uuid": None,
         }

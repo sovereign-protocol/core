@@ -1,8 +1,9 @@
 # Sovereign Protocol serialization and hashing specification
 
-Status: normative for protocol schema version `1` during the `0.x` series.
-Breaking changes are permitted before `1.0`; incompatible input is rejected and
-is not migrated automatically.
+Status: normative for protocol schema version `2` during the `0.x` series.
+Breaking changes are permitted before `1.0`; incompatible channel input is
+rejected. Stored version-1 sessions have the migration exception described
+below.
 
 ## Version domains
 
@@ -11,7 +12,7 @@ The following versions are independent and must not share a wire field:
 | Domain | Current field/value | Status |
 |---|---|---|
 | Python distribution | `0.1.0` | implemented |
-| Protocol tree envelope | `protocol_schema_version: 1` | implemented |
+| Protocol tree envelope | `protocol_schema_version: 2` | implemented |
 | Session persistence envelope | `format: sovereign-session`, `version: 1` | implemented |
 | Connect token | `token_version: 1` | implemented |
 | Channel descriptor | `descriptor_version: 1` | implemented |
@@ -32,7 +33,7 @@ its first 20 lowercase hexadecimal characters.
 ```
 
 The shown values are illustrative. A node's UUID, parent, timestamps,
-children, revision base, and revision origin are excluded.
+children, revision base, revision origin, and revision sequence are excluded.
 
 `state_hash` covers the node's `content_hash` and a list of every immediate
 child's `[uuid, state_hash]` pair. The pairs are sorted lexicographically.
@@ -46,14 +47,18 @@ A serialized node contains:
 - `uuid`, `created_at`, `updated_at`;
 - `data`, `weights`, `deleted`, `parent_uuid`, and recursive `children`;
 - verified `content_hash` and `state_hash`;
-- `base_hash`, `base_parent_uuid`, and `revision_origin`.
+- `base_hash`, `base_parent_uuid`, `revision_origin`, and `revision_seq`.
 
 `base_hash` is the node's content hash before the current revision wave.
 Successive edits by the same `revision_origin` compound against that base.
 Adoption preserves the origin; an independent edit by another origin starts a
-new wave. Revision metadata is deliberately excluded from both hashes.
+new wave. `revision_seq` is a non-negative logical sequence issued by the
+origin and preserved by adopters and forwarders. It orders different revisions
+from the same origin without comparing wall clocks. Zero is reserved for nodes
+migrated from schema version 1. Revision metadata is deliberately excluded from
+both hashes.
 
-The retired field `revision_origin_identity` is invalid in schema version 1.
+The retired field `revision_origin_identity` is invalid in schema version 2.
 
 ## Protocol tree envelope
 
@@ -61,7 +66,7 @@ Every subtree crossing a channel uses:
 
 ```json
 {
-  "protocol_schema_version": 1,
+  "protocol_schema_version": 2,
   "subtree": {"...": "Protocol node"},
   "parent_uuid": null
 }
@@ -72,7 +77,7 @@ schema may be repaired on an explicitly repair-capable ingestion path; a schema
 version mismatch must never be treated as hash damage.
 
 The executable golden example is
-[`tests/fixtures/protocol_tree_v1.json`](tests/fixtures/protocol_tree_v1.json).
+[`tests/fixtures/protocol_tree_v2.json`](tests/fixtures/protocol_tree_v2.json).
 
 ## Other envelopes
 
@@ -82,6 +87,8 @@ A saved session contains `format`, `version`, `protocol_schema_version`,
 descriptor contains its own `descriptor_version` and channel-specific fields.
 
 These outer formats may evolve independently from the protocol tree schema.
+Stored schema-version-1 sessions are migrated in place with `revision_seq: 0`;
+schema-version-1 channel envelopes remain incompatible and are rejected.
 
 The Core public profile is also independent structured data. Version 1 contains
 only `identity_key`, `display_name`, optional avatar data (`picture` and

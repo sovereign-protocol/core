@@ -335,7 +335,26 @@ work — captured here as the agreed target.
   shows up later (chat, comments, notifications) where sequence itself
   carries meaning — not for board/identity state sync.
 
-## 4. Open questions
+## 4. Implemented publication sequencing and polling cadence
+
+- Every publisher persists one monotonically increasing `publication_seq`
+  per topic. Every relay head and snapshot carry that generation.
+- A semantic publication becomes the acknowledgement target. Later
+  acknowledgement-only heads retain that target but do not request an
+  acknowledgement of themselves, preventing ack-of-ack loops while still
+  allowing late peers to confirm the content they actually fetched.
+- `observed_publications` reports the exact semantic publication fetched by
+  each peer. Node-revision observations remain authoritative for adoption
+  and divergence; publication sequences provide transport diagnostics.
+- Regular polling advances from its configured cadence. Slow I/O skips
+  consumed slots, and local-edit wakeups do not move the regular deadline.
+  The conservative response estimate is acknowledgement timing only.
+- `SOVEREIGN_TRACE=events` records semantic changes and failures;
+  `SOVEREIGN_TRACE=timing` additionally records successful relay cycles and
+  phase durations. `off` disables tracing, while legacy `1`/`true` values
+  map to `events`.
+
+## 5. Open questions
 
 1. **Resolved, and deferred out of MVP entirely.** Expiration needs no
    protocol-level handling at all: `expires_at` would just be another

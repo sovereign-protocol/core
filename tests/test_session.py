@@ -442,13 +442,14 @@ class SessionTests(unittest.TestCase):
 
     @staticmethod
     def _node(state_hash, base_hash, parent_uuid, base_parent_uuid,
-              origin=None):
+              origin=None, revision_seq=0):
         node = ProtocolNode({"name": "x"})
         node.state_hash = state_hash
         node.base_hash = base_hash
         node.parent_uuid = parent_uuid
         node.base_parent_uuid = base_parent_uuid
         node.revision_origin = origin
+        node.revision_seq = revision_seq
         return node
 
     def test_opposing_moves_are_divergence(self):
@@ -467,6 +468,38 @@ class SessionTests(unittest.TestCase):
         peer_node.updated_at = "2026-01-01T00:00:01.000+00:00"
 
         self.assertEqual(Session._classify_move(local_node, peer_node), "peer_made_changes")
+
+    def test_same_origin_sequence_orders_content_without_clock_comparison(self):
+        local_node = self._node(
+            "local", "base", "doing", "done", "origin-b", 10,
+        )
+        peer_node = self._node(
+            "peer", "base", "doing", "done", "origin-b", 11,
+        )
+        local_node.content_hash = "local"
+        peer_node.content_hash = "peer"
+        local_node.updated_at = "2026-01-01T00:00:10.000+00:00"
+        peer_node.updated_at = "2026-01-01T00:00:00.000+00:00"
+
+        self.assertEqual(
+            Session._classify_content(local_node, peer_node),
+            "peer_made_changes",
+        )
+
+    def test_same_origin_sequence_orders_repeated_move_without_clock_comparison(self):
+        local_node = self._node(
+            "h0", "h0", "doing", "done", "origin-b", 10,
+        )
+        peer_node = self._node(
+            "h0", "h0", "todo", "done", "origin-b", 11,
+        )
+        local_node.updated_at = "2026-01-01T00:00:10.000+00:00"
+        peer_node.updated_at = "2026-01-01T00:00:00.000+00:00"
+
+        self.assertEqual(
+            Session._classify_move(local_node, peer_node),
+            "peer_made_changes",
+        )
 
     def test_transition_staging_waits_for_peer_observation(self):
         event = {
@@ -1182,6 +1215,42 @@ class SessionTests(unittest.TestCase):
             node_is_eligible=lambda node, event_type: node.data.get("type") != "leaf",
         )
 
+        self.assertNotIn(leaf.uuid, local.protocol.index)
+
+    def test_accept_missing_peer_node_can_adopt_container_without_descendants(self):
+        peer = Session("si-b")
+        topic = peer.create_child(
+            peer.protocol.root.uuid, {"type": "note", "name": "t"}, {},
+        ).value
+        local = Session("si-a")
+        local.adopt_subtree(
+            ProtocolNode.from_dict(topic.to_dict()),
+            local.protocol.root.uuid,
+        )
+        folder = peer.create_child(
+            topic.uuid, {"type": "folder", "name": "new"}, {},
+        ).value
+        leaf = peer.create_child(
+            folder.uuid, {"type": "leaf", "text": "protected"}, {},
+        ).value
+        local.apply_peer_subtree(
+            "si-b",
+            ProtocolNode.from_dict(
+                peer.protocol.index[topic.uuid].to_dict(),
+            ),
+            local.protocol.root.uuid,
+        )
+
+        result = local.accept_peer_node(
+            "si-b", folder.uuid, adopt_descendants=False,
+        )
+
+        self.assertEqual(result.status, "ok")
+        adopted = local.protocol.index[folder.uuid]
+        self.assertEqual(adopted.content_hash, folder.content_hash)
+        self.assertEqual(adopted.revision_origin, folder.revision_origin)
+        self.assertEqual(adopted.revision_seq, folder.revision_seq)
+        self.assertEqual(adopted.children, [])
         self.assertNotIn(leaf.uuid, local.protocol.index)
 
 if __name__ == "__main__":

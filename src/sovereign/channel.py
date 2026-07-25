@@ -327,14 +327,20 @@ class ChannelManager:
         """Return Session network state enriched by channel capabilities."""
         info = self.session.get_network_info()
         for addr, peer_info in (info.get("peers") or {}).items():
-            kind = self.session.peer_channel.get(addr)
-            channel = self.channel(kind) if kind else None
-            liveness = getattr(channel, "peer_liveness_for_address", None)
-            if liveness:
-                peer_info["channel_liveness"] = liveness(addr, topic_uuid)
+            liveness = self.peer_liveness_for_address(addr, topic_uuid)
+            if liveness is not None:
+                peer_info["channel_liveness"] = liveness
         if include_channel_status:
             info["channels"] = self.status()
         return info
+
+    def peer_liveness_for_address(
+        self, peer_addr: str, topic_uuid: str | None = None,
+    ) -> dict | None:
+        kind = self.session.peer_channel.get(peer_addr)
+        channel = self.channel(kind) if kind else None
+        liveness = getattr(channel, "peer_liveness_for_address", None)
+        return liveness(peer_addr, topic_uuid) if liveness else None
 
     def close(self) -> None:
         for channel in reversed(self.channels()):

@@ -268,9 +268,12 @@ dialog menu .danger:not(:last-child) {
 }
 .shell-target-row {
   display: grid;
-  grid-template-columns: 1fr auto auto;
+  grid-template-columns: minmax(0, 1fr) auto;
   gap: 8px;
   align-items: center;
+  padding: 9px;
+  border: 1px solid rgba(127, 127, 127, 0.25);
+  border-radius: 8px;
 }
 .shell-target-form {
   display: grid;
@@ -292,6 +295,23 @@ dialog menu .danger:not(:last-child) {
    of being squeezed into one. */
 .shell-target-form-full {
   grid-column: 1 / -1;
+}
+.shell-target-form[hidden],
+.shell-token-form[hidden] {
+  display: none;
+}
+.shell-token-form {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  border: 1px solid rgba(127, 127, 127, 0.35);
+  border-radius: 8px;
+  padding: 12px;
+}
+.shell-token-form legend {
+  font-size: 12px;
+  opacity: 0.75;
+  padding: 0 4px;
 }
 .shell-panel menu {
   display: flex;
@@ -602,6 +622,14 @@ dialog menu .danger:not(:last-child) {
   padding: 6px 9px;
 }
 .shell-pane button { cursor: pointer; background: rgba(255, 255, 255, 0.06); }
+.shell-pane button.primary {
+  background: var(--shell-accent, #2f6feb);
+  border-color: var(--shell-accent, #2f6feb);
+  color: #fff;
+}
+.shell-pane button.danger {
+  color: #fca5a5;
+}
 .shell-pane .shell-row input { flex: 1 1 auto; min-width: 0; }
 
 .shell-agenda-list {
@@ -618,19 +646,56 @@ dialog menu .danger:not(:last-child) {
   border-radius: 6px;
   background: rgba(127, 127, 127, 0.12);
   border-left: 3px solid transparent;
+  position: relative;
+}
+.shell-agenda-item.has-drag {
+  grid-template-columns: auto minmax(0, 1fr) auto;
 }
 .shell-agenda-item[data-priority="high"] { border-left-color: #f87171; }
 .shell-agenda-item[data-priority="medium"] { border-left-color: #fbbf24; }
 .shell-agenda-item[data-priority="low"] { border-left-color: #60a5fa; }
+.shell-agenda-item.is-dragging { opacity: 0.45; }
+.shell-agenda-item.drop-before::before,
+.shell-agenda-item.drop-after::after {
+  content: "";
+  position: absolute;
+  left: 4px;
+  right: 4px;
+  height: 2px;
+  background: var(--shell-accent, #2f6feb);
+}
+.shell-agenda-item.drop-before::before { top: -4px; }
+.shell-agenda-item.drop-after::after { bottom: -4px; }
 .shell-agenda-text { min-width: 0; overflow-wrap: anywhere; }
 .shell-agenda-actions {
   display: inline-flex;
   align-items: center;
   gap: 6px;
 }
+.shell-agenda-drag {
+  border: 0 !important;
+  background: transparent !important;
+  color: var(--shell-muted) !important;
+  cursor: grab !important;
+  letter-spacing: -3px;
+  min-width: 24px;
+  padding: 2px 7px 2px 4px !important;
+  touch-action: none;
+  user-select: none;
+}
+.shell-agenda-drag:active { cursor: grabbing !important; }
+.shell-agenda-priority-control {
+  min-width: 92px;
+  padding: 4px 6px !important;
+}
+.shell-agenda-priority-label {
+  color: var(--shell-muted);
+  font-size: 12px;
+  white-space: nowrap;
+}
 .shell-agenda-delete { color: #f87171; }
-/* Priority and delete stay out of the way until the row is hovered or the
-   controls are focused, so a settled agenda reads as a plain list. */
+/* Destructive actions stay out of the way until the row is active. Priority
+   remains visible because it is meaningful agenda information. */
 .shell-agenda-hover {
   opacity: 0;
   transition: opacity 0.12s ease;
@@ -662,8 +727,43 @@ dialog menu .danger:not(:last-child) {
   color: var(--shell-muted, #9aa4b2);
 }
 
-/* Connections pane. Peers at the top, then adoption, then the connection
-   list with connect/disconnect, then + Add connection at the bottom. */
+/* Sharing & Sync pane. */
+.shell-auto-adopt-setting {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.shell-auto-adopt-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 10px;
+  align-items: center;
+}
+.shell-auto-adopt-row select {
+  width: 100%;
+}
+.shell-auto-adopt-indicator {
+  display: grid;
+  grid-template-columns: repeat(2, 7px);
+  grid-template-rows: repeat(2, 7px);
+  gap: 2px;
+  width: max-content;
+  padding: 5px;
+  border: 1px solid var(--shell-border, #30363d);
+  border-radius: 5px;
+}
+.shell-auto-adopt-cell {
+  width: 7px;
+  height: 7px;
+  border-radius: 1px;
+  background: rgba(148, 163, 184, 0.28);
+}
+.shell-auto-adopt-cell.filled {
+  background: var(--shell-accent, #2f6feb);
+}
+.shell-auto-adopt-description {
+  min-height: 2.4em;
+}
 .shell-peers-list {
   display: flex;
   flex-direction: column;
@@ -677,13 +777,53 @@ dialog menu .danger:not(:last-child) {
 }
 .shell-peer-name { min-width: 0; overflow-wrap: anywhere; }
 .shell-peer-status { text-align: right; white-space: nowrap; }
-.shell-target-name { min-width: 0; overflow-wrap: anywhere; }
-.shell-target-status {
-  font-size: 12px;
-  color: var(--shell-muted, #9aa4b2);
-  white-space: nowrap;
+.shell-target-identity {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
 }
-.shell-target-status.is-connected { color: #4ade80; }
+.shell-target-name {
+  min-width: 0;
+  overflow-wrap: anywhere;
+  font-weight: 600;
+}
+.shell-channel-statuses {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 4px;
+}
+.shell-channel-badge {
+  padding: 2px 6px;
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--shell-muted, #9aa4b2);
+}
+.shell-channel-badge.is-available {
+  color: #86efac;
+  background: rgba(34, 197, 94, 0.14);
+}
+.shell-channel-badge.is-in-use {
+  color: #93c5fd;
+  background: rgba(47, 111, 235, 0.2);
+}
+.shell-target-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.shell-target-actions button {
+  font-size: 12px;
+  min-height: 30px;
+  padding: 4px 8px;
+}
+.shell-channel-actions {
+  flex-wrap: wrap;
+}
 .shell-target-manage {
   color: var(--shell-text, #e6edf3);
   min-width: 30px;

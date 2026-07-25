@@ -94,7 +94,8 @@ class ProtocolNode:
     def __init__(self, data: dict,
                  weights: dict[str, float] | None = None,
                  parent_uuid: str | None = None,
-                 revision_origin: str | None = None):
+                 revision_origin: str | None = None,
+                 revision_seq: int = 0):
         self.uuid = str(uuid_mod.uuid4())
         self.created_at = now_iso()
         self.updated_at = now_iso()
@@ -118,6 +119,11 @@ class ProtocolNode:
         # It identifies the client that started this revision wave, even
         # when another peer merely forwards or adopts its latest state.
         self.revision_origin = revision_origin
+        # Origin-local logical revision number. It orders successive
+        # revisions from the same author without comparing wall clocks.
+        # Forwarders preserve it unchanged; it is deliberately excluded
+        # from content/state hashes, which describe semantic state only.
+        self.revision_seq = revision_seq
 
     def recompute_content_hash(self) -> str:
         return content_hash(self.data, self.weights, self.deleted)
@@ -150,6 +156,7 @@ class ProtocolNode:
             "base_hash": self.base_hash,
             "base_parent_uuid": self.base_parent_uuid,
             "revision_origin": self.revision_origin,
+            "revision_seq": self.revision_seq,
             "weights": copy.deepcopy(self.weights),
             "data": copy.deepcopy(self.data),
             "parent_uuid": self.parent_uuid,
@@ -173,6 +180,12 @@ class ProtocolNode:
         node.base_hash = payload.get("base_hash", payload["content_hash"])
         node.base_parent_uuid = payload.get("base_parent_uuid", payload.get("parent_uuid"))
         node.revision_origin = payload.get("revision_origin")
+        revision_seq = payload.get("revision_seq", 0)
+        if (isinstance(revision_seq, bool)
+                or not isinstance(revision_seq, int)
+                or revision_seq < 0):
+            raise ValueError("revision_seq must be a non-negative integer")
+        node.revision_seq = revision_seq
         node.weights = copy.deepcopy(payload.get("weights", {}))
         node.data = copy.deepcopy(payload["data"])
         node.parent_uuid = payload.get("parent_uuid")
@@ -233,11 +246,14 @@ class ProtocolState:
 
     def create_child(self, parent_uuid: str, data: dict,
                      weights: dict | None = None,
-                     revision_origin: str | None = None) -> ProtocolResult:
+                     revision_origin: str | None = None,
+                     revision_seq: int = 0) -> ProtocolResult:
         parent = self.index.get(parent_uuid)
         if not parent:
             return ProtocolResult(False, reason="parent not found")
-        child = ProtocolNode(data, weights, parent_uuid, revision_origin)
+        child = ProtocolNode(
+            data, weights, parent_uuid, revision_origin, revision_seq,
+        )
         parent.children.append(child)
         self.index_subtree(child)
         self.cascade_hash(parent_uuid)
@@ -245,7 +261,8 @@ class ProtocolState:
 
     def modify(self, node_uuid: str, data: dict,
                weights: dict | None = None,
-               revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+               revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+               revision_seq: int | None = None) -> ProtocolResult:
         node = self.index.get(node_uuid)
         if not node:
             return ProtocolResult(False, reason="node not found")
@@ -256,23 +273,25 @@ class ProtocolState:
         node.weights = new_weights
         if changed:
             node.updated_at = now_iso()
-            self._begin_revision(node, revision_origin)
+            self._begin_revision(node, revision_origin, revision_seq)
         self.cascade_hash(node_uuid)
         return ProtocolResult(True, True)
 
     def delete(self, node_uuid: str,
-               revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
-        ok = self._delete_impl(node_uuid, revision_origin)
+               revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+               revision_seq: int | None = None) -> ProtocolResult:
+        ok = self._delete_impl(node_uuid, revision_origin, revision_seq)
         return ProtocolResult(ok, ok, None if ok else "delete failed")
 
     def copy(self, source_uuid: str, destination_uuid: str,
-             revision_origin: str | None = None) -> ProtocolResult:
+             revision_origin: str | None = None,
+             revision_seq: int = 0) -> ProtocolResult:
         source = self.index.get(source_uuid)
         destination = self.index.get(destination_uuid)
         if not source or not destination:
             return ProtocolResult(False, reason="source or destination not found")
         clone = self.clone_subtree(
-            source, destination.uuid, revision_origin,
+            source, destination.uuid, revision_origin, revision_seq,
         )
         destination.children.append(clone)
         self.index_subtree(clone)
@@ -280,15 +299,17 @@ class ProtocolState:
         return ProtocolResult(True, clone)
 
     def move(self, source_uuid: str, destination_uuid: str,
-             revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+             revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+             revision_seq: int | None = None) -> ProtocolResult:
         ok = self._move_impl(
-            source_uuid, destination_uuid, revision_origin,
+            source_uuid, destination_uuid, revision_origin, revision_seq,
         )
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
     def move_child(self, source_uuid: str, destination_uuid: str,
                    index: int | None = None,
-                   revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> ProtocolResult:
+                   revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+                   revision_seq: int | None = None) -> ProtocolResult:
         # NOTE on `index`: sibling *position* is not part of any hash
         # (content/state hashes sort their children), so it never syncs -
         # it only affects this local list's order. An app that wants order
@@ -296,7 +317,7 @@ class ProtocolState:
         # an application's own ordering field can do. Passing `index`
         # alone will silently look right locally and wrong on every peer.
         ok = self._move_child_impl(
-            source_uuid, destination_uuid, index, revision_origin,
+            source_uuid, destination_uuid, index, revision_origin, revision_seq,
         )
         return ProtocolResult(ok, ok, None if ok else "move failed")
 
@@ -328,15 +349,15 @@ class ProtocolState:
                 return ProtocolResult(False, reason="destination parent not present")
             if not self._move_child_impl(
                     node_uuid, source.parent_uuid, None,
-                    source.revision_origin):
+                    source.revision_origin, source.revision_seq):
                 return ProtocolResult(False, reason="move not applicable")
         node.data = copy.deepcopy(source.data)
         node.weights = copy.deepcopy(source.weights)
         node.deleted = source.deleted
         node.revision_origin = source.revision_origin
-        # Preserve the source revision's timestamp. Session orders forwarded
-        # same-origin revisions by updated_at, so stamping the adopter's clock
-        # would let a stale adopted copy look newer than the originator's head.
+        node.revision_seq = source.revision_seq
+        # Preserve the source timestamp for protocol-v1 migrated revisions
+        # whose sequence is zero and therefore still use the legacy fallback.
         node.updated_at = source.updated_at
         self.cascade_hash(node_uuid)
         # Adoption copies the complete remote revision, including its base -
@@ -415,7 +436,8 @@ class ProtocolState:
 
     @staticmethod
     def _begin_revision(node: ProtocolNode,
-                        revision_origin: str | None | object) -> None:
+                        revision_origin: str | None | object,
+                        revision_seq: int | None = None) -> None:
         if revision_origin is _REVISION_ORIGIN_UNSET:
             return
         if node.revision_origin != revision_origin:
@@ -425,50 +447,58 @@ class ProtocolState:
             node.base_hash = node.content_hash
             node.base_parent_uuid = node.parent_uuid
         node.revision_origin = revision_origin
+        if revision_seq is not None:
+            node.revision_seq = revision_seq
 
     def clone_subtree(self, node: ProtocolNode, parent_uuid: str | None,
-                      revision_origin: str | None = None) -> ProtocolNode:
+                      revision_origin: str | None = None,
+                      revision_seq: int = 0) -> ProtocolNode:
         clone = ProtocolNode(
             copy.deepcopy(node.data),
             copy.deepcopy(node.weights),
             parent_uuid,
             revision_origin,
+            revision_seq,
         )
         for child in node.children:
             clone.children.append(self.clone_subtree(
-                child, clone.uuid, revision_origin,
+                child, clone.uuid, revision_origin, revision_seq,
             ))
         clone.refresh_hashes_deep()
         return clone
 
     def _delete_impl(self, node_uuid: str,
-                     revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
+                     revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+                     revision_seq: int | None = None) -> bool:
         node = self.index.get(node_uuid)
         if not node or node.parent_uuid is None or node.deleted:
             return False
-        self._mark_deleted_cascade(node, revision_origin)
+        self._mark_deleted_cascade(node, revision_origin, revision_seq)
         node.refresh_hashes_deep()
         self.cascade_hash(node.parent_uuid)
         return True
 
     def _mark_deleted_cascade(self, node: ProtocolNode,
-                              revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> None:
+                              revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+                              revision_seq: int | None = None) -> None:
         if not node.deleted:
-            self._begin_revision(node, revision_origin)
+            self._begin_revision(node, revision_origin, revision_seq)
             node.deleted = True
             node.updated_at = now_iso()
         for child in node.children:
-            self._mark_deleted_cascade(child, revision_origin)
+            self._mark_deleted_cascade(child, revision_origin, revision_seq)
 
     def _move_impl(self, source_uuid: str, destination_uuid: str,
-                   revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
+                   revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+                   revision_seq: int | None = None) -> bool:
         return self._move_child_impl(
-            source_uuid, destination_uuid, None, revision_origin,
+            source_uuid, destination_uuid, None, revision_origin, revision_seq,
         )
 
     def _move_child_impl(self, source_uuid: str, destination_uuid: str,
                           index: int | None = None,
-                          revision_origin: str | None | object = _REVISION_ORIGIN_UNSET) -> bool:
+                          revision_origin: str | None | object = _REVISION_ORIGIN_UNSET,
+                          revision_seq: int | None = None) -> bool:
         node = self.index.get(source_uuid)
         destination = self.index.get(destination_uuid)
         if not node or not destination or node.parent_uuid is None:
@@ -484,7 +514,7 @@ class ProtocolState:
         # A same-parent call is a reorder, not a move: leave the compound
         # move base alone.
         if node.parent_uuid != destination.uuid:
-            self._begin_revision(node, revision_origin)
+            self._begin_revision(node, revision_origin, revision_seq)
         node.parent_uuid = destination.uuid
         node.updated_at = now_iso()
         insert_at = len(destination.children) if index is None else max(0, min(index, len(destination.children)))

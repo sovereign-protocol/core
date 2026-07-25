@@ -9,12 +9,16 @@ from typing import Any
 
 
 class TraceLogger:
-    def __init__(self, path: str | None = None, node: str | None = None):
-        self.path = path
+    _LEVELS = {"off": 0, "events": 1, "timing": 2}
+
+    def __init__(self, path: str | None = None, node: str | None = None,
+                 level: str = "events"):
+        self.level = self.normalize_level(level)
+        self.path = path if self.level != "off" else None
         self.node = node
         self._lock = threading.Lock()
-        if path:
-            directory = os.path.dirname(os.path.abspath(path))
+        if self.path:
+            directory = os.path.dirname(os.path.abspath(self.path))
             if directory:
                 os.makedirs(directory, exist_ok=True)
 
@@ -22,8 +26,17 @@ class TraceLogger:
     def enabled(self) -> bool:
         return bool(self.path)
 
-    def event(self, kind: str, **fields: Any) -> None:
-        if not self.path:
+    @property
+    def timing_enabled(self) -> bool:
+        return self.enabled and self.level == "timing"
+
+    def event(self, kind: str, *, required_level: str = "events",
+              **fields: Any) -> None:
+        required = self.normalize_level(required_level)
+        if (
+            not self.path
+            or self._LEVELS[self.level] < self._LEVELS[required]
+        ):
             return
         record = {
             "ts": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
@@ -38,14 +51,37 @@ class TraceLogger:
 
     @classmethod
     def from_config(cls, config: dict, port: int, address: str) -> "TraceLogger":
-        path = config.get("trace_log_file") or os.environ.get("SOVEREIGN_TRACE_LOG")
-        if not path and os.environ.get("SOVEREIGN_TRACE"):
+        raw_environment_level = os.environ.get("SOVEREIGN_TRACE")
+        level = cls.normalize_level(
+            raw_environment_level
+            if raw_environment_level is not None
+            else config.get("trace_level", "events")
+        )
+        if level == "off":
+            return cls.disabled()
+        path = config.get("trace_log_file") or os.environ.get(
+            "SOVEREIGN_TRACE_LOG",
+        )
+        if not path and raw_environment_level is not None:
             path = str(Path.cwd() / "data" / f"trace_{port}.jsonl")
-        return cls(path, node=address)
+        return cls(path, node=address, level=level)
 
     @classmethod
     def disabled(cls) -> "TraceLogger":
-        return cls()
+        return cls(level="off")
+
+    @classmethod
+    def normalize_level(cls, value: Any) -> str:
+        if value is None:
+            return "off"
+        normalized = str(value).strip().lower()
+        if normalized in {"", "0", "false", "no", "off", "none"}:
+            return "off"
+        if normalized == "timing":
+            return "timing"
+        # Backward compatibility: SOVEREIGN_TRACE=1/true and any other
+        # previously accepted non-empty value enable ordinary event tracing.
+        return "events"
 
     @classmethod
     def _jsonable(cls, value: Any) -> Any:

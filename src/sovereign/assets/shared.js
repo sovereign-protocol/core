@@ -650,7 +650,7 @@ Object.assign(SovereignShell, {
     button.classList.toggle("has-divergence", diverged > 0);
     button.classList.toggle("has-items", items.length > 0);
     button.title = items.length
-      ? "Open what is not yet in agreement"
+      ? "Open current divergences"
       : "Everything on this topic is in agreement";
     if (!status) return;
     status.hidden = false;
@@ -671,7 +671,7 @@ Object.assign(SovereignShell, {
     if (!items.length) {
       const empty = document.createElement("p");
       empty.className = "shell-note";
-      empty.textContent = "Everything on this topic is in agreement.";
+      empty.textContent = "No current divergences.";
       list.append(empty);
       return;
     }
@@ -747,7 +747,7 @@ Object.assign(SovereignShell, {
       "</form>",
       "</div>",
       '<div class="shell-pane-section">',
-      '<h3 id="shellNotAlignedTitle">Not yet in agreement</h3>',
+      '<h3 id="shellNotAlignedTitle">Current divergences</h3>',
       '<div id="shellDisagreementList" class="shell-disagreement-list"></div>',
       "</div>",
       "</aside>",
@@ -823,6 +823,98 @@ Object.assign(SovereignShell, {
     const row = document.createElement("div");
     row.className = "shell-agenda-item";
     row.dataset.priority = item.data.priority || "";
+    row.dataset.itemUuid = item.uuid;
+
+    if (routes && routes.move) {
+      row.classList.add("has-drag");
+      row.draggable = true;
+      const handle = document.createElement("button");
+      handle.type = "button";
+      handle.className = "shell-agenda-drag";
+      handle.textContent = "⋮⋮";
+      handle.title = "Drag to rearrange";
+      handle.setAttribute("aria-label", "Drag to rearrange");
+      const clearDrag = () => {
+        this._dragAgendaUuid = "";
+        row.classList.remove("is-dragging");
+        document.querySelectorAll(".shell-agenda-item").forEach((entry) => {
+          entry.classList.remove("drop-before", "drop-after");
+        });
+      };
+      const targetAt = (clientX, clientY) => {
+        const target = document.elementFromPoint(
+          clientX, clientY,
+        )?.closest(".shell-agenda-item");
+        document.querySelectorAll(".shell-agenda-item").forEach((entry) => {
+          entry.classList.remove("drop-before", "drop-after");
+        });
+        if (!target || target.dataset.itemUuid === item.uuid) return null;
+        const bounds = target.getBoundingClientRect();
+        const after = clientY > bounds.top + bounds.height / 2;
+        target.classList.add(after ? "drop-after" : "drop-before");
+        return { target, after };
+      };
+      const finishDrag = async (clientX, clientY) => {
+        if (this._dragAgendaUuid !== item.uuid) return;
+        const placement = targetAt(clientX, clientY);
+        clearDrag();
+        if (!placement) return;
+        const targetUuid = placement.target.dataset.itemUuid || "";
+        if (!targetUuid || targetUuid === item.uuid) return;
+        const items = (
+          (this._options.state ? this._options.state() : {}).agenda_items || []
+        ).filter((entry) => entry.uuid !== item.uuid);
+        let index = items.findIndex((entry) => entry.uuid === targetUuid);
+        if (index < 0) return;
+        if (placement.after) index += 1;
+        try {
+          await this._post(routes.move, { item_uuid: item.uuid, index });
+          await this._changed();
+          this.openCollab();
+        } catch (error) { showToast(error.message, true); }
+      };
+      handle.onmousedown = (event) => {
+        if (event.button !== 0) return;
+        event.preventDefault();
+        this._dragAgendaUuid = item.uuid;
+        row.classList.add("is-dragging");
+        const move = (moveEvent) => {
+          if (this._dragAgendaUuid === item.uuid) {
+            targetAt(moveEvent.clientX, moveEvent.clientY);
+          }
+        };
+        const up = (upEvent) => {
+          document.removeEventListener("mousemove", move);
+          document.removeEventListener("mouseup", up);
+          finishDrag(upEvent.clientX, upEvent.clientY);
+        };
+        document.addEventListener("mousemove", move);
+        document.addEventListener("mouseup", up);
+      };
+      row.ondragstart = (event) => {
+        if (this._dragAgendaUuid !== item.uuid) {
+          event.preventDefault();
+          return;
+        }
+        if (event.dataTransfer) {
+          event.dataTransfer.effectAllowed = "move";
+          event.dataTransfer.setData("text/plain", item.uuid);
+        }
+      };
+      row.ondragover = (event) => {
+        if (!this._dragAgendaUuid || this._dragAgendaUuid === item.uuid) return;
+        event.preventDefault();
+        targetAt(event.clientX, event.clientY);
+      };
+      row.ondrop = (event) => {
+        event.preventDefault();
+        finishDrag(event.clientX, event.clientY);
+      };
+      row.ondragend = () => {
+        if (this._dragAgendaUuid === item.uuid) clearDrag();
+      };
+      row.append(handle);
+    }
 
     const text = document.createElement("span");
     text.className = "shell-agenda-text";
@@ -837,7 +929,10 @@ Object.assign(SovereignShell, {
     // delete stay out of the way until you are looking at your own row.
     if (mine && routes) {
       const priority = document.createElement("select");
-      priority.className = "shell-agenda-hover";
+      priority.className = "shell-agenda-priority-control";
+      priority.setAttribute(
+        "aria-label", "Priority for " + (item.data.text || "agenda topic"),
+      );
       for (const [value, label] of [["", "No priority"], ["high", "High"],
         ["medium", "Medium"], ["low", "Low"]]) {
         const option = document.createElement("option");
@@ -847,11 +942,13 @@ Object.assign(SovereignShell, {
       }
       priority.value = item.data.priority || "";
       priority.onchange = async () => {
+        row.dataset.priority = priority.value || "";
         try {
           await this._post(routes.setPriority, {
             item_uuid: item.uuid, priority: priority.value || null,
           });
           await this._changed();
+          this.openCollab();
         } catch (error) { showToast(error.message, true); }
       };
       const remove = document.createElement("button");
@@ -866,6 +963,13 @@ Object.assign(SovereignShell, {
         } catch (error) { showToast(error.message, true); }
       };
       actions.append(priority, remove);
+    } else {
+      const priority = document.createElement("span");
+      priority.className = "shell-agenda-priority-label";
+      priority.textContent = {
+        high: "High", medium: "Medium", low: "Low",
+      }[item.data.priority] || "No priority";
+      actions.append(priority);
     }
 
     const identity = this._identityFor(item.data.author);
@@ -893,6 +997,10 @@ Object.assign(SovereignShell, {
   // its own labels; Core shows the raw mode rather than inventing wording for
   // a policy it does not interpret.
   AUTO_ADOPT_LABELS: { always: "Adopt automatically", never: "Hold for me to decide" },
+  AUTO_ADOPT_DESCRIPTIONS: {
+    always: "Peer changes are adopted automatically.",
+    never: "Peer changes wait for you to review and adopt them.",
+  },
 
   _autoAdoptControl() {
     const route = this._options.autoAdoptRoute;
@@ -903,11 +1011,20 @@ Object.assign(SovereignShell, {
     const labels = Object.assign(
       {}, this.AUTO_ADOPT_LABELS, this._options.autoAdoptLabels || {},
     );
+    const descriptions = Object.assign(
+      {}, this.AUTO_ADOPT_DESCRIPTIONS,
+      this._options.autoAdoptDescriptions || {},
+    );
 
-    const wrap = document.createElement("label");
-    wrap.className = "shell-setting";
-    wrap.textContent = "Peer changes on this topic";
+    const wrap = document.createElement("div");
+    wrap.className = "shell-auto-adopt-setting";
+    const row = document.createElement("div");
+    row.className = "shell-auto-adopt-row";
+    const indicator = document.createElement("span");
+    indicator.className = "shell-auto-adopt-indicator";
+    indicator.setAttribute("aria-hidden", "true");
     const select = document.createElement("select");
+    select.setAttribute("aria-label", "Automatic adoption");
     for (const mode of modes) {
       const option = document.createElement("option");
       option.value = mode;
@@ -915,7 +1032,25 @@ Object.assign(SovereignShell, {
       select.append(option);
     }
     select.value = state.auto_adopt_mode || "always";
+    const description = document.createElement("p");
+    description.className = "shell-note shell-auto-adopt-description";
+    const renderSelection = () => {
+      indicator.replaceChildren();
+      if (this._options.renderAutoAdoptIndicator) {
+        this._options.renderAutoAdoptIndicator(indicator, select.value);
+      } else {
+        const filled = select.value === "always" ? 4 : 0;
+        for (let index = 0; index < 4; index += 1) {
+          const cell = document.createElement("span");
+          cell.className = "shell-auto-adopt-cell";
+          if (index < filled) cell.classList.add("filled");
+          indicator.append(cell);
+        }
+      }
+      description.textContent = descriptions[select.value] || "";
+    };
     select.onchange = async () => {
+      renderSelection();
       try {
         await this._post(route.path, {
           [route.topicKey]: topic, mode: select.value,
@@ -923,7 +1058,9 @@ Object.assign(SovereignShell, {
         await this._changed();
       } catch (error) { showToast(error.message, true); }
     };
-    wrap.append(select);
+    row.append(indicator, select);
+    wrap.append(row, description);
+    renderSelection();
     return wrap;
   },
 
@@ -957,22 +1094,34 @@ Object.assign(SovereignShell, {
       '<div id="shellConnOverlay" class="shell-pane-overlay" hidden></div>',
       '<aside id="shellConnPane" class="shell-pane shell-pane-right" hidden>',
       '<div class="shell-pane-header">',
-      "<strong>Connections</strong>",
+      "<strong>Sharing &amp; Sync</strong>",
       '<button type="button" id="shellConnCloseBtn" class="shell-pane-close" aria-label="Close">&times;</button>',
       "</div>",
       '<div class="shell-pane-section">',
-      "<h3>Connected peers</h3>",
+      "<h3>People involved</h3>",
       '<div id="shellPeersList" class="shell-peers-list"></div>',
       "</div>",
-      '<div class="shell-pane-section" id="shellConnAutoAdopt"></div>',
-      // Application actions (e.g. "stop discussing") sit right under the
-      // adoption control - they are about this topic, not about the relay
-      // endpoints listed below.
-      '<div id="shellConnExtras" class="shell-pane-section"></div>',
+      '<div class="shell-pane-section" id="shellConnAutoAdopt">',
+      "<h3>Automatic adoption</h3>",
+      '<div id="shellConnAutoAdoptControl"></div>',
+      "</div>",
       '<div class="shell-pane-section">',
-      "<h3>Available connections</h3>",
+      "<h3>Channels</h3>",
       '<div id="shellConnTargetList" class="shell-target-list"></div>',
-      '<button type="button" id="shellNewTargetBtn" class="shell-link-btn">+ New target</button>',
+      '<div id="shellChannelActions" class="shell-row shell-channel-actions">',
+      '<button type="button" id="shellUseTokenBtn">Use invite token</button>',
+      '<button type="button" id="shellNewTargetBtn">+ New target</button>',
+      "</div>",
+      '<fieldset id="shellTokenFieldset" class="shell-token-form" hidden>',
+      "<legend>Use an invite token</legend>",
+      '<label for="shellTokenInput">Invite token</label>',
+      '<input id="shellTokenInput" placeholder="Paste an invite token">',
+      '<div class="shell-row">',
+      '<button type="button" id="shellConnectBtn" class="primary">Connect</button>',
+      '<button type="button" id="shellCancelTokenBtn">Cancel</button>',
+      "</div>",
+      '<p id="shellTokenNote" class="shell-note"></p>',
+      "</fieldset>",
       '<fieldset id="shellTargetFieldset" class="shell-target-form" hidden>',
       '<legend id="shellTargetFormTitle">Add an SFTP target</legend>',
       '<input id="shellTargetName" placeholder="Name">',
@@ -991,38 +1140,19 @@ Object.assign(SovereignShell, {
       "</fieldset>",
       '<p id="shellTargetsNote" class="shell-note"></p>',
       "</div>",
-      '<div class="shell-pane-section">',
-      '<button type="button" id="shellAddConnectionBtn" class="primary">+ Add connection</button>',
-      '<p id="shellConnNote" class="shell-note"></p>',
-      "</div>",
       "</aside>",
-      '<dialog id="shellTokenModal" class="shell-dialog">',
-      '<form method="dialog" class="shell-panel">',
-      "<h2>Add a connection</h2>",
-      '<div class="shell-row"><button type="button" id="shellCopyTokenBtn">Copy share token</button></div>',
-      '<label for="shellTokenInput">Paste a share token</label>',
-      '<div class="shell-row"><input id="shellTokenInput" placeholder="Paste a share token"><button type="button" id="shellConnectBtn">Connect</button></div>',
-      '<p id="shellTokenNote" class="shell-note"></p>',
-      '<menu><button type="button" id="shellTokenCloseBtn">Close</button></menu>',
-      "</form></dialog>",
     ].join("");
     document.body.append(...host.children);
     this._connReady = true;
 
     document.getElementById("shellConnCloseBtn").onclick = () => this.closeConnections();
     document.getElementById("shellConnOverlay").onclick = () => this.closeConnections();
+    document.getElementById("shellUseTokenBtn").onclick = () => this._toggleTokenForm(true);
+    document.getElementById("shellCancelTokenBtn").onclick = () => this._toggleTokenForm(false);
     document.getElementById("shellNewTargetBtn").onclick = () => this._toggleTargetForm(true);
     document.getElementById("shellCancelTargetBtn").onclick = () => this._toggleTargetForm(false);
     document.getElementById("shellTestTargetBtn").onclick = () => this._testFormTarget();
     document.getElementById("shellSaveTargetBtn").onclick = () => this._saveTarget();
-    document.getElementById("shellAddConnectionBtn").onclick = () => {
-      document.getElementById("shellTokenNote").textContent = "";
-      document.getElementById("shellTokenInput").value = "";
-      document.getElementById("shellTokenModal").showModal();
-    };
-    document.getElementById("shellTokenCloseBtn").onclick = () =>
-      document.getElementById("shellTokenModal").close();
-    document.getElementById("shellCopyTokenBtn").onclick = () => this._copyToken();
     document.getElementById("shellConnectBtn").onclick = () => this._connect();
   },
 
@@ -1041,9 +1171,7 @@ Object.assign(SovereignShell, {
   // topicUuid overrides the mounted default, so a multi-topic view such as a
   // board overview can open the pane for one specific topic; targetId is
   // that topic's already-assigned target, since a multi-topic view has no
-  // single state().channel_target_id to fall back on. extras carries actions
-  // the shell has no business knowing about - "stop discussing" belongs to
-  // the application that owns the topic type, not to Core.
+  // single state().channel_target_id to fall back on.
   openConnectionPanel(panel) {
     const request = panel || {};
     this._ensureConnectionsPane();
@@ -1055,37 +1183,17 @@ Object.assign(SovereignShell, {
     this._renderPeersList();
 
     const autoAdoptSection = document.getElementById("shellConnAutoAdopt");
-    autoAdoptSection.replaceChildren();
+    const autoAdoptControl = document.getElementById(
+      "shellConnAutoAdoptControl",
+    );
+    autoAdoptControl.replaceChildren();
     const adopt = this._autoAdoptControl();
-    if (adopt) autoAdoptSection.append(adopt);
+    if (adopt) autoAdoptControl.append(adopt);
     autoAdoptSection.hidden = !adopt;
 
+    this._toggleTokenForm(false);
     this._toggleTargetForm(false);
     this._renderConnTargets();
-
-    const extraRow = document.getElementById("shellConnExtras");
-    extraRow.replaceChildren();
-    const extras = request.extras
-      || (this._options.extras ? this._options.extras() : []);
-    for (const extra of extras || []) {
-      const button = document.createElement("button");
-      button.type = "button";
-      if (extra.className) button.className = extra.className;
-      button.textContent = extra.label;
-      button.onclick = () => {
-        this.closeConnections();
-        extra.onClick();
-      };
-      extraRow.append(button);
-    }
-    extraRow.hidden = !(extras && extras.length);
-
-    const topic = this._topic();
-    document.getElementById("shellAddConnectionBtn").disabled = !topic;
-    this._note(
-      "shellConnNote",
-      topic ? "" : "Select or create a topic before connecting it.",
-    );
 
     document.getElementById("shellConnOverlay").hidden = false;
     document.getElementById("shellConnPane").hidden = false;
@@ -1141,42 +1249,40 @@ Object.assign(SovereignShell, {
     }
   },
 
-  // Assignment is implicit: a share token routes through an available relay
-  // so a peer can sync while offline, and sharing the topic through that
-  // relay is what assigns it - there is no separate "connect" step.
-  async _ensureTopicTarget(topic) {
-    if (this._panelAssignedTarget) return this._panelAssignedTarget;
-    let targets = [];
-    try {
-      targets = (await (await fetch("/api/channels/mailbox/targets")).json()).targets || [];
-    } catch (error) {
-      return "";
-    }
-    if (!targets.length) return "";
-    const targetId = targets[0].id;
+  async _assignTopicTarget(targetId) {
+    const topic = this._topic();
+    if (!topic) throw new Error("Select a topic first.");
     await this._post("/api/channels/mailbox/topics/assign", {
-      topic_uuid: topic, target_id: targetId,
+      topic_uuid: topic, target_id: targetId || null,
     });
-    this._panelAssignedTarget = targetId;
+    this._panelAssignedTarget = targetId || "";
     await this._changed();
-    return targetId;
   },
 
-  async _copyToken() {
+  async _copyToken(targetId = "", targetName = "Direct") {
     const topic = this._topic();
-    if (!topic) return;
+    if (!topic) {
+      this._note("shellTargetsNote", "Select a topic before creating a token.");
+      return;
+    }
     try {
-      const targetId = await this._ensureTopicTarget(topic);
+      if (targetId && this._panelAssignedTarget !== targetId) {
+        await this._assignTopicTarget(targetId);
+      }
       const token = await this._post("/api/connect_token", {
         topic_uuids: [topic],
         channel_options: targetId ? { mailbox: { target_id: targetId } } : {},
       });
       await navigator.clipboard.writeText(btoa(JSON.stringify(token)));
-      this._note("shellTokenNote", targetId
-        ? "Token copied - it routes through your relay connection."
-        : "Token copied - direct connection only, no relay configured.");
+      this._note(
+        "shellTargetsNote",
+        targetId
+          ? `Invite token copied. ${targetName} is now in use for this topic.`
+          : "Direct invite token copied.",
+      );
+      await this._renderConnTargets();
     } catch (error) {
-      this._note("shellTokenNote", error.message);
+      this._note("shellTargetsNote", error.message);
     }
   },
 
@@ -1204,14 +1310,29 @@ Object.assign(SovereignShell, {
       field.value = "";
       this._note("shellTokenNote", "Connected.");
       await this._changed();
+      this._toggleTokenForm(false);
+      await this._renderConnTargets();
     } catch (error) {
       this._note("shellTokenNote", error.message);
     }
   },
 
-  // Relay targets are "available connections" - endpoints a topic can be
-  // shared through. The actual connection is with peers (listed above), so a
-  // target's only action here is Discard: stop watching it, remove it.
+  _targetStatus(label, className = "") {
+    const badge = document.createElement("span");
+    badge.className = "shell-channel-badge " + className;
+    badge.textContent = label;
+    return badge;
+  },
+
+  _channelAction(label, action, className = "") {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.textContent = label;
+    if (className) button.className = className;
+    button.onclick = action;
+    return button;
+  },
+
   async _renderConnTargets() {
     const list = document.getElementById("shellConnTargetList");
     if (!list) return;
@@ -1221,29 +1342,98 @@ Object.assign(SovereignShell, {
       const response = await fetch("/api/channels/mailbox/targets");
       targets = (await response.json()).targets || [];
     } catch (error) {
-      this._note("shellTargetsNote", "Could not read relay connections.");
+      this._note("shellTargetsNote", "Could not read channel targets.");
       return;
     }
-    if (!targets.length) {
-      const empty = document.createElement("p");
-      empty.className = "shell-note";
-      empty.textContent = "No relay connections yet.";
-      list.append(empty);
-      return;
+
+    const direct = document.createElement("div");
+    direct.className = "shell-target-row";
+    const directName = document.createElement("div");
+    directName.className = "shell-target-identity";
+    directName.innerHTML = (
+      '<span class="shell-target-name">Direct</span>'
+      + '<span class="shell-note">Live device-to-device channel</span>'
+    );
+    const directStatuses = document.createElement("div");
+    directStatuses.className = "shell-channel-statuses";
+    directStatuses.append(this._targetStatus("Available", "is-available"));
+    const state = this._options.state ? this._options.state() : {};
+    const allPeers = (state.network && state.network.peers) || {};
+    const panelPeers = this._options.peerAddresses
+      ? this._options.peerAddresses().map((addr) => allPeers[addr] || {})
+      : Object.values(allPeers);
+    if (panelPeers.some((peer) => peer.channel === "http")) {
+      directStatuses.append(this._targetStatus("In use", "is-in-use"));
     }
+    const directActions = document.createElement("div");
+    directActions.className = "shell-target-actions";
+    directActions.append(this._channelAction(
+      "Get token", () => this._copyToken(),
+    ));
+    direct.append(directName, directStatuses, directActions);
+    list.append(direct);
+
     for (const target of targets) {
       const row = document.createElement("div");
       row.className = "shell-target-row";
+      const identity = document.createElement("div");
+      identity.className = "shell-target-identity";
       const name = document.createElement("span");
       name.className = "shell-target-name";
       name.textContent = target.name;
-      const status = document.createElement("span");
-      status.className = "shell-target-status";
-      status.textContent = "Available";
-      const discard = document.createElement("button");
-      discard.type = "button";
-      discard.className = "danger";
-      discard.textContent = "Discard";
+      const kind = document.createElement("span");
+      kind.className = "shell-note";
+      kind.textContent = "Mailbox channel";
+      identity.append(name, kind);
+      const inUse = (
+        this._panelAssignedTarget === target.id
+        || (target.topic_uuids || []).includes(this._topic())
+      );
+      const statuses = document.createElement("div");
+      statuses.className = "shell-channel-statuses";
+      statuses.append(this._targetStatus("Available", "is-available"));
+      if (inUse) {
+        statuses.append(this._targetStatus("In use", "is-in-use"));
+      }
+      const actions = document.createElement("div");
+      actions.className = "shell-target-actions";
+      if (inUse) {
+        actions.append(this._channelAction(
+          "Stop using",
+          async () => {
+            try {
+              await this._assignTopicTarget("");
+              await this._renderConnTargets();
+              this._note(
+                "shellTargetsNote",
+                `${target.name} is no longer used for this topic.`,
+              );
+            } catch (error) {
+              this._note("shellTargetsNote", error.message);
+            }
+          },
+        ));
+      } else {
+        actions.append(this._channelAction(
+          "Use for this topic",
+          async () => {
+            try {
+              await this._assignTopicTarget(target.id);
+              await this._renderConnTargets();
+              this._note(
+                "shellTargetsNote",
+                `${target.name} is now in use for this topic.`,
+              );
+            } catch (error) {
+              this._note("shellTargetsNote", error.message);
+            }
+          },
+        ));
+      }
+      actions.append(this._channelAction(
+        "Get token", () => this._copyToken(target.id, target.name), "primary",
+      ));
+      const discard = this._channelAction("Discard", () => {}, "danger");
       discard.title = "Stop using this connection and remove it";
       discard.onclick = () => confirmAction(
         "Discard " + target.name + "?",
@@ -1261,15 +1451,32 @@ Object.assign(SovereignShell, {
           }
         },
       );
-      row.append(name, status, discard);
+      actions.append(discard);
+      row.append(identity, statuses, actions);
       list.append(row);
+    }
+  },
+
+  _toggleTokenForm(show) {
+    const fieldset = document.getElementById("shellTokenFieldset");
+    fieldset.hidden = !show;
+    document.getElementById("shellUseTokenBtn").hidden = !!show;
+    if (show) {
+      this._toggleTargetForm(false);
+      document.getElementById("shellTokenInput").value = "";
+      this._note("shellTokenNote", "");
+      document.getElementById("shellTokenInput").focus();
     }
   },
 
   _toggleTargetForm(show) {
     document.getElementById("shellTargetFieldset").hidden = !show;
     document.getElementById("shellNewTargetBtn").hidden = !!show;
-    if (show) this._resetTargetForm();
+    if (show) {
+      this._toggleTokenForm(false);
+      this._resetTargetForm();
+      document.getElementById("shellTargetName").focus();
+    }
   },
 
   _resetTargetForm() {

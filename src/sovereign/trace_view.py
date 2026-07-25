@@ -41,6 +41,8 @@ def format_record(record: dict) -> str:
     ]
     for key in (
         "peer_addr",
+        "peer_id",
+        "relay_identity",
         "target",
         "topic_uuid",
         "node_uuid",
@@ -52,6 +54,17 @@ def format_record(record: dict) -> str:
         "peer_state_hash",
         "incoming_state_hash",
         "state_hash",
+        "publication_seq",
+        "previous_publication_seq",
+        "ack_publication_seq",
+        "observed_local_publication_seq",
+        "current_publication_seq",
+        "ack_requested",
+        "acknowledgement_pending",
+        "phase",
+        "duration_ms",
+        "next_poll_ms",
+        "acknowledgement_wait_ms",
     ):
         if record.get(key) is not None:
             parts.append(f"{key}={record[key]}")

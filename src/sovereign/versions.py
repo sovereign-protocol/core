@@ -4,7 +4,7 @@
 # force every other consumer to upgrade.
 PACKAGE_VERSION = "0.1.0"
 
-PROTOCOL_SCHEMA_VERSION = 1
+PROTOCOL_SCHEMA_VERSION = 2
 
 SESSION_ENVELOPE_FORMAT = "sovereign-session"
 SESSION_ENVELOPE_VERSION = 1

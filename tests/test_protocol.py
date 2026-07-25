@@ -44,6 +44,29 @@ class ProtocolTests(unittest.TestCase):
         # recursive subtree (state_hash).
         self.assertEqual(node.base_hash, node.content_hash)
         self.assertEqual(node.base_parent_uuid, node.parent_uuid)
+        self.assertEqual(node.revision_seq, 0)
+
+    def test_revision_sequence_roundtrips_without_changing_hashes(self):
+        node = ProtocolNode(
+            {"name": "node"},
+            revision_origin="identity-a",
+            revision_seq=17,
+        )
+        content_before = node.content_hash
+        state_before = node.state_hash
+
+        restored = ProtocolNode.from_dict(node.to_dict())
+
+        self.assertEqual(restored.revision_seq, 17)
+        self.assertEqual(restored.content_hash, content_before)
+        self.assertEqual(restored.state_hash, state_before)
+
+    def test_from_dict_rejects_invalid_revision_sequence(self):
+        payload = ProtocolNode({"name": "node"}).to_dict()
+        payload["revision_seq"] = -1
+
+        with self.assertRaisesRegex(ValueError, "revision_seq"):
+            ProtocolNode.from_dict(payload)
 
     def test_same_origin_modifications_keep_compound_base_hash(self):
         state = ProtocolState("si-a")

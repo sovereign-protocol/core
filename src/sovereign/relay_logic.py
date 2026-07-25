@@ -809,8 +809,18 @@ class RelayLogic:
             if current_hash is None:
                 continue
             observed = self._state.get("observed", {}).get(topic_uuid, {})
+            observed_publications = self._state.get(
+                "observed_publications", {},
+            ).get(topic_uuid, {})
             observed_digest = hashlib.sha256(
-                json.dumps(observed, sort_keys=True, separators=(",", ":")).encode("utf-8")
+                json.dumps(
+                    {
+                        "node_revisions": observed,
+                        "publications": observed_publications,
+                    },
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ).encode("utf-8")
             ).hexdigest()[:20]
             if (self._state["published"].get(topic_uuid) == current_hash
                     and self._state["published_observations"].get(topic_uuid)
@@ -824,7 +834,37 @@ class RelayLogic:
                 payload = self.session.get_subtree(topic_uuid)
             if current_hash is None or payload is None:
                 continue
+            content_changed = (
+                self._state["published"].get(topic_uuid) != current_hash
+            )
+            publication_seq = int(
+                self._state.setdefault("publication_seq", {}).get(
+                    topic_uuid, 0,
+                )
+            ) + 1
+            ack_publication_seq = int(
+                self._state.setdefault("ack_publication_seq", {}).get(
+                    topic_uuid, 0,
+                )
+            )
+            if content_changed:
+                ack_publication_seq = publication_seq
+            # Reserve and persist the sequence before external I/O. A crash
+            # may leave a harmless gap, but can never reuse a generation that
+            # another process may already have observed on the relay.
+            self._state["publication_seq"][topic_uuid] = publication_seq
+            self._state["ack_publication_seq"][topic_uuid] = (
+                ack_publication_seq
+            )
+            self._save_state()
             payload["_relay_observed"] = observed
+            payload["_relay_observed_publications"] = observed_publications
+            payload["_relay_publication_seq"] = publication_seq
+            payload["_relay_ack_publication_seq"] = ack_publication_seq
+            # Observation-only heads are acknowledgements. Requesting an
+            # acknowledgement for those would create an endless ack-of-ack
+            # loop, so only semantic topic publications request one.
+            payload["_relay_ack_requested"] = content_changed
             blob_ids = referenced_blob_ids(payload.get("subtree"))
             leased: list[str] = []
             publish_ready = True
@@ -859,6 +899,16 @@ class RelayLogic:
             self._state["published"][topic_uuid] = current_hash
             self._state["published_observations"][topic_uuid] = observed_digest
             published.append(topic_uuid)
+            self.session.trace_event(
+                "relay.publication_published",
+                relay_identity=self.identity,
+                topic_uuid=topic_uuid,
+                state_hash=current_hash,
+                publication_seq=publication_seq,
+                ack_requested=content_changed,
+                ack_publication_seq=ack_publication_seq,
+                observed_publications=observed_publications,
+            )
         if published:
             self._last_publish_server_time = self.timing.server_now()
             self._save_state()
@@ -948,6 +998,7 @@ class RelayLogic:
         if not self.storage:
             return []
         applied: set[tuple[str, str]] = set()
+        bookkeeping_changed = False
         # A peer appears under every topic it shares with us; its presence
         # file is per-identity, not per-topic, so read it once per cycle
         # instead of re-fetching (an SFTP round-trip) for each topic.
@@ -1006,6 +1057,95 @@ class RelayLogic:
                 head = self.storage.read_head(topic_uuid, peer_id)
                 if not head:
                     continue
+                raw_publication_seq = head.get("publication_seq", 0)
+                publication_seq = (
+                    raw_publication_seq
+                    if (
+                        isinstance(raw_publication_seq, int)
+                        and not isinstance(raw_publication_seq, bool)
+                        and raw_publication_seq >= 0
+                    )
+                    else 0
+                )
+                raw_ack_publication_seq = head.get(
+                    "ack_publication_seq",
+                    publication_seq
+                    if head.get("ack_requested", False)
+                    else 0,
+                )
+                ack_publication_seq = (
+                    raw_ack_publication_seq
+                    if (
+                        isinstance(raw_ack_publication_seq, int)
+                        and not isinstance(raw_ack_publication_seq, bool)
+                        and 0 <= raw_ack_publication_seq <= publication_seq
+                    )
+                    else 0
+                )
+                received = self._state.setdefault(
+                    "received_publications", {},
+                ).setdefault(topic_uuid, {})
+                previous_received_seq = int(received.get(peer_id, 0))
+                received_changed = publication_seq > previous_received_seq
+                if received_changed:
+                    received[peer_id] = publication_seq
+                    bookkeeping_changed = True
+
+                raw_observed_seq = (
+                    (head.get("observed_publications") or {}).get(
+                        self.identity, 0,
+                    )
+                )
+                observed_by_peer_seq = (
+                    raw_observed_seq
+                    if (
+                        isinstance(raw_observed_seq, int)
+                        and not isinstance(raw_observed_seq, bool)
+                        and raw_observed_seq >= 0
+                    )
+                    else 0
+                )
+                peer_observed = self._state.setdefault(
+                    "peer_observed_publications", {},
+                ).setdefault(topic_uuid, {})
+                previous_peer_observed_seq = int(
+                    peer_observed.get(peer_id, 0),
+                )
+                peer_observation_changed = (
+                    observed_by_peer_seq > previous_peer_observed_seq
+                )
+                if peer_observation_changed:
+                    peer_observed[peer_id] = observed_by_peer_seq
+                    bookkeeping_changed = True
+                    self.session.trace_event(
+                        "relay.publication_acknowledged",
+                        relay_identity=self.identity,
+                        topic_uuid=topic_uuid,
+                        peer_id=peer_id,
+                        publication_seq=observed_by_peer_seq,
+                        current_publication_seq=self._state.get(
+                            "publication_seq", {},
+                        ).get(topic_uuid, 0),
+                    )
+                if received_changed or peer_observation_changed:
+                    self.session.trace_event(
+                        "relay.publication_head_received",
+                        relay_identity=self.identity,
+                        topic_uuid=topic_uuid,
+                        peer_id=peer_id,
+                        publication_seq=publication_seq,
+                        previous_publication_seq=previous_received_seq,
+                        state_hash=head.get("hash"),
+                        ack_requested=bool(head.get("ack_requested", False)),
+                        ack_publication_seq=ack_publication_seq,
+                        observed_local_publication_seq=observed_by_peer_seq,
+                    )
+                observed_publications_for_topic = self._state.setdefault(
+                    "observed_publications", {},
+                ).setdefault(topic_uuid, {})
+                needs_publication_ack = ack_publication_seq > int(
+                    observed_publications_for_topic.get(peer_id, 0),
+                )
                 # Avatar blobs are small, so the MVP eagerly caches them.
                 # Besides making rendering immediate, this makes a client a
                 # safe bridge when it republishes the adopted profile through
@@ -1023,12 +1163,6 @@ class RelayLogic:
                         if blob_data is not None:
                             self.blob_store.write_blob(blob_data)
                 observed_for_me = (head.get("observed") or {}).get(self.identity, {})
-                with self._session_lock:
-                    observations_changed = self.session.record_peer_observations(
-                        peer_addr, observed_for_me,
-                    )
-                if observations_changed:
-                    applied.add((topic_uuid, peer_id))
                 state_hash = head.get("hash")
                 if not state_hash:
                     continue
@@ -1051,9 +1185,50 @@ class RelayLogic:
                         )
                     )
                 if state_hash == last_seen and not wants_graft:
+                    # The cached perspective already represents this head's
+                    # semantic state, so its observation metadata is safe to
+                    # expose immediately.  For a changed hash this must wait
+                    # until the matching snapshot is applied below; otherwise
+                    # reconciliation briefly combines a fresh acknowledgement
+                    # with stale peer content and reports false divergence.
+                    with self._session_lock:
+                        observations_changed = (
+                            self.session.record_peer_observations(
+                                peer_addr, observed_for_me,
+                            )
+                        )
+                    if observations_changed:
+                        applied.add((topic_uuid, peer_id))
+                    if needs_publication_ack:
+                        observed_publications_for_topic[peer_id] = (
+                            ack_publication_seq
+                        )
+                        bookkeeping_changed = True
+                        applied.add((topic_uuid, peer_id))
                     continue
                 payload = self.storage.read_snapshot(topic_uuid, peer_id, state_hash)
                 if not payload:
+                    continue
+                payload_publication_seq = payload.get(
+                    "_relay_publication_seq", 0,
+                )
+                if (
+                    publication_seq > 0
+                    and payload_publication_seq != publication_seq
+                ):
+                    # The publisher advanced an unchanged-hash snapshot
+                    # between our head and snapshot reads. Do not combine
+                    # metadata from two generations; the fixed poll cadence
+                    # will fetch the new head promptly.
+                    self.session.trace_event(
+                        "relay.publication_snapshot_race",
+                        relay_identity=self.identity,
+                        topic_uuid=topic_uuid,
+                        peer_id=peer_id,
+                        head_publication_seq=publication_seq,
+                        snapshot_publication_seq=payload_publication_seq,
+                        state_hash=state_hash,
+                    )
                     continue
                 subtree = protocol_node_from_envelope(payload)
                 peer_copy = copy.deepcopy(subtree)
@@ -1074,12 +1249,28 @@ class RelayLogic:
                     self.session.apply_peer_subtree(
                         peer_addr, peer_copy, payload.get("parent_uuid"),
                     )
+                    self.session.record_peer_observations(
+                        peer_addr, observed_for_me,
+                    )
                 self._state["observed"].setdefault(topic_uuid, {})[peer_id] = (
                     self.session.node_revision_map(peer_copy)
                 )
+                if needs_publication_ack:
+                    observed_publications_for_topic[peer_id] = (
+                        ack_publication_seq
+                    )
                 self._state["applied"].setdefault(topic_uuid, {})[peer_id] = state_hash
                 applied.add((topic_uuid, peer_id))
-        if applied:
+                self.session.trace_event(
+                    "relay.publication_cached",
+                    relay_identity=self.identity,
+                    topic_uuid=topic_uuid,
+                    peer_id=peer_id,
+                    publication_seq=publication_seq,
+                    state_hash=state_hash,
+                    acknowledgement_pending=needs_publication_ack,
+                )
+        if applied or bookkeeping_changed:
             self._save_state()
         return sorted(applied)
 
@@ -1105,6 +1296,21 @@ class RelayLogic:
             "topics": {
                 topic_uuid: {
                     "published_hash": self._state["published"].get(topic_uuid),
+                    "publication_seq": self._state.get(
+                        "publication_seq", {},
+                    ).get(topic_uuid, 0),
+                    "ack_publication_seq": self._state.get(
+                        "ack_publication_seq", {},
+                    ).get(topic_uuid, 0),
+                    "received_publications": self._state.get(
+                        "received_publications", {},
+                    ).get(topic_uuid, {}),
+                    "observed_publications": self._state.get(
+                        "observed_publications", {},
+                    ).get(topic_uuid, {}),
+                    "peer_observed_publications": self._state.get(
+                        "peer_observed_publications", {},
+                    ).get(topic_uuid, {}),
                     "applied": self._state["applied"].get(topic_uuid, {}),
                 }
                 for topic_uuid in sorted(topic_uuids)
@@ -1123,6 +1329,11 @@ class RelayLogic:
         self._state["published"].pop(topic_uuid, None)
         self._state["published_observations"].pop(topic_uuid, None)
         self._state["observed"].pop(topic_uuid, None)
+        self._state["publication_seq"].pop(topic_uuid, None)
+        self._state["ack_publication_seq"].pop(topic_uuid, None)
+        self._state["received_publications"].pop(topic_uuid, None)
+        self._state["observed_publications"].pop(topic_uuid, None)
+        self._state["peer_observed_publications"].pop(topic_uuid, None)
         self._state["applied"].pop(topic_uuid, None)
         self._state["desired"] = [t for t in self._state.get("desired", []) if t != topic_uuid]
         self._state["identity_topics"] = [
@@ -1140,6 +1351,11 @@ class RelayLogic:
             data.setdefault("published", {})
             data.setdefault("published_observations", {})
             data.setdefault("observed", {})
+            data.setdefault("publication_seq", {})
+            data.setdefault("ack_publication_seq", {})
+            data.setdefault("received_publications", {})
+            data.setdefault("observed_publications", {})
+            data.setdefault("peer_observed_publications", {})
             data.setdefault("desired", [])
             data.setdefault("identity_topics", [])
             data.setdefault("shared", [])
@@ -1150,6 +1366,9 @@ class RelayLogic:
             return data
         return {
             "published": {}, "published_observations": {}, "observed": {},
+            "publication_seq": {}, "ack_publication_seq": {},
+            "received_publications": {},
+            "observed_publications": {}, "peer_observed_publications": {},
             "applied": {}, "desired": [], "identity_topics": [], "shared": [],
         }
 

@@ -78,6 +78,7 @@ DEFAULT_CONFIG = {
     "debug": True,
     "peer_sync_interval_seconds": 2,
     "trace_log_file": None,
+    "trace_level": "events",
     # advertise_host is what we tell peers to reach us at (e.g. a Tailscale
     # IP or a public domain); bind_host is which network interface uvicorn
     # actually listens on ("0.0.0.0" to accept from any interface). Both
@@ -313,7 +314,11 @@ def _session_envelope_error(payload: dict) -> str | None:
         return f"expected format '{SESSION_ENVELOPE_FORMAT}'"
     if payload.get("version") != SESSION_ENVELOPE_VERSION:
         return f"unsupported envelope version {payload.get('version')!r}"
-    if payload.get("protocol_schema_version") != PROTOCOL_SCHEMA_VERSION:
+    # Stored v1 sessions are upgraded in place: ProtocolNode.from_dict gives
+    # their nodes revision_seq=0, and the next save emits protocol v2.
+    if payload.get("protocol_schema_version") not in {
+        1, PROTOCOL_SCHEMA_VERSION,
+    }:
         return (
             "unsupported protocol schema version "
             f"{payload.get('protocol_schema_version')!r}"
@@ -325,6 +330,7 @@ def _session_envelope_error(payload: dict) -> str | None:
 
 def _session_metadata(session: Session) -> dict:
     return {
+        "local_revision_seq": session.local_revision_seq,
         "members": sorted(session.members - {session.address}),
         "active_topic_uuids": sorted(session.active_topic_uuids),
         "peer_topics": dict(sorted(session.peer_topics.items())),
@@ -348,6 +354,14 @@ def _session_metadata(session: Session) -> dict:
 
 
 def _restore_session_metadata(session: Session, metadata: dict) -> None:
+    stored_revision_seq = metadata.get("local_revision_seq", 0)
+    session.local_revision_seq = (
+        stored_revision_seq
+        if isinstance(stored_revision_seq, int)
+        and not isinstance(stored_revision_seq, bool)
+        and stored_revision_seq >= 0
+        else 0
+    )
     session.active_topic_uuids = {
         uuid for uuid in metadata.get("active_topic_uuids", [])
         if session.has_node(uuid)
@@ -1049,6 +1063,21 @@ async def observer_sync_loop(runtime: AppRuntime) -> None:
             runtime.notify_change("network")
 
 
+def _advance_poll_deadline(scheduled_for: float | None,
+                           cycle_started: float,
+                           interval_seconds: float,
+                           now: float) -> float:
+    """Advance a fixed polling cadence, skipping slots consumed by slow I/O."""
+    interval = max(0.05, float(interval_seconds))
+    deadline = (
+        scheduled_for if scheduled_for is not None else cycle_started
+    ) + interval
+    if deadline <= now:
+        missed = int((now - deadline) // interval) + 1
+        deadline += missed * interval
+    return deadline
+
+
 async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
     # One polling-channel cycle: presence + publish + poll, then - crucially - the
     # app's adoption hook. Without that drain, relay-applied peer content
@@ -1077,62 +1106,214 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
             continue
         due_connections.append((relay, scheduled_for, was_due))
 
-    async def first_pass(relay):
-        cycle_started = time.monotonic()
+    def trace_relay(relay, kind: str, *,
+                    trace_level: str = "events", **fields) -> None:
+        trace_event = getattr(
+            getattr(runtime, "session", None), "trace_event", None,
+        )
+        if not trace_event:
+            return
+        storage = getattr(relay, "storage", None)
+        state_path = getattr(relay, "_state_path", None)
+        trace_event(
+            kind,
+            trace_level=trace_level,
+            relay_identity=getattr(relay, "identity", None),
+            relay_backend=type(storage).__name__ if storage else None,
+            relay_state_file=Path(state_path).name if state_path else None,
+            poll_interval_seconds=getattr(
+                relay, "poll_interval_seconds", None,
+            ),
+            **fields,
+        )
+
+    async def relay_phase(relay, cycle_id: str, phase: str, operation):
+        started = time.monotonic()
+        try:
+            value = await asyncio.to_thread(operation)
+        except Exception as exc:
+            trace_relay(
+                relay,
+                "relay.phase",
+                cycle_id=cycle_id,
+                phase=phase,
+                duration_ms=round((time.monotonic() - started) * 1000, 1),
+                ok=False,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            raise
+        details = {}
+        if phase.startswith("publish"):
+            details = {
+                "published_count": len(value or []),
+                "published_topics": list(value or []),
+            }
+        elif phase == "poll_and_apply":
+            details = {
+                "applied_count": len(value or []),
+                "applied_topics": list(value or []),
+            }
+        trace_relay(
+            relay,
+            "relay.phase",
+            trace_level="timing",
+            cycle_id=cycle_id,
+            phase=phase,
+            duration_ms=round((time.monotonic() - started) * 1000, 1),
+            ok=True,
+            **details,
+        )
+        return value
+
+    async def first_pass(relay, scheduled_for, was_due):
+        total_started = time.monotonic()
+        cycle_id = uuid.uuid4().hex[:12]
+        trace_relay(
+            relay,
+            "relay.cycle_start",
+            trace_level="timing",
+            cycle_id=cycle_id,
+            due_only=due_only,
+            was_due=was_due,
+            scheduled_in_ms=(
+                round((scheduled_for - total_started) * 1000, 1)
+                if scheduled_for is not None else None
+            ),
+        )
+        cycle_started = total_started
         try:
             calibrate = getattr(relay, "calibrate_timing_if_due", None)
             if calibrate:
-                await asyncio.to_thread(calibrate)
+                await relay_phase(
+                    relay, cycle_id, "calibrate_timing", calibrate,
+                )
             cycle_started = time.monotonic()
-            await asyncio.to_thread(relay.write_presence)
-            published_before = await asyncio.to_thread(relay.publish_due_topics)
-            applied = await asyncio.to_thread(relay.poll_and_apply)
+            await relay_phase(
+                relay, cycle_id, "write_presence", relay.write_presence,
+            )
+            published_before = await relay_phase(
+                relay, cycle_id, "publish_before_poll",
+                relay.publish_due_topics,
+            )
+            applied = await relay_phase(
+                relay, cycle_id, "poll_and_apply", relay.poll_and_apply,
+            )
         except Exception as exc:
             print(f"[channel] sync failed: {exc}", flush=True)
-            return relay, [], [], False, time.monotonic() - cycle_started
+            return (
+                relay, [], [], False, time.monotonic() - cycle_started,
+                cycle_id, total_started,
+            )
         duration = time.monotonic() - cycle_started
-        return relay, published_before, applied, True, duration
+        return (
+            relay, published_before, applied, True, duration,
+            cycle_id, total_started,
+        )
 
     first_results = await asyncio.gather(
-        *(first_pass(relay) for relay, _scheduled, _was_due in due_connections),
+        *(
+            first_pass(relay, scheduled_for, was_due)
+            for relay, scheduled_for, was_due in due_connections
+        ),
     )
     adoption_started = time.monotonic()
     had_applied = any(
-        applied for _relay, _published, applied, ok, _duration in first_results if ok
+        applied
+        for (
+            _relay, _published, applied, ok, _duration,
+            _cycle_id, _total_started,
+        ) in first_results
+        if ok
     )
     if had_applied:
         await drain_peer_update_hook(runtime)
     adoption_duration = time.monotonic() - adoption_started if had_applied else 0.0
+    for (
+        relay, _published, applied, ok, _duration,
+        cycle_id, _total_started,
+    ) in first_results:
+        if ok and applied:
+            trace_relay(
+                relay,
+                "relay.phase",
+                trace_level="timing",
+                cycle_id=cycle_id,
+                phase="adopt_peer_updates",
+                duration_ms=round(adoption_duration * 1000, 1),
+                ok=True,
+                applied_count=len(applied),
+            )
 
-    async def response_pass(relay, applied):
+    async def response_pass(relay, applied, cycle_id):
         # Publish the reaction/acknowledgement in this same relay cycle. This
         # is essential when auto-adopt is off too: the unchanged local
         # snapshot's head still needs to say "I have seen your revision."
         started = time.monotonic()
         try:
-            published = await asyncio.to_thread(relay.publish_due_topics) if applied else []
-            return published, time.monotonic() - started
+            published = (
+                await relay_phase(
+                    relay, cycle_id, "publish_response",
+                    relay.publish_due_topics,
+                )
+                if applied else []
+            )
+            return published, time.monotonic() - started, True
         except Exception as exc:
             print(f"[channel] response publish failed: {exc}", flush=True)
-            return [], time.monotonic() - started
+            return [], time.monotonic() - started, False
 
     response_results = await asyncio.gather(*(
-        response_pass(relay, applied)
-        for relay, _published, applied, ok, _duration in first_results if ok
+        response_pass(relay, applied, cycle_id)
+        for (
+            relay, _published, applied, ok, _duration,
+            cycle_id, _total_started,
+        ) in first_results
+        if ok
     ))
     response_index = 0
     schedule_by_relay = {
         id(relay): (scheduled_for, was_due)
         for relay, scheduled_for, was_due in due_connections
     }
-    for relay, published_before, applied, ok, _duration in first_results:
+    for (
+        relay, published_before, applied, ok, _duration,
+        cycle_id, total_started,
+    ) in first_results:
         connection_key = id(relay)
         scheduled_for, was_due = schedule_by_relay[connection_key]
         stable_interval = float(getattr(relay, "poll_interval_seconds", 3))
         if not ok:
-            next_due[connection_key] = time.monotonic() + stable_interval
+            finished_at = time.monotonic()
+            if (
+                was_due
+                or scheduled_for is None
+                or finished_at >= scheduled_for
+            ):
+                next_due[connection_key] = _advance_poll_deadline(
+                    scheduled_for, total_started, stable_interval, finished_at,
+                )
+            trace_relay(
+                relay,
+                "relay.cycle_done",
+                trace_level="events",
+                cycle_id=cycle_id,
+                duration_ms=round(
+                    (time.monotonic() - total_started) * 1000, 1,
+                ),
+                ok=False,
+                next_poll_ms=round(
+                    max(
+                        0.0,
+                        next_due[connection_key] - finished_at,
+                    ) * 1000,
+                    1,
+                ),
+            )
             continue
-        published_after, response_duration = response_results[response_index]
+        published_after, response_duration, response_ok = (
+            response_results[response_index]
+        )
         response_index += 1
         record_duration = getattr(relay, "record_cycle_duration", None)
         if record_duration:
@@ -1140,16 +1321,55 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
                 _duration + response_duration
                 + (adoption_duration if applied else 0.0)
             )
+        ack_wait_ms = None
         if published_before or published_after:
             calculate_delay = getattr(relay, "response_check_delay", None)
             delay = calculate_delay() if calculate_delay else stable_interval
-            next_due[connection_key] = time.monotonic() + max(0.05, float(delay))
-        elif was_due or scheduled_for is None:
-            next_due[connection_key] = time.monotonic() + stable_interval
-        # If a local edit woke this connection before its calculated answer
-        # check and it had nothing to publish, retain the earlier deadline.
+            # This is an acknowledgement expectation only. It deliberately
+            # does not move the transport's regular polling deadline.
+            ack_wait_ms = round(max(0.05, float(delay)) * 1000, 1)
+        finished_at = time.monotonic()
+        if (
+            was_due
+            or scheduled_for is None
+            or finished_at >= scheduled_for
+        ):
+            next_due[connection_key] = _advance_poll_deadline(
+                scheduled_for, total_started, stable_interval, finished_at,
+            )
+        # A local edit can wake an early publication cycle. Keep the existing
+        # regular poll deadline so the configured cadence neither slips nor
+        # accelerates because of that extra work.
         if published_before or published_after or applied:
             changed = True
+        trace_relay(
+            relay,
+            "relay.cycle_done",
+            trace_level=(
+                "timing" if response_ok else "events"
+            ),
+            cycle_id=cycle_id,
+            duration_ms=round(
+                (time.monotonic() - total_started) * 1000, 1,
+            ),
+            work_duration_ms=round(
+                (
+                    _duration + response_duration
+                    + (adoption_duration if applied else 0.0)
+                ) * 1000,
+                1,
+            ),
+            ok=response_ok,
+            published_before=list(published_before),
+            published_after=list(published_after),
+            applied_topics=list(applied),
+            acknowledgement_wait_ms=ack_wait_ms,
+            next_poll_ms=round(
+                max(0.0, next_due[connection_key] - time.monotonic())
+                * 1000,
+                1,
+            ),
+        )
     if changed:
         runtime.notify_change("channel")
     return changed
@@ -1202,7 +1422,10 @@ def main(
     print(f"Applications: {', '.join(runtime.host.instances) if runtime.host else ''}")
     print(f"Storage: {runtime.config.get('storage_file')}")
     if runtime.session.trace.enabled:
-        print(f"Trace: {runtime.session.trace.path}")
+        print(
+            f"Trace: {runtime.session.trace.path} "
+            f"({runtime.session.trace.level})"
+        )
     try:
         uvicorn.run(
             app,
