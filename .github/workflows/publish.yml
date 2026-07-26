@@ -51,3 +51,15 @@ jobs:
       - uses: actions/download-artifact@v4
         with: { name: distributions, path: dist/ }
       - uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          # Re-tagging an already-released version is a legitimate thing
+          # to do, and did happen: the tag was re-cut so it pointed at the
+          # commit the artifacts were actually built from. That fired this
+          # workflow again and it failed with "file already exists".
+          #
+          # PyPI versions are immutable, so this can never overwrite what
+          # was published; it only declines to upload again. The cost is
+          # that forgetting to raise the version publishes nothing instead
+          # of failing loudly - acceptable because the version comes from
+          # pyproject.toml, so a stale one cannot ship wrong content.
+          skip-existing: true
