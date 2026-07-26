@@ -167,6 +167,21 @@ class ThemeTests(unittest.TestCase):
         self.assertIn("localStorage", SHARED_JS)
         self.assertIn('THEME_STORAGE_KEY = "sovereign.theme"', SHARED_JS)
 
+    def test_the_control_lives_in_the_profile_dialog(self):
+        self.assertIn("shellThemeSelect", SHARED_JS)
+        # It sits inside the profile dialog's markup, not the header bar.
+        dialog = SHARED_JS.split("_ensureProfileDialog() {", 1)[1]
+        dialog = dialog.split("document.body.append", 1)[0]
+        self.assertIn("shellThemeSelect", dialog)
+
+    def test_the_theme_applies_on_change_rather_than_on_save(self):
+        # The dialog's Save writes the profile; the theme is not profile
+        # data, so waiting for Save would both delay it and imply Cancel
+        # reverts it. It applies on change and Cancel leaves it alone.
+        self.assertIn('getElementById("shellThemeSelect").onchange', SHARED_JS)
+        save = SHARED_JS.split("async _saveProfile(", 1)[1].split("\n  },", 1)[0]
+        self.assertNotIn("shellThemeSelect", save)
+
 
 class ShippedExampleAssetTests(unittest.TestCase):
     """The example's assets are held to the rules every application follows.

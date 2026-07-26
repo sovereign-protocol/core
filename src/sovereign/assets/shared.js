@@ -37,14 +37,6 @@ function applyTheme(theme) {
 // corrects itself - a flash that is worse than either theme on its own.
 applyTheme(storedTheme());
 
-const ICON_SUN =
-  '<circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path>'
-  + '<path d="M12 20v2"></path><path d="m4.9 4.9 1.4 1.4"></path>'
-  + '<path d="m17.7 17.7 1.4 1.4"></path><path d="M2 12h2"></path>'
-  + '<path d="M20 12h2"></path><path d="m6.3 17.7-1.4 1.4"></path>'
-  + '<path d="m19.1 4.9-1.4 1.4"></path>';
-const ICON_MOON = '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>';
-
 const ICON_CLOSE = '<path d="M18 6 6 18"></path><path d="M6 6l12 12"></path>';
 const ICON_CHEVRON_DOWN = '<path d="M6 9l6 6 6-6"></path>';
 const ICON_SETTINGS =
@@ -495,10 +487,6 @@ Object.assign(SovereignShell, {
     connection.textContent = "Private";
     connection.onclick = () => this.openConnectionPanel();
 
-    const theme = iconButton("", "Theme", () => this.toggleTheme());
-    theme.id = "shellThemeBtn";
-    theme.classList.add("shell-theme-btn");
-
     const avatar = document.createElement("button");
     avatar.type = "button";
     avatar.id = "shellAvatarBtn";
@@ -506,9 +494,8 @@ Object.assign(SovereignShell, {
     avatar.title = "Edit your profile";
     avatar.onclick = () => this.openProfile();
 
-    actions.append(appActions, connection, theme, avatar);
+    actions.append(appActions, connection, avatar);
     container.append(left, middle, actions);
-    this._renderThemeButton();
     return nav;
   },
 
@@ -524,26 +511,11 @@ Object.assign(SovereignShell, {
       // Unwritable storage means the choice lasts for this window only,
       // which is still better than refusing to switch at all.
     }
-    this._renderThemeButton();
     return resolved;
   },
 
   toggleTheme() {
     return this.setTheme(this.theme() === "dark" ? "light" : "dark");
-  },
-
-  // The icon shows what you would switch *to*, not the state you are in -
-  // a sun while dark reads as "go light", which is what a click does.
-  _renderThemeButton() {
-    const button = document.getElementById("shellThemeBtn");
-    if (!button) return;
-    const dark = this.theme() === "dark";
-    const label = dark ? "Switch to light theme" : "Switch to dark theme";
-    button.innerHTML =
-      '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
-      + (dark ? ICON_SUN : ICON_MOON) + "</svg>";
-    button.title = label;
-    button.setAttribute("aria-label", label);
   },
 
   // The topic region and the application-actions slot are the two places an
@@ -695,6 +667,17 @@ Object.assign(SovereignShell, {
       '<input id="shellProfilePicture" type="file" accept="image/png,image/jpeg,image/gif,image/webp">',
       '<img id="shellProfilePreview" class="shell-avatar-preview" alt="">',
       '<p class="shell-note">PNG, JPEG, GIF or WebP. The picture is shared with everyone you collaborate with.</p>',
+      // Everything above is the shared profile and saves on Save. The theme
+      // is neither: it is a display preference for this device, so it is
+      // separated by a rule, applies the moment it changes, and is not
+      // undone by Cancel. Saying so here is cheaper than the surprise.
+      '<hr class="shell-profile-divider">',
+      '<label for="shellThemeSelect">Theme</label>',
+      '<select id="shellThemeSelect">',
+      '<option value="dark">Dark</option>',
+      '<option value="light">Light</option>',
+      "</select>",
+      '<p class="shell-note">Applies to this device only and takes effect immediately. Not shared with anyone.</p>',
       '<p id="shellProfileNote" class="shell-note"></p>',
       "<menu>",
       '<button type="button" id="shellRemoveAvatarBtn" class="danger">Remove picture</button>',
@@ -720,6 +703,10 @@ Object.assign(SovereignShell, {
     };
     document.getElementById("shellRemoveAvatarBtn").onclick = () =>
       this._saveProfile({ removePicture: true });
+    // Not part of the form's submit: the theme is local, so it applies on
+    // change rather than waiting for a Save that only concerns the profile.
+    document.getElementById("shellThemeSelect").onchange = (event) =>
+      this.setTheme(event.target.value);
   },
 
   async _profileView() {
@@ -737,6 +724,7 @@ Object.assign(SovereignShell, {
       this._note("shellProfileNote", "Could not read your profile.");
     }
     document.getElementById("shellProfileName").value = view.display_name || "";
+    document.getElementById("shellThemeSelect").value = this.theme();
     document.getElementById("shellProfilePicture").value = "";
     const preview = document.getElementById("shellProfilePreview");
     preview.src = view.picture || "";

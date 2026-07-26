@@ -545,6 +545,15 @@ dialog menu .danger:not(:last-child) {
   border-radius: 50%;
   object-fit: cover;
 }
+/* Separates the shared profile above from device-local settings below, which
+   save differently: the profile waits for Save and syncs to peers, the theme
+   applies on change and never leaves this machine. */
+.shell-profile-divider {
+  width: 100%;
+  margin: 4px 0 0;
+  border: none;
+  border-top: 1px solid var(--shell-border);
+}
 .shell-bar .peer-cluster {
   display: flex;
   align-items: center;
