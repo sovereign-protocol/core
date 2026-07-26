@@ -8,6 +8,35 @@
   helpers just call the global peerLabel() the page itself defines.
 */
 
+// Theme is a display preference for this machine, like the OS's own dark
+// mode - deliberately not in the Core profile, which syncs to peers and
+// would carry a cosmetic choice to every device you connect from.
+const THEME_STORAGE_KEY = "sovereign.theme";
+const THEMES = ["dark", "light"];
+const DEFAULT_THEME = "dark";
+
+function storedTheme() {
+  try {
+    const value = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return THEMES.includes(value) ? value : DEFAULT_THEME;
+  } catch (error) {
+    // Private browsing and some embedded webviews throw on access rather
+    // than returning null. A theme is not worth failing a page load over.
+    return DEFAULT_THEME;
+  }
+}
+
+function applyTheme(theme) {
+  const resolved = THEMES.includes(theme) ? theme : DEFAULT_THEME;
+  document.documentElement.setAttribute("data-theme", resolved);
+  return resolved;
+}
+
+// Run at parse time, not on DOMContentLoaded: the attribute must be on
+// <html> before first paint, or the page shows the default palette and then
+// corrects itself - a flash that is worse than either theme on its own.
+applyTheme(storedTheme());
+
 const ICON_CLOSE = '<path d="M18 6 6 18"></path><path d="M6 6l12 12"></path>';
 const ICON_CHEVRON_DOWN = '<path d="M6 9l6 6 6-6"></path>';
 const ICON_SETTINGS =
@@ -470,6 +499,25 @@ Object.assign(SovereignShell, {
     return nav;
   },
 
+  theme() {
+    return document.documentElement.getAttribute("data-theme") || DEFAULT_THEME;
+  },
+
+  setTheme(theme) {
+    const resolved = applyTheme(theme);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, resolved);
+    } catch (error) {
+      // Unwritable storage means the choice lasts for this window only,
+      // which is still better than refusing to switch at all.
+    }
+    return resolved;
+  },
+
+  toggleTheme() {
+    return this.setTheme(this.theme() === "dark" ? "light" : "dark");
+  },
+
   // The topic region and the application-actions slot are the two places an
   // application puts its own controls. Everything else in the bar is Core's.
   setTopicRegion(node) {
@@ -619,6 +667,17 @@ Object.assign(SovereignShell, {
       '<input id="shellProfilePicture" type="file" accept="image/png,image/jpeg,image/gif,image/webp">',
       '<img id="shellProfilePreview" class="shell-avatar-preview" alt="">',
       '<p class="shell-note">PNG, JPEG, GIF or WebP. The picture is shared with everyone you collaborate with.</p>',
+      // Everything above is the shared profile and saves on Save. The theme
+      // is neither: it is a display preference for this device, so it is
+      // separated by a rule, applies the moment it changes, and is not
+      // undone by Cancel. Saying so here is cheaper than the surprise.
+      '<hr class="shell-profile-divider">',
+      '<label for="shellThemeSelect">Theme</label>',
+      '<select id="shellThemeSelect">',
+      '<option value="dark">Dark</option>',
+      '<option value="light">Light</option>',
+      "</select>",
+      '<p class="shell-note">Applies to this device only and takes effect immediately. Not shared with anyone.</p>',
       '<p id="shellProfileNote" class="shell-note"></p>',
       "<menu>",
       '<button type="button" id="shellRemoveAvatarBtn" class="danger">Remove picture</button>',
@@ -644,6 +703,10 @@ Object.assign(SovereignShell, {
     };
     document.getElementById("shellRemoveAvatarBtn").onclick = () =>
       this._saveProfile({ removePicture: true });
+    // Not part of the form's submit: the theme is local, so it applies on
+    // change rather than waiting for a Save that only concerns the profile.
+    document.getElementById("shellThemeSelect").onchange = (event) =>
+      this.setTheme(event.target.value);
   },
 
   async _profileView() {
@@ -661,6 +724,7 @@ Object.assign(SovereignShell, {
       this._note("shellProfileNote", "Could not read your profile.");
     }
     document.getElementById("shellProfileName").value = view.display_name || "";
+    document.getElementById("shellThemeSelect").value = this.theme();
     document.getElementById("shellProfilePicture").value = "";
     const preview = document.getElementById("shellProfilePreview");
     preview.src = view.picture || "";

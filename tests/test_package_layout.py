@@ -114,6 +114,75 @@ class PackageLayoutTests(unittest.TestCase):
             ), str(path))
 
 
+class ThemeTests(unittest.TestCase):
+    """U4 shipped dark-only and left light mode as the open question. The
+    switch is Core's, because the shell owns the chrome every application
+    draws inside - an application choosing its own would put a dark dialog
+    on a light page, which is the exact failure U4 was written about.
+    """
+
+    SHARED_CSS = files("sovereign.assets").joinpath("shared.css").read_text(
+        encoding="utf-8",
+    )
+
+    def test_the_shell_defines_both_palettes(self):
+        self.assertIn("--shell-surface: #161b22", self.SHARED_CSS)
+        self.assertIn('[data-theme="light"]', self.SHARED_CSS)
+
+    def test_light_moves_tokens_rather_than_individual_rules(self):
+        # An application that reads the tokens gets light for free; one that
+        # hardcodes a colour stays visibly wrong rather than half-working.
+        # Redefining rules here instead would hide that distinction.
+        light = self.SHARED_CSS.split('[data-theme="light"] .shell-dialog', 1)[1]
+        light = light.split("}", 1)[0]
+        for token in ("--shell-surface", "--shell-text", "--shell-border"):
+            self.assertIn(token, light)
+
+    def test_colour_scheme_moves_with_the_theme(self):
+        # Native controls, scrollbars and form widgets follow color-scheme.
+        # Pinning it to dark would render them dark inside a light page.
+        self.assertIn(':root[data-theme="light"] { color-scheme: light; }', self.SHARED_CSS)
+        self.assertIn(':root[data-theme="dark"] { color-scheme: dark; }', self.SHARED_CSS)
+
+    def test_the_theme_is_applied_before_first_paint(self):
+        # At parse time, not on DOMContentLoaded: otherwise the page renders
+        # the default palette and corrects itself, which is a visible flash.
+        self.assertIn("applyTheme(storedTheme())", SHARED_JS)
+        # Checks for a listener registration, not the bare word - the comment
+        # above the call names DOMContentLoaded to explain why it is avoided,
+        # and matching prose would fail on the explanation itself.
+        marker = SHARED_JS.index("applyTheme(storedTheme())")
+        self.assertNotIn('addEventListener("DOMContentLoaded"', SHARED_JS[:marker])
+
+    def test_an_unreadable_preference_falls_back_rather_than_throwing(self):
+        # Private browsing and some embedded webviews throw on localStorage
+        # access. A theme is not worth failing a page load over.
+        stored = SHARED_JS.split("function storedTheme()", 1)[1].split("\n}", 1)[0]
+        self.assertIn("catch", stored)
+        self.assertIn("DEFAULT_THEME", stored)
+
+    def test_the_preference_is_local_and_not_in_the_synced_profile(self):
+        # A display choice for this machine. Putting it in the Core profile
+        # would sync a cosmetic setting to every device and every peer.
+        self.assertIn("localStorage", SHARED_JS)
+        self.assertIn('THEME_STORAGE_KEY = "sovereign.theme"', SHARED_JS)
+
+    def test_the_control_lives_in_the_profile_dialog(self):
+        self.assertIn("shellThemeSelect", SHARED_JS)
+        # It sits inside the profile dialog's markup, not the header bar.
+        dialog = SHARED_JS.split("_ensureProfileDialog() {", 1)[1]
+        dialog = dialog.split("document.body.append", 1)[0]
+        self.assertIn("shellThemeSelect", dialog)
+
+    def test_the_theme_applies_on_change_rather_than_on_save(self):
+        # The dialog's Save writes the profile; the theme is not profile
+        # data, so waiting for Save would both delay it and imply Cancel
+        # reverts it. It applies on change and Cancel leaves it alone.
+        self.assertIn('getElementById("shellThemeSelect").onchange', SHARED_JS)
+        save = SHARED_JS.split("async _saveProfile(", 1)[1].split("\n  },", 1)[0]
+        self.assertNotIn("shellThemeSelect", save)
+
+
 class ShippedExampleAssetTests(unittest.TestCase):
     """The example's assets are held to the rules every application follows.
 
