@@ -79,6 +79,47 @@ def _wait_until_serving(server, deadline: float) -> bool:
     return False
 
 
+# DWMWA_USE_IMMERSIVE_DARK_MODE. 20 is the stable value from Windows 10
+# 20H1 onward; 19 is the same attribute on the handful of earlier 1809/1903
+# builds still in use, and is tried only if 20 is rejected.
+_DWMWA_USE_IMMERSIVE_DARK_MODE = 20
+_DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY = 19
+
+
+def _use_dark_titlebar(window) -> None:
+    """Ask Windows to draw this window's native titlebar in dark mode.
+
+    background_color paints the content area pywebview controls; the
+    titlebar is drawn by the OS and answers to a different setting
+    entirely, which is why fixing one left the other white. There is no
+    pywebview option for this - it has to go through DwmSetWindowAttribute
+    directly, and only after the native window exists, which is what the
+    `shown` event guarantees.
+
+    Windows-only and best-effort: an unsupported build, a non-Windows
+    platform, or a native handle winforms does not expose all fail
+    silently. A plain white titlebar is a cosmetic regression, not a
+    reason to crash the window that is already open.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+
+        hwnd = window.native.Handle.ToInt32()
+        dark = ctypes.c_int(1)
+        dwmapi = ctypes.windll.dwmapi
+        result = dwmapi.DwmSetWindowAttribute(
+            hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE, ctypes.byref(dark), 4,
+        )
+        if result != 0:
+            dwmapi.DwmSetWindowAttribute(
+                hwnd, _DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY, ctypes.byref(dark), 4,
+            )
+    except Exception:  # noqa: BLE001 - cosmetic only, never worth failing over
+        pass
+
+
 def ensure_streams() -> None:
     """Give the process real stdout/stderr, which a windowed build lacks.
 
@@ -145,11 +186,12 @@ def run_desktop(app_name: str, window_title: str,
         # and so importing this module never requires one.
         import webview
 
-        webview.create_window(
+        window = webview.create_window(
             window_title, f"http://{config['bind_host']}:{port}/",
             width=1280, height=860, min_size=(900, 600),
             background_color=config.get("window_background") or WINDOW_BACKGROUND,
         )
+        window.events.shown += _use_dark_titlebar
         webview.start()
     finally:
         # The window is gone, so nothing can reach the session any more. Stop

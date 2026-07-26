@@ -79,6 +79,75 @@ class StreamTests(unittest.TestCase):
         self.assertIsNotNone(config)
 
 
+class DarkTitlebarTests(unittest.TestCase):
+    """background_color paints the content area; the titlebar is the OS's
+    to draw and answers to DwmSetWindowAttribute instead - fixing one left
+    the other white. Exercised without a real Windows handle: ctypes.windll
+    does not exist off Windows at all, so the platform and the call both
+    have to be faked to test the logic on any runner, including the Linux
+    leg of this repository's own CI matrix.
+    """
+
+    @staticmethod
+    def _window(hwnd=12345):
+        window = unittest.mock.Mock()
+        window.native.Handle.ToInt32.return_value = hwnd
+        return window
+
+    def test_does_nothing_off_windows(self):
+        window = self._window()
+        with patch.object(sys, "platform", "linux"):
+            desktop._use_dark_titlebar(window)
+
+        window.native.Handle.ToInt32.assert_not_called()
+
+    def test_asks_dwm_for_dark_mode_using_the_real_window_handle(self):
+        import ctypes
+
+        window = self._window(hwnd=98765)
+        fake_dwmapi = unittest.mock.Mock()
+        fake_dwmapi.DwmSetWindowAttribute.return_value = 0
+        fake_windll = unittest.mock.Mock(dwmapi=fake_dwmapi)
+
+        with patch.object(sys, "platform", "win32"), \
+                patch.object(ctypes, "windll", fake_windll, create=True):
+            desktop._use_dark_titlebar(window)
+
+        fake_dwmapi.DwmSetWindowAttribute.assert_called_once()
+        args = fake_dwmapi.DwmSetWindowAttribute.call_args[0]
+        self.assertEqual(args[0], 98765)
+        self.assertEqual(args[1], desktop._DWMWA_USE_IMMERSIVE_DARK_MODE)
+
+    def test_falls_back_to_the_legacy_attribute_when_the_new_one_is_rejected(self):
+        import ctypes
+
+        window = self._window()
+        fake_dwmapi = unittest.mock.Mock()
+        # Non-zero is DWM's failure return; older Windows builds reject the
+        # stable attribute number and only accept the legacy one.
+        fake_dwmapi.DwmSetWindowAttribute.return_value = 1
+        fake_windll = unittest.mock.Mock(dwmapi=fake_dwmapi)
+
+        with patch.object(sys, "platform", "win32"), \
+                patch.object(ctypes, "windll", fake_windll, create=True):
+            desktop._use_dark_titlebar(window)
+
+        self.assertEqual(fake_dwmapi.DwmSetWindowAttribute.call_count, 2)
+        second_call_attribute = fake_dwmapi.DwmSetWindowAttribute.call_args_list[1][0][1]
+        self.assertEqual(
+            second_call_attribute, desktop._DWMWA_USE_IMMERSIVE_DARK_MODE_LEGACY,
+        )
+
+    def test_a_missing_native_handle_does_not_crash_the_open_window(self):
+        # A plain white titlebar is cosmetic; raising here would take down a
+        # window that otherwise opened successfully.
+        window = unittest.mock.Mock()
+        window.native.Handle.ToInt32.side_effect = AttributeError("no handle")
+
+        with patch.object(sys, "platform", "win32"):
+            desktop._use_dark_titlebar(window)  # must not raise
+
+
 class CheckOnlyTests(unittest.TestCase):
     def test_check_only_builds_everything_and_opens_no_window(self):
         # webview is absent on a headless runner; if check_only reached the
@@ -152,6 +221,10 @@ class WindowAppearanceTests(unittest.TestCase):
             @staticmethod
             def create_window(title, url, **kwargs):
                 created.update(title=title, url=url, **kwargs)
+                # Real create_window returns a window; run_desktop hooks its
+                # `events.shown` for the dark-titlebar fix, which needs `+=`
+                # support that plain Mock does not provide.
+                return unittest.mock.MagicMock()
 
             @staticmethod
             def start():
