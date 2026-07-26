@@ -874,7 +874,18 @@ class RelayLogic:
                         continue
                     data = self.blob_store.read_blob(blob_id) if self.blob_store else None
                     if data is None:
+                        # Held back deliberately: a head must never name a blob
+                        # the relay does not hold. Traced as well as printed,
+                        # because a topic that silently stops publishing is the
+                        # hardest kind of sync failure to explain afterwards.
                         print(f"[relay] snapshot publish deferred: missing {blob_id}")
+                        self.session.trace_event(
+                            "relay.publication_deferred",
+                            relay_identity=self.identity,
+                            topic_uuid=topic_uuid,
+                            blob_id=blob_id,
+                            reason="referenced blob is not in the local store",
+                        )
                         publish_ready = False
                         break
                     self.storage.write_blob_lease(blob_id, self.identity, {
@@ -926,12 +937,34 @@ class RelayLogic:
             try:
                 blob_hex(blob_id)
             except ValueError:
+                self.session.trace_event(
+                    "relay.blob_rejected",
+                    relay_identity=self.identity,
+                    blob_id=str(blob_id)[:80],
+                    reason="malformed blob id",
+                )
                 continue
             if self.blob_store.has_blob(blob_id):
                 continue
             blob_data = self.storage.read_blob(blob_id)
-            if blob_data is not None:
-                self.blob_store.write_blob(blob_data)
+            # A reference that syncs while its bytes never arrive renders as a
+            # peer with no avatar and leaves no trace of why. Both outcomes are
+            # recorded, because "nothing happened" was indistinguishable from
+            # "nothing needed to happen" when this path was silent.
+            if blob_data is None:
+                self.session.trace_event(
+                    "relay.blob_missing",
+                    relay_identity=self.identity,
+                    blob_id=blob_id,
+                )
+                continue
+            self.blob_store.write_blob(blob_data)
+            self.session.trace_event(
+                "relay.blob_cached",
+                relay_identity=self.identity,
+                blob_id=blob_id,
+                size=len(blob_data),
+            )
 
     @_relay_io_locked
     def read_blob(self, blob_id: str) -> bytes | None:
