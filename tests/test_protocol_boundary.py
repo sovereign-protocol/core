@@ -28,14 +28,16 @@ class ProtocolBoundaryTests(unittest.TestCase):
 
     def test_app_logic_does_not_mutate_protocol_directly(self):
         root = Path(__file__).resolve().parents[1]
-        candidates = [
-            root / "applications" / "s-kanban" / "src" / "s_kanban" / "logic.py",
-            root / "applications" / "s-agreement" / "src" / "s_agreement" / "logic.py",
-            root / "examples" / "s-agreement" / "src" / "s_agreement" / "logic.py",
+        # Only what this repository ships. The candidate list used to name
+        # S-Kanban and S-Agreement at monorepo paths that no longer exist, so
+        # it silently fell through to whichever file happened to be present.
+        app_files = [
+            *sorted(root.glob("examples/*/src/*/logic.py")),
             root / "src" / "sovereign" / "protocol_explorer.py",
         ]
-        app_files = [path for path in candidates if path.is_file()]
-        self.assertGreaterEqual(len(app_files), 2)
+        self.assertGreaterEqual(len(app_files), 2, app_files)
+        for path in app_files:
+            self.assertTrue(path.is_file(), str(path))
         forbidden = [
             r"\.(?:children|parent_uuid|content_hash|state_hash|base_hash|base_parent_uuid|data|weights)\s*=",
             r"\.(?:data|weights)\s*\[",

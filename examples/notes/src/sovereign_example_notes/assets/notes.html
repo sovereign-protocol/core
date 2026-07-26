@@ -1,0 +1,47 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>Example Notes</title>
+<link rel="stylesheet" href="/assets/shared.css">
+<link rel="stylesheet" href="/assets/notes.css">
+<script src="/assets/shared.js" defer></script>
+
+<!--
+  The shell draws the header, the collaboration pane and every dialog. An
+  application supplies its content area and nothing else; that is what keeps
+  chrome identical across applications (DESIGN_UI_CONSISTENCY, U1).
+-->
+<main id="notes">
+  <ul id="note-list"></ul>
+  <form id="add-note">
+    <input id="note-text" type="text" placeholder="Add a note" required>
+    <button type="submit">Add</button>
+  </form>
+</main>
+
+<script>
+  async function refresh() {
+    const state = await fetch("/api/example-notes/state").then((r) => r.json());
+    const list = document.getElementById("note-list");
+    list.replaceChildren(...state.notes.map((note) => {
+      const item = document.createElement("li");
+      item.textContent = note.text;
+      return item;
+    }));
+    // Topic selection is the shell's, so the application only names its topic.
+    SovereignShell.setTopicSelector({ topicUuid: state.list_uuid });
+  }
+
+  document.getElementById("add-note").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const field = document.getElementById("note-text");
+    await fetch("/api/example-notes/notes", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ text: field.value }),
+    });
+    field.value = "";
+    refresh();
+  });
+
+  refresh();
+</script>

@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sovereign-example-notes"
+version = "0.1.0"
+description = "Smallest complete Sovereign Core application, used by Core's own tests"
+requires-python = ">=3.10"
+# An example carries the repository licence, per NOTICE. Unlike S-Agreement,
+# which left to become a product under Apache-2.0, this is not a product and
+# is not published: it exists so Core's suite always has a real application.
+license = "LGPL-3.0-or-later"
+classifiers = ["Private :: Do Not Upload"]
+dependencies = ["sovereign-protocol"]
+
+[project.urls]
+Homepage = "https://github.com/sovereign-protocol/core"
+Source = "https://github.com/sovereign-protocol/core/tree/main/examples/notes"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+include = ["sovereign_example_notes*"]
+
+[tool.setuptools.package-data]
+"sovereign_example_notes.assets" = ["*.css", "*.html", "*.js"]

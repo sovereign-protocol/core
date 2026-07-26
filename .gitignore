@@ -8,3 +8,4 @@ data/
 traces/
 *.log
 .claude/
+core.code-workspace

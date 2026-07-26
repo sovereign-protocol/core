@@ -15,7 +15,9 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: {python-version: "${{ matrix.python }}"}
-      - run: python -m pip install ".[test]" -e ./examples/s-agreement
+      # The example is installed, not just present, so Core's suite exercises
+      # its contract against a real distribution rather than only stubs.
+      - run: python -m pip install ".[test]" -e ./examples/notes
       - run: python -m pip check
       - if: runner.os == 'Windows' && matrix.python == '3.14'
         run: python tools/check_dependency_inventory.py

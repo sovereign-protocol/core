@@ -18,6 +18,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "src" / "sovereign"
 EXAMPLES = ROOT / "examples"
 APPLICATION_PACKAGES = ("personal_cockpit", "s_agreement", "s_kanban")
+EXAMPLE_PACKAGE = "sovereign_example_notes"
 
 
 def imported_modules(path: Path) -> set[str]:
@@ -75,11 +76,12 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             offending = sorted(
                 name for name in imports
                 for package in APPLICATION_PACKAGES
-                # S-Agreement ships inside Core as its conformance example, so
-                # it is the one application a Core test may import.
-                if package != "s_agreement"
-                and (name == package or name.startswith(f"{package}."))
+                if name == package or name.startswith(f"{package}.")
             )
+            # There used to be an exemption here for S-Agreement, which
+            # shipped inside Core. It became a product and moved to its own
+            # repository, so no application is importable from Core's tests
+            # any more and the special case is gone.
             self.assertEqual(offending, [], f"{path} imports {offending}")
 
     def test_protocol_depends_only_on_standard_library_and_its_version_constant(self):
