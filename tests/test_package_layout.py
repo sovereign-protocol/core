@@ -76,8 +76,9 @@ class PackageLayoutTests(unittest.TestCase):
     def test_domain_logic_modules_do_not_depend_on_host_or_http_controllers(self):
         paths = [
             ROOT / "src" / "sovereign" / "protocol_explorer.py",
-            ROOT / "examples" / "s-agreement" / "src" / "s_agreement" / "logic.py",
+            *sorted(ROOT.glob("examples/*/src/*/logic.py")),
         ]
+        self.assertGreaterEqual(len(paths), 2, paths)
         for path in paths:
             tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
             imports = {
@@ -114,30 +115,32 @@ class PackageLayoutTests(unittest.TestCase):
 
 
 class ShippedExampleAssetTests(unittest.TestCase):
+    """The example's assets are held to the rules every application follows.
+
+    These used to check S-Agreement, which shipped inside Core. It became a
+    product and moved out, so they check the minimal example that replaced it.
+    """
+
     def setUp(self):
-        self.agreement = files("s_agreement.assets").joinpath(
-            "agreement.html",
+        self.notes = files("sovereign_example_notes.assets").joinpath(
+            "notes.html",
         ).read_text(encoding="utf-8")
 
-    def test_agreement_assets_are_packaged(self):
-        self.assertTrue(files("s_agreement.assets").joinpath("agreement.html").is_file())
+    def test_example_assets_are_packaged(self):
+        assets = files("sovereign_example_notes.assets")
+        self.assertTrue(assets.joinpath("notes.html").is_file())
+        self.assertTrue(assets.joinpath("notes.css").is_file())
 
-    def test_agreement_ui_presents_peer_only_nodes_as_proposals(self):
-        self.assertIn("payloadState.proposed_nodes", self.agreement)
-        self.assertIn("Accept proposal", self.agreement)
-        self.assertIn("Withdraw proposal", self.agreement)
-        self.assertNotIn("Keep mine", self.agreement)
+    def test_example_delegates_topic_creation_to_the_shell(self):
+        self.assertNotIn("onCreateTopic", self.notes)
+        self.assertIn("SovereignShell.setTopicSelector", self.notes)
 
-    def test_agreement_delegates_topic_creation_to_the_shell(self):
-        self.assertNotIn("onCreateTopic", self.agreement)
-        self.assertIn("SovereignShell.setTopicSelector", self.agreement)
-
-    def test_agreement_never_navigates_to_the_bare_root_with_a_query(self):
+    def test_example_never_navigates_to_the_bare_root_with_a_query(self):
         # "/" serves whichever application is primary, so a root-relative link
         # lands somewhere that depends on host configuration.
-        for number, line in enumerate(self.agreement.splitlines(), start=1):
+        for number, line in enumerate(self.notes.splitlines(), start=1):
             for pattern in ('href = `/?', 'href="/?', "href='/?"):
-                self.assertNotIn(pattern, line, f"agreement.html:{number}")
+                self.assertNotIn(pattern, line, f"notes.html:{number}")
 
 
 if __name__ == "__main__":
