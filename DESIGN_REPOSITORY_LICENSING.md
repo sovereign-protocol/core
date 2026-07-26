@@ -67,7 +67,14 @@ License: `Apache-2.0`.
 ### Later repositories
 
 - `sovereign-protocol/s-agreement` — create only when the conformance skeleton becomes a
-  real product.
+  real product. **Condition met 2026-07-26; the repository exists.** It was
+  relicensed from `LGPL-3.0-or-later` to `Apache-2.0` on the way out: it had
+  carried Core's licence only because it lived inside Core's repository,
+  where `NOTICE` makes the repository licence the default for examples, and
+  an application takes the application licence. Sole copyright holder, so no
+  contributor consent was required. Core keeps a minimal, non-product example
+  at `examples/notes` so its own CI still exercises the application contract
+  against something real — the role S-Agreement used to fill.
 - A reusable profile or UI package — only after ownership decisions in the
   architecture design.
 
