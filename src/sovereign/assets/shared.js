@@ -8,6 +8,43 @@
   helpers just call the global peerLabel() the page itself defines.
 */
 
+// Theme is a display preference for this machine, like the OS's own dark
+// mode - deliberately not in the Core profile, which syncs to peers and
+// would carry a cosmetic choice to every device you connect from.
+const THEME_STORAGE_KEY = "sovereign.theme";
+const THEMES = ["dark", "light"];
+const DEFAULT_THEME = "dark";
+
+function storedTheme() {
+  try {
+    const value = window.localStorage.getItem(THEME_STORAGE_KEY);
+    return THEMES.includes(value) ? value : DEFAULT_THEME;
+  } catch (error) {
+    // Private browsing and some embedded webviews throw on access rather
+    // than returning null. A theme is not worth failing a page load over.
+    return DEFAULT_THEME;
+  }
+}
+
+function applyTheme(theme) {
+  const resolved = THEMES.includes(theme) ? theme : DEFAULT_THEME;
+  document.documentElement.setAttribute("data-theme", resolved);
+  return resolved;
+}
+
+// Run at parse time, not on DOMContentLoaded: the attribute must be on
+// <html> before first paint, or the page shows the default palette and then
+// corrects itself - a flash that is worse than either theme on its own.
+applyTheme(storedTheme());
+
+const ICON_SUN =
+  '<circle cx="12" cy="12" r="4"></circle><path d="M12 2v2"></path>'
+  + '<path d="M12 20v2"></path><path d="m4.9 4.9 1.4 1.4"></path>'
+  + '<path d="m17.7 17.7 1.4 1.4"></path><path d="M2 12h2"></path>'
+  + '<path d="M20 12h2"></path><path d="m6.3 17.7-1.4 1.4"></path>'
+  + '<path d="m19.1 4.9-1.4 1.4"></path>';
+const ICON_MOON = '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"></path>';
+
 const ICON_CLOSE = '<path d="M18 6 6 18"></path><path d="M6 6l12 12"></path>';
 const ICON_CHEVRON_DOWN = '<path d="M6 9l6 6 6-6"></path>';
 const ICON_SETTINGS =
@@ -458,6 +495,10 @@ Object.assign(SovereignShell, {
     connection.textContent = "Private";
     connection.onclick = () => this.openConnectionPanel();
 
+    const theme = iconButton("", "Theme", () => this.toggleTheme());
+    theme.id = "shellThemeBtn";
+    theme.classList.add("shell-theme-btn");
+
     const avatar = document.createElement("button");
     avatar.type = "button";
     avatar.id = "shellAvatarBtn";
@@ -465,9 +506,44 @@ Object.assign(SovereignShell, {
     avatar.title = "Edit your profile";
     avatar.onclick = () => this.openProfile();
 
-    actions.append(appActions, connection, avatar);
+    actions.append(appActions, connection, theme, avatar);
     container.append(left, middle, actions);
+    this._renderThemeButton();
     return nav;
+  },
+
+  theme() {
+    return document.documentElement.getAttribute("data-theme") || DEFAULT_THEME;
+  },
+
+  setTheme(theme) {
+    const resolved = applyTheme(theme);
+    try {
+      window.localStorage.setItem(THEME_STORAGE_KEY, resolved);
+    } catch (error) {
+      // Unwritable storage means the choice lasts for this window only,
+      // which is still better than refusing to switch at all.
+    }
+    this._renderThemeButton();
+    return resolved;
+  },
+
+  toggleTheme() {
+    return this.setTheme(this.theme() === "dark" ? "light" : "dark");
+  },
+
+  // The icon shows what you would switch *to*, not the state you are in -
+  // a sun while dark reads as "go light", which is what a click does.
+  _renderThemeButton() {
+    const button = document.getElementById("shellThemeBtn");
+    if (!button) return;
+    const dark = this.theme() === "dark";
+    const label = dark ? "Switch to light theme" : "Switch to dark theme";
+    button.innerHTML =
+      '<svg viewBox="0 0 24 24" aria-hidden="true" class="icon-svg">'
+      + (dark ? ICON_SUN : ICON_MOON) + "</svg>";
+    button.title = label;
+    button.setAttribute("aria-label", label);
   },
 
   // The topic region and the application-actions slot are the two places an
