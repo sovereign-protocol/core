@@ -72,15 +72,44 @@ def _wait_until_serving(server, deadline: float) -> bool:
     return False
 
 
+def ensure_streams() -> None:
+    """Give the process real stdout/stderr, which a windowed build lacks.
+
+    A frozen build with no console leaves both as None. uvicorn's default log
+    configuration then asks `sys.stdout.isatty()` whether to colourise, which
+    raises `AttributeError` inside `logging.config.dictConfig` and surfaces as
+    "Unable to configure formatter 'default'" - before the window ever opens.
+    Anything else that writes, including a traceback explaining a different
+    failure, breaks the same way and for the same reason.
+
+    Discarding is the honest default here: there is no console to read, and a
+    window that refuses to start is worse than one whose server logs go
+    nowhere. A stream that is already open is left alone, so running from a
+    terminal is unaffected.
+    """
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name, None) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
 def run_desktop(app_name: str, window_title: str,
                 application_aliases: dict | None = None,
                 config_path: str | None = None,
-                port: int | None = None) -> int:
-    """Serve on a background thread and show the window until it is closed."""
+                port: int | None = None,
+                check_only: bool = False) -> int:
+    """Serve on a background thread and show the window until it is closed.
+
+    With `check_only`, everything up to the window is built and the call
+    returns instead of opening one. That is what a frozen build can run on a
+    machine with no desktop session, so a startup failure is caught by CI
+    rather than by whoever double-clicks the executable first.
+    """
     import uvicorn
 
     from .app_server import build_app, create_runtime
 
+    # Before uvicorn, which is the first thing to touch stdout.
+    ensure_streams()
     config = desktop_config(
         app_name, application_aliases, window_title, config_path,
     )
@@ -92,6 +121,11 @@ def run_desktop(app_name: str, window_title: str,
         port=port,
         log_level="error",
     ))
+    if check_only:
+        # The server object exists, which means the log configuration was
+        # accepted and the application mounted. Nothing is served and no
+        # window is opened, so this runs anywhere.
+        return 0
     thread = threading.Thread(target=server.run, name="sovereign-host", daemon=True)
     thread.start()
     try:
@@ -120,15 +154,25 @@ def run_desktop(app_name: str, window_title: str,
 
 def desktop_main(argv: list[str] | None, app_name: str, window_title: str,
                  application_aliases: dict | None = None) -> int:
-    """Command-line wrapper shared by every application's desktop entry."""
+    """Command-line wrapper shared by every application's desktop entry.
+
+    `--check` builds everything up to the window and exits, so a frozen build
+    can prove it starts on a machine with no desktop session.
+    """
+    # A windowed build has no stdout, so even the usage message below would
+    # raise before printing. Fix the streams first, not inside run_desktop.
+    ensure_streams()
     argv = list(sys.argv[1:] if argv is None else argv)
+    check_only = "--check" in argv
+    argv = [item for item in argv if item != "--check"]
     if len(argv) > 1:
-        print(f"Usage: {app_name}-desktop [config.json]", file=sys.stderr)
+        print(f"Usage: {app_name}-desktop [--check] [config.json]", file=sys.stderr)
         return 1
     try:
         return run_desktop(
             app_name, window_title, application_aliases,
             argv[0] if argv else None,
+            check_only=check_only,
         )
     except ImportError:
         print(
