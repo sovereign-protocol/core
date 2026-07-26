@@ -39,7 +39,9 @@ Changelog = "https://github.com/sovereign-protocol/core/blob/main/CHANGELOG.md"
 Specification = "https://github.com/sovereign-protocol/core/blob/main/SPECIFICATION_S_PROTOCOL.md"
 
 [project.optional-dependencies]
-test = ["pytest>=8,<10"]
+# setuptools is the build backend; the packaging test builds a wheel without
+# build isolation, and Python 3.12+ virtual environments no longer ship it.
+test = ["pytest>=8,<10", "setuptools>=68"]
 
 [project.scripts]
 sovereign-host = "sovereign.app_server:main"
