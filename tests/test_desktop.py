@@ -144,6 +144,55 @@ class CheckOnlyTests(unittest.TestCase):
         return path
 
 
+class WindowAppearanceTests(unittest.TestCase):
+    def _open_window(self, config_extra=None):
+        created = {}
+
+        class FakeWebview:
+            @staticmethod
+            def create_window(title, url, **kwargs):
+                created.update(title=title, url=url, **kwargs)
+
+            @staticmethod
+            def start():
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "host.json"
+            settings = {"storage_file": str(Path(tmp) / "state.json")}
+            settings.update(config_extra or {})
+            path.write_text(
+                "{%s}" % ", ".join(
+                    f'"{key}": "{value}"' for key, value in settings.items()
+                ).replace("\\", "/"),
+                encoding="utf-8",
+            )
+            with patch.dict(sys.modules, {"webview": FakeWebview}):
+                desktop.run_desktop(
+                    "example", "Example", ALIASES, str(path), port=9996,
+                )
+        return created
+
+    def test_the_window_is_dark_before_the_page_paints(self):
+        # pywebview defaults to white. Every application here is dark (U4),
+        # so the default shows a white frame until the page loads and again
+        # behind the content while resizing.
+        created = self._open_window()
+
+        self.assertEqual(created["background_color"], desktop.WINDOW_BACKGROUND)
+        self.assertNotEqual(created["background_color"].upper(), "#FFFFFF")
+
+    def test_an_application_can_choose_its_own_window_background(self):
+        created = self._open_window({"window_background": "#1c1a17"})
+
+        self.assertEqual(created["background_color"], "#1c1a17")
+
+    def test_the_window_carries_the_supplied_title(self):
+        created = self._open_window()
+
+        self.assertEqual(created["title"], "Example")
+
+
 class DataDirectoryTests(unittest.TestCase):
     def test_storage_is_not_derived_from_the_port(self):
         # A window picks a free port each start, so a port-derived filename

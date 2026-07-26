@@ -30,6 +30,13 @@ STARTUP_TIMEOUT_SECONDS = 20.0
 SHUTDOWN_TIMEOUT_SECONDS = 10.0
 LOOPBACK = "127.0.0.1"
 
+# What the window is painted with before the page arrives, and behind it
+# while resizing. pywebview defaults to white, which flashes against every
+# application in the project - U4 in DESIGN_UI_CONSISTENCY makes them all
+# dark. This is the shell's own page colour, so the seam is invisible.
+# An application can override it with `window_background` in its config.
+WINDOW_BACKGROUND = "#0d1117"
+
 
 def data_directory(application_name: str) -> Path:
     """The per-user directory holding this application's saved state."""
@@ -141,6 +148,7 @@ def run_desktop(app_name: str, window_title: str,
         webview.create_window(
             window_title, f"http://{config['bind_host']}:{port}/",
             width=1280, height=860, min_size=(900, 600),
+            background_color=config.get("window_background") or WINDOW_BACKGROUND,
         )
         webview.start()
     finally:
