@@ -40,7 +40,13 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertTrue(files("sovereign.assets").joinpath("manual.html").is_file())
 
     def test_package_sources_live_under_the_declared_src_root(self):
-        self.assertTrue(Path(sovereign.__file__).is_relative_to(ROOT / "src"))
+        # Asserting where the imported module loaded from only holds for an
+        # editable install: CI installs a wheel, so __file__ points into
+        # site-packages. The invariant is this repository's layout - the
+        # source sits under src/, and no flat copy survives beside it for an
+        # import to pick up ahead of the installed package.
+        self.assertTrue((ROOT / "src" / "sovereign" / "__init__.py").is_file())
+        self.assertFalse((ROOT / "sovereign").exists())
 
     def test_applications_cannot_receive_channel_manager(self):
         from sovereign.application import ApplicationServices
