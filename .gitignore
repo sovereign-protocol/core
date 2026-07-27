@@ -9,3 +9,5 @@ traces/
 *.log
 .claude/
 core.code-workspace
+# Editor configuration is per-machine, not per-project.
+.vscode/

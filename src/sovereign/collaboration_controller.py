@@ -79,7 +79,53 @@ def build_routes(runtime) -> list[Route]:
             runtime.notify_change("invitation")
         return response(result)
 
+    async def api_sibling_alarms(request: Request):
+        payload = await asyncio.to_thread(service.sibling_alarms_payload)
+        # Where this client's own version lives. Taking the sibling's version
+        # discards it, and copying this file is the only way back - the
+        # design deliberately offers no export (section 4.4).
+        payload["storage_file"] = runtime.config.get("storage_file") or ""
+        return JSONResponse(payload)
+
+    async def api_resolve_sibling_alarm(request: Request):
+        values = await request.json()
+        result = await asyncio.to_thread(
+            service.resolve_sibling_alarm,
+            values.get("topic_uuid", ""),
+            values.get("decision", ""),
+        )
+        if result.ok:
+            runtime.notify_change("sibling-alarm")
+        return response(result)
+
+    async def api_pairing_token(request: Request):
+        values = await request.json() if await request.body() else {}
+        return response(await asyncio.to_thread(
+            service.compose_pairing_token, values.get("target_id", ""),
+        ))
+
+    async def api_accept_pairing_token(request: Request):
+        values = await request.json()
+        result = await asyncio.to_thread(
+            service.accept_pairing_token, values.get("token") or {},
+        )
+        if result.ok:
+            runtime.notify_change("pairing")
+        return response(result)
+
     return [
+        Route("/api/core/siblings/pairing", api_pairing_token, methods=["POST"]),
+        Route(
+            "/api/core/siblings/pairing/accept",
+            api_accept_pairing_token,
+            methods=["POST"],
+        ),
+        Route("/api/core/siblings/alarms", api_sibling_alarms),
+        Route(
+            "/api/core/siblings/alarms/resolve",
+            api_resolve_sibling_alarm,
+            methods=["POST"],
+        ),
         Route("/api/core/channels", api_channels, methods=["GET", "POST"]),
         Route("/api/core/channels/test", api_test_channel, methods=["POST"]),
         Route("/api/core/channels/delete", api_delete_channel, methods=["POST"]),

@@ -786,8 +786,11 @@ class AppServerTests(unittest.TestCase):
             [
                 "calibrate_timing",
                 "write_presence",
-                "publish_before_poll",
+                # Poll precedes publish: with one publication identity per
+                # user, writing before looking is a lost update rather than
+                # merely a stale one.
                 "poll_and_apply",
+                "publish_after_poll",
                 "adopt_peer_updates",
                 "publish_response",
             ],

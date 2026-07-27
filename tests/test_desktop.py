@@ -7,12 +7,14 @@ either executable was double-clicked, while CI stayed green building them.
 """
 
 import io
+import json
 import os
+import socket
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 from sovereign import desktop
 from sovereign.application import ApplicationInstance, ApplicationManifest
@@ -148,6 +150,26 @@ class DarkTitlebarTests(unittest.TestCase):
             desktop._use_dark_titlebar(window)  # must not raise
 
 
+class ServerTests(unittest.TestCase):
+    def test_free_port_is_actually_bindable(self):
+        port = desktop.free_port()
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+            probe.bind((desktop.LOOPBACK, port))  # must not raise
+
+    def test_waiting_gives_up_rather_than_hanging(self):
+        never = type("Server", (), {"started": False})()
+
+        self.assertFalse(desktop._wait_until_serving(never, deadline=0.0))
+
+    def test_waiting_returns_as_soon_as_the_server_is_up(self):
+        started = type("Server", (), {"started": True})()
+
+        self.assertTrue(
+            desktop._wait_until_serving(started, deadline=float("inf")),
+        )
+
+
 class CheckOnlyTests(unittest.TestCase):
     def test_check_only_builds_everything_and_opens_no_window(self):
         # webview is absent on a headless runner; if check_only reached the
@@ -266,17 +288,128 @@ class WindowAppearanceTests(unittest.TestCase):
         self.assertEqual(created["title"], "Example")
 
 
+class WindowSessionTests(unittest.TestCase):
+    """Exercise the real server lifecycle with only the window faked.
+
+    WindowAppearanceTests above fakes `start()` as a no-op and reads back what
+    `create_window` was given. These let the server actually serve: the fake
+    window fetches its own URL, which is what makes the frozen build's
+    blank-window failure visible, and the session has to reach disk on close.
+    No port is pinned, so `free_port` is exercised too.
+    """
+
+    def _fake_webview(self, opened: dict):
+        import types
+        import urllib.request
+
+        module = types.ModuleType("webview")
+
+        def create_window(title, url, **kwargs):
+            opened["title"] = title
+            opened["url"] = url
+            # Real pywebview returns a window object, and run_desktop hooks its
+            # events.shown to darken the native titlebar. Returning None made
+            # this fake diverge from the thing it stands in for, so a change
+            # that is correct against pywebview broke it.
+            return MagicMock()
+
+        def start():
+            # The window would load this URL, so proving it serves here is
+            # what makes the frozen build's blank-window failure visible.
+            with urllib.request.urlopen(opened["url"], timeout=10) as response:
+                opened["status"] = response.status
+                opened["body"] = response.read(2048).decode("utf-8", "replace")
+
+        module.create_window = create_window
+        module.start = start
+        return module
+
+    def _run(self, opened: dict, directory: str):
+        config_file = Path(directory) / "host.json"
+        config_file.write_text(
+            json.dumps({
+                "storage_file": str(Path(directory) / "state.json"),
+                "blob_store_dir": str(Path(directory) / "blobs"),
+            }),
+            encoding="utf-8",
+        )
+        with patch.dict(sys.modules, {"webview": self._fake_webview(opened)}):
+            return desktop.run_desktop(
+                "example", "Example", ALIASES, str(config_file),
+            )
+
+    def test_window_gets_a_served_page_and_the_session_is_saved_on_close(self):
+        opened: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            code = self._run(opened, tmp)
+
+            self.assertEqual(code, 0)
+            self.assertEqual(opened["status"], 200)
+            self.assertIn("<html", opened["body"].lower())
+            # Closing the window must leave the session on disk, or the next
+            # launch silently starts empty.
+            self.assertTrue((Path(tmp) / "state.json").is_file())
+
+    def test_the_window_opens_on_loopback(self):
+        opened: dict = {}
+        with tempfile.TemporaryDirectory() as tmp:
+            self._run(opened, tmp)
+
+        self.assertTrue(opened["url"].startswith(f"http://{desktop.LOOPBACK}:"))
+
+
 class DataDirectoryTests(unittest.TestCase):
+    """Where a frozen build keeps state, which is the whole risk here.
+
+    Every test that reaches `desktop_config` redirects `data_directory` to a
+    temporary one, because the real call creates the per-user directory as a
+    side effect and a test suite must not leave state in it.
+    """
+
+    def _config(self, directory, config_path=None):
+        with patch.object(desktop, "data_directory", return_value=Path(directory)):
+            return desktop.desktop_config("example", ALIASES, "Example", config_path)
+
     def test_storage_is_not_derived_from_the_port(self):
         # A window picks a free port each start, so a port-derived filename
         # would lose the previous session every time.
-        first = desktop.desktop_config("example", ALIASES, "Example")
-        second = desktop.desktop_config("example", ALIASES, "Example")
+        with tempfile.TemporaryDirectory() as tmp:
+            first = self._config(tmp)
+            second = self._config(tmp)
 
         self.assertEqual(first["storage_file"], second["storage_file"])
+        for port in (9105, 51789):
+            self.assertNotIn(str(port), first["storage_file"])
+
+    def test_storage_does_not_depend_on_the_working_directory(self):
+        # An executable started from the shell has no meaningful cwd, so an
+        # absolute per-user path is the only thing that survives.
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp)
+
+            self.assertTrue(Path(config["storage_file"]).is_absolute())
+            self.assertTrue(config["storage_file"].startswith(tmp))
+
+    def test_an_explicit_storage_file_still_wins(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            chosen = str(Path(tmp) / "chosen.json")
+            config_file = Path(tmp) / "config.json"
+            config_file.write_text(
+                json.dumps({"storage_file": chosen}), encoding="utf-8",
+            )
+            config = self._config(tmp, str(config_file))
+
+        self.assertEqual(config["storage_file"], chosen)
+
+    def test_data_directory_is_user_scoped_and_named(self):
+        directory = desktop.data_directory("Example")
+
+        self.assertTrue(directory.is_absolute())
+        self.assertEqual(directory.name, "Example")
 
     def test_binding_stays_on_loopback(self):
-        config = desktop.desktop_config("example", ALIASES, "Example")
+        with tempfile.TemporaryDirectory() as tmp:
+            config = self._config(tmp)
 
         self.assertEqual(config["bind_host"], desktop.LOOPBACK)
 
@@ -286,6 +419,23 @@ class DataDirectoryTests(unittest.TestCase):
             directory = desktop.data_directory("Example")
 
         self.assertEqual(directory, Path(r"C:\Users\x\AppData\Local") / "Example")
+
+
+class EntryPointTests(unittest.TestCase):
+    def test_missing_pywebview_explains_the_install(self):
+        # The window is the only thing pywebview is needed for, so its absence
+        # must read as an install hint rather than a crash.
+        with patch.object(desktop, "run_desktop", side_effect=ImportError("no webview")):
+            code = desktop.desktop_main([], "example", "Example", ALIASES)
+
+        self.assertEqual(code, 1)
+
+    def test_too_many_arguments_are_rejected(self):
+        code = desktop.desktop_main(
+            ["one.json", "two.json"], "example", "Example", ALIASES,
+        )
+
+        self.assertEqual(code, 1)
 
 
 if __name__ == "__main__":

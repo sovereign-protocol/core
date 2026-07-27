@@ -175,6 +175,16 @@ class ReadOnlyProtocolView:
 
 
 class Session:
+    # Another client of this same user caches its version of a topic under an
+    # address with this prefix. It is not a peer address and must never be
+    # treated as one: a sibling has no place in the participant lists, and no
+    # vote in prune_deleted_nodes - it is this user, not another party.
+    SIBLING_ADDRESS_PREFIX = "sibling:"
+
+    @classmethod
+    def is_sibling_address(cls, peer_addr: str | None) -> bool:
+        return str(peer_addr or "").startswith(cls.SIBLING_ADDRESS_PREFIX)
+
     def __init__(self, address: str, trace: TraceLogger | None = None):
         self.lock = threading.RLock()
         self.address = address
@@ -307,6 +317,49 @@ class Session:
         if picture is not None:
             data["picture"] = picture or ""
         return self.modify(profile.uuid, data, profile.weights)
+
+    @_session_locked
+    def adopt_pairing_identity(self, profile: dict) -> SessionResult:
+        """Become the identity in a pairing token, replacing our own.
+
+        Unlike accept_profile_invitation, which validates a *peer's* profile
+        and leaves ours alone, this replaces the local profile node outright
+        - uuid included. That is the point: siblings must present one face,
+        so third parties see one participant rather than one per machine.
+
+        `local_revision_seq` is deliberately untouched. It is this client's
+        own counter and stays client-local; copying it would give two clients
+        one origin *and* one counter, which is the collision the sequence
+        comparator cannot detect.
+        """
+        error = _core_profile_schema_error(dict(profile.get("data") or {}))
+        if error:
+            return SessionResult("error", reason=error)
+        incoming = ProtocolNode.from_dict(profile)
+        if incoming.children:
+            return SessionResult("error", reason="Core profile cannot have children")
+        container = self._folder(self.protocol.root, "shared_user_data")
+        current = next(
+            (
+                child for child in container.children
+                if child.data.get("type") == "shared_user_profile"
+            ),
+            None,
+        )
+        if current is not None:
+            if current.uuid == incoming.uuid:
+                return SessionResult("ok", value=current.uuid)
+            self._protocol.remove_subtree_uuids(
+                self._protocol.root.uuid, {current.uuid},
+            )
+        adopted = self.adopt_subtree(incoming, container.uuid)
+        if adopted.status != "ok":
+            return adopted
+        self.trace_event(
+            "session.pairing_identity_adopted",
+            identity_uuid=incoming.uuid,
+        )
+        return SessionResult("ok", value=incoming.uuid)
 
     def accept_profile_invitation(self, tree: ProtocolNode) -> SessionResult:
         """Validate a peer profile without grafting it into our sovereign tree.
@@ -1229,6 +1282,36 @@ class Session:
                 self.peer_perspectives.pop(peer_addr, None)
         return True
 
+    @_session_locked
+    def forget_peer_topic_perspective(self, peer_addr: str,
+                                      topic_uuid: str) -> bool:
+        """Drop a peer's cached content for one topic, keep the relationship.
+
+        Deliberately narrower than remove_peer. The cache is a view of what
+        a peer is currently publishing, so it may follow what the channel
+        can presently see. peer_topic_sets is the relationship, and dropping
+        that would also drop the peer's vote in prune_deleted_nodes - which
+        is how a peer that merely went quiet could have its deletions pruned
+        and then re-proposed as new nodes when it came back.
+
+        Losing the cache makes _peer_topic_confirms_deletion answer False
+        for this peer, so pruning becomes more conservative here, never
+        less.
+        """
+        tree = self.peer_perspectives.get(peer_addr)
+        if not tree:
+            return False
+        if tree.uuid == topic_uuid:
+            # The cache root is the topic itself, so there is nothing left
+            # to keep - same case handle_leave has to make.
+            self.peer_perspectives.pop(peer_addr, None)
+            return True
+        if not self._find_in_tree(tree, topic_uuid):
+            return False
+        self._remove_uuid_from_tree(tree, topic_uuid)
+        self._refresh_tree_hashes(tree)
+        return True
+
     def observed_topic_pairs(self) -> list[tuple[str, str]]:
         return sorted(
             (peer_addr, topic_uuid)
@@ -1605,6 +1688,78 @@ class Session:
         return changed
 
     @_session_locked
+    def adopt_sibling_topic(self, peer_addr: str,
+                            topic_uuid: str) -> SessionResult:
+        """Take another client of this same user's version of one topic, whole.
+
+        Deliberately unlike reconcile_peer_changes, which is per node because
+        peer reconciliation is *selective* - one adopts a peer's card and
+        declines their column deletion, so every node needs its own verdict.
+        Between one person's own clients there is nothing to select: the
+        decision was made once, for the topic, by the person who was asked
+        (DESIGN_MULTI_CLIENT_PAIRING.md 4.3). So every difference resolves the
+        same way, including the two reconcile_peer_changes leaves alone -
+        nodes only this side still has, and nodes this side changed.
+
+        Nodes the sibling no longer has are deleted here. Leaving them would
+        produce a state that is *nearly* the sibling's, which is worse than
+        either version: nobody chose it and nobody can reason about it.
+        """
+        peer_topic = self.get_cached_peer_subtree(peer_addr, topic_uuid)
+        if not peer_topic:
+            return SessionResult("error", reason="no sibling version cached")
+        local_topic = self._protocol.index.get(topic_uuid)
+        if not local_topic:
+            return SessionResult("error", reason="topic not found")
+        if peer_topic.state_hash == local_topic.state_hash:
+            return SessionResult("ok", value=False)
+
+        changed = False
+        # Parents before children: a node the sibling has and this client does
+        # not can only be created once its parent exists.
+        for node in self._breadth_first(peer_topic):
+            result = self.accept_peer_node(
+                peer_addr,
+                node.uuid,
+                adopt_descendants=node.uuid not in self._protocol.index,
+            )
+            changed = changed or result.status == "ok"
+
+        peer_uuids = {node.uuid for node in self._breadth_first(peer_topic)}
+        # Shallowest first, and skipping anything already removed: deleting a
+        # node takes its descendants with it, so the deeper entries of a
+        # removed subtree are gone before the loop reaches them.
+        for node in self._breadth_first(local_topic):
+            if node.uuid in peer_uuids or node.uuid == topic_uuid:
+                continue
+            if node.uuid not in self._protocol.index:
+                continue
+            result = self.delete(node.uuid)
+            changed = changed or result.status == "ok"
+
+        self.trace_event(
+            "session.sibling_topic_adopted",
+            peer_addr=peer_addr,
+            topic_uuid=topic_uuid,
+            changed=changed,
+        )
+        return SessionResult(
+            "ok",
+            value=changed,
+            effects=self.sync_effects(topic_uuid) if changed else [],
+        )
+
+    @staticmethod
+    def _breadth_first(root: ProtocolNode) -> list[ProtocolNode]:
+        ordered = []
+        pending = [root]
+        while pending:
+            node = pending.pop(0)
+            ordered.append(node)
+            pending.extend(node.children)
+        return ordered
+
+    @_session_locked
     def remove_subtree_uuids(self, root_uuid: str, uuids: set[str]) -> SessionResult:
         result = self._protocol.remove_subtree_uuids(root_uuid, uuids)
         return self._operation_result(result, root_uuid)
@@ -1668,7 +1823,12 @@ class Session:
             "root_content_hash": self._protocol.root.content_hash,
             "root_state_hash": self._protocol.root.state_hash,
             "members": sorted(self.members),
-            "peer_addresses": sorted(self.peer_perspectives.keys()),
+            # Siblings are excluded throughout: this view is "who else is on
+            # this topic", and another client of mine is not someone else.
+            "peer_addresses": sorted(
+                addr for addr in self.peer_perspectives
+                if not self.is_sibling_address(addr)
+            ),
             "topic_uuid": self.active_topic_uuid,
             "topic_uuids": sorted(self.active_topic_uuids),
             "peers": {
@@ -1684,6 +1844,7 @@ class Session:
                     )),
                 }
                 for addr, tree in self.peer_perspectives.items()
+                if not self.is_sibling_address(addr)
             },
             "peer_status": {
                 addr: self.peer_status.get(addr, self._new_peer_status())
@@ -2202,7 +2363,8 @@ class Session:
         out = [describe(self.identity.uuid, self.identity.data, self.address)]
         seen = {self.identity.uuid}
         addrs = (self.members | set(self.peer_perspectives)) - {self.address}
-        for addr in sorted(addrs):
+        for addr in sorted(addr for addr in addrs
+                           if not self.is_sibling_address(addr)):
             profile = self.peer_identity(addr)
             if not profile or profile.uuid in seen:
                 continue

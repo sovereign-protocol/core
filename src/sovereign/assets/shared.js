@@ -321,12 +321,120 @@ const SovereignShell = {
     this.refreshDisagreements();
     this.refreshSharingHeader();
     this.refreshCollaborationPane();
+    this.refreshSiblingAlarms();
+  },
+
+  // ---- sibling alarms ------------------------------------------------
+  //
+  // Another client of this same user published something this client's own
+  // unpublished work was not built on. Nothing syncs on that topic until the
+  // person answers, and the answer is theirs: no automation, and no export -
+  // they copy the storage file if they want to keep this side.
+  // See DESIGN_MULTI_CLIENT_PAIRING.md 4.4.
+
+  async refreshSiblingAlarms() {
+    try {
+      const response = await fetch("/api/core/siblings/alarms");
+      if (!response.ok) return;
+      const payload = await response.json();
+      this._renderSiblingAlarms(payload.alarms || [], payload.storage_file || "");
+    } catch (error) {
+      // A failed poll is not an alarm. Leave whatever is already shown.
+    }
+  },
+
+  _ensureSiblingAlarmBar() {
+    let bar = document.getElementById("shellSiblingAlarms");
+    if (bar) return bar;
+    bar = document.createElement("div");
+    bar.id = "shellSiblingAlarms";
+    bar.className = "shell-sibling-alarms";
+    bar.hidden = true;
+    document.body.prepend(bar);
+    return bar;
+  },
+
+  _renderSiblingAlarms(alarms, storageFile) {
+    const bar = this._ensureSiblingAlarmBar();
+    if (!alarms.length) {
+      bar.hidden = true;
+      bar.replaceChildren();
+      document.body.classList.remove("shell-sibling-alarm-open");
+      return;
+    }
+    bar.replaceChildren();
+    for (const alarm of alarms) {
+      bar.append(this._siblingAlarmRow(alarm, storageFile));
+    }
+    bar.hidden = false;
+    document.body.classList.add("shell-sibling-alarm-open");
+  },
+
+  _siblingAlarmRow(alarm, storageFile) {
+    const row = document.createElement("div");
+    row.className = "shell-sibling-alarm";
+
+    const text = document.createElement("div");
+    text.className = "shell-sibling-alarm-text";
+    const title = document.createElement("strong");
+    title.textContent = alarm.title || "A topic";
+    const explanation = document.createElement("span");
+    explanation.textContent =
+      " was changed on another of your clients, and this client has changes"
+      + " that were not built on it. Nothing is being synced until you choose.";
+    text.append(title, explanation);
+    if (storageFile) {
+      const note = document.createElement("p");
+      note.className = "shell-note";
+      note.textContent =
+        "Taking the other version discards this client's copy. To keep it,"
+        + ` copy this file first: ${storageFile}`;
+      text.append(note);
+    }
+
+    const actions = document.createElement("div");
+    actions.className = "shell-sibling-alarm-actions";
+    actions.append(
+      this._siblingAlarmButton(
+        "Use the other client's version", alarm.topic_uuid, "take_sibling",
+        "danger",
+      ),
+      this._siblingAlarmButton(
+        "Keep this client's version", alarm.topic_uuid, "keep_local", "primary",
+      ),
+    );
+    row.append(text, actions);
+    return row;
+  },
+
+  _siblingAlarmButton(label, topicUuid, decision, className) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = className;
+    button.textContent = label;
+    button.onclick = async () => {
+      button.disabled = true;
+      try {
+        await this._post("/api/core/siblings/alarms/resolve", {
+          topic_uuid: topicUuid,
+          decision,
+        });
+        await this._changed();
+        await this.refreshSiblingAlarms();
+      } catch (error) {
+        button.disabled = false;
+        showToast(error.message, true);
+      }
+    };
+    return button;
   },
 
   _renderSharingHeader(people, errorMessage = "") {
     const button = document.getElementById("shellConnectionBtn");
     if (!button) return;
-    button.disabled = !this._topic();
+    // Never disabled, not even with no topic selected: accepting an invite
+    // token is how a fresh install gets its first topic, and the token form
+    // lives behind this button. Disabling it made first run a dead end.
     button.replaceChildren();
     button.className = people.length ? "peer-cluster" : "peer-cluster local";
     if (!people.length) {
@@ -1314,13 +1422,13 @@ Object.assign(SovereignShell, {
       "<h3>Channels</h3>",
       '<div id="shellConnTargetList" class="shell-target-list"></div>',
       '<div id="shellChannelActions" class="shell-row shell-channel-actions">',
-      '<button type="button" id="shellUseTokenBtn">Use invite token</button>',
+      '<button type="button" id="shellUseTokenBtn">Use a token</button>',
       '<button type="button" id="shellManageChannelsBtn">Manage channels</button>',
       "</div>",
       '<fieldset id="shellTokenFieldset" class="shell-token-form" hidden>',
-      "<legend>Use an invite token</legend>",
-      '<label for="shellTokenInput">Invite token</label>',
-      '<input id="shellTokenInput" placeholder="Paste an invite token">',
+      "<legend>Use a token</legend>",
+      '<label for="shellTokenInput">Invite or pairing token</label>',
+      '<input id="shellTokenInput" placeholder="Paste a token">',
       '<div class="shell-row">',
       '<button type="button" id="shellConnectBtn" class="primary">Connect</button>',
       '<button type="button" id="shellCancelTokenBtn">Cancel</button>',
@@ -1328,6 +1436,21 @@ Object.assign(SovereignShell, {
       '<p id="shellTokenNote" class="shell-note"></p>',
       "</fieldset>",
       '<p id="shellTargetsNote" class="shell-note"></p>',
+      "</div>",
+      // Pairing gets its own section rather than another channel action. An
+      // invite token connects you to another person; a pairing token makes a
+      // second machine into *you*. Side by side those read as variations of
+      // one thing, which is the confusion the token kinds are checked for
+      // server-side - better not to invite it in the first place.
+      '<div class="shell-pane-section">',
+      "<h3>My other clients</h3>",
+      '<p class="shell-note">A paired client is not another person: it'
+      + " publishes as you, and everything you own follows it.</p>",
+      '<button type="button" id="shellPairClientBtn">Generate pairing token</button>',
+      '<p class="shell-note">Paste it into the other client under'
+      + " &quot;Use a token&quot;. Pair a client that has nothing on it yet -"
+      + " content already there cannot be merged, only chosen between.</p>",
+      '<p id="shellPairingNote" class="shell-note"></p>',
       "</div>",
       "</aside>",
       '<dialog id="shellChannelManager" class="shell-dialog">',
@@ -1368,6 +1491,39 @@ Object.assign(SovereignShell, {
     document.getElementById("shellTestChannelBtn").onclick = () => this._testChannelForm();
     document.getElementById("shellSaveChannelBtn").onclick = () => this._saveChannel();
     document.getElementById("shellConnectBtn").onclick = () => this._connect();
+    document.getElementById("shellPairClientBtn").onclick = () =>
+      this._copyPairingToken();
+  },
+
+  async _copyPairingToken() {
+    try {
+      const token = await this._post("/api/core/siblings/pairing", {});
+      await navigator.clipboard.writeText(btoa(JSON.stringify(token)));
+      this._note(
+        "shellPairingNote",
+        "Pairing token copied. It carries this client's identity and every"
+        + " topic you own, so treat it like the key to everything.",
+      );
+    } catch (error) {
+      this._note("shellPairingNote", error.message);
+    }
+  },
+
+  async _acceptPairingToken(token, field) {
+    try {
+      await this._post("/api/core/siblings/pairing/accept", { token });
+      field.value = "";
+      this._note(
+        "shellTokenNote",
+        "Paired. This client now publishes as the same participant as the"
+        + " one that issued the token.",
+      );
+      await this._changed();
+      this._toggleTokenForm(false);
+      await this._loadSharing();
+    } catch (error) {
+      this._note("shellTokenNote", error.message);
+    }
   },
 
   closeConnections() {
@@ -1394,7 +1550,9 @@ Object.assign(SovereignShell, {
     if (adopt) autoAdoptControl.append(adopt);
     autoAdoptSection.hidden = !adopt;
 
-    this._toggleTokenForm(false);
+    // With no topic there is nothing to share yet, so the one thing the pane
+    // can still do - join someone else's topic - is opened straight away.
+    this._toggleTokenForm(!this._topic());
     document.getElementById("shellConnOverlay").hidden = false;
     document.getElementById("shellConnPane").hidden = false;
     document.body.classList.add("shell-pane-open-right");
@@ -1411,7 +1569,10 @@ Object.assign(SovereignShell, {
       this._sharing = { people: [], channels: [] };
       this._renderPeersList();
       this._renderConnTargets();
-      this._note("shellTargetsNote", "Select a topic to manage sharing.");
+      this._note(
+        "shellTargetsNote",
+        "No topic yet. Paste an invite token to join one.",
+      );
       return;
     }
     try {
@@ -1514,6 +1675,12 @@ Object.assign(SovereignShell, {
       this._note("shellTokenNote", "That is not a share token.");
       return;
     }
+    // One paste field, two kinds. The server refuses each token on the other
+    // path, so routing here is a convenience rather than the safeguard.
+    if (token.token_kind === "pairing") {
+      await this._acceptPairingToken(token, field);
+      return;
+    }
     // Core serializes token_version; the channel descriptor carries its own
     // descriptor_version. Testing the wrong one rejects every valid token.
     if (
@@ -1561,7 +1728,8 @@ Object.assign(SovereignShell, {
       const empty = document.createElement("p");
       empty.className = "shell-note";
       empty.textContent = this._topic()
-        ? "No channels are available." : "Select a topic first.";
+        ? "No channels are available."
+        : "Channels appear once you have a topic to share.";
       list.append(empty);
       return;
     }

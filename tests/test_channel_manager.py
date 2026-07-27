@@ -9,6 +9,7 @@ from sovereign.channel import (
     Invitation,
     PollingChannel,
 )
+from sovereign.collaboration import CollaborationService
 from sovereign.http_channel import DirectHttpChannel
 from sovereign.mailbox_channel import MailboxChannel
 from sovereign.session import Session, SessionEffect
@@ -400,6 +401,115 @@ class ChannelManagerTests(unittest.TestCase):
         self.assertTrue(accepted.ok)
         self.assertEqual(accepted.value.peer_addr, "relay:A")
         self.assertEqual(manager.accepted[0][2], "inviter")
+
+
+class _MailboxManagerStub:
+    """Just enough RelayManager for the channel's topic bookkeeping."""
+
+    def __init__(self, session, targets):
+        self.session = session
+        self.targets = {
+            target_id: list(topics) for target_id, topics in targets.items()
+        }
+        self.deleted = []
+
+    @staticmethod
+    def _ok(value=None):
+        return type("Result", (), {"status": "ok", "value": value, "reason": None})()
+
+    def list_targets(self):
+        return [
+            {
+                "id": target_id,
+                "name": target_id,
+                "backend": "local",
+                "topic_uuids": sorted(topics),
+            }
+            for target_id, topics in sorted(self.targets.items())
+        ]
+
+    def target_for_topic(self, topic_uuid):
+        for target_id, topics in self.targets.items():
+            if topic_uuid in topics:
+                return target_id
+        return None
+
+    def assign_topic_target(self, topic_uuid, target_id):
+        for topics in self.targets.values():
+            if topic_uuid in topics:
+                topics.remove(topic_uuid)
+        if target_id:
+            self.targets[target_id].append(topic_uuid)
+        return self._ok(target_id or "")
+
+    def delete_target(self, target_id):
+        self.deleted.append(target_id)
+        self.targets.pop(target_id, None)
+        return self._ok(target_id)
+
+    def all_connections(self):
+        return []
+
+
+class MailboxTopicReleaseTests(unittest.TestCase):
+    def _session_with_both_channels(self):
+        session = Session("http://a")
+        session.note_indirect_peer_topic("relay:B", "board")
+        session.bind_peer_topic_channel("relay:B", "board", "mailbox")
+        session.add_peer("http://c", "board")
+        session.bind_peer_topic_channel("http://c", "board", "http")
+        return session
+
+    def test_stopping_a_mailbox_channel_returns_the_topic_to_private(self):
+        # A topic no channel carries has no members, so the application can
+        # tell "was on this board" from "is on this board" - which is what
+        # lets a participant be taken off a card and not put back.
+        session = self._session_with_both_channels()
+        channel = MailboxChannel(
+            _MailboxManagerStub(session, {"target": ["board"]}),
+        )
+
+        result = channel.detach_instance_topics(("board",), "target")
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+
+    def test_stopping_a_mailbox_channel_keeps_peers_the_direct_one_carries(self):
+        session = self._session_with_both_channels()
+        channel = MailboxChannel(
+            _MailboxManagerStub(session, {"target": ["board"]}),
+        )
+
+        channel.detach_instance_topics(("board",), "target")
+
+        self.assertIn("board", session.peer_topic_sets["http://c"])
+
+    def test_deleting_a_mailbox_channel_releases_the_topics_it_carried(self):
+        session = self._session_with_both_channels()
+        manager = _MailboxManagerStub(session, {"target": ["board"]})
+        channel = MailboxChannel(manager)
+
+        result = channel.delete_instance("target")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(manager.deleted, ["target"])
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+
+    def test_a_channel_still_holding_topics_can_be_deleted(self):
+        # It used to refuse with "channel is still used by: <uuid>". The
+        # assignment is invisible to the user and nothing clears it when the
+        # peers go, so the refusal made channels undeletable in practice.
+        session = self._session_with_both_channels()
+        manager = ChannelManager(session)
+        manager.register(MailboxChannel(
+            _MailboxManagerStub(session, {"target": ["board"]}),
+        ))
+        service = CollaborationService(session, manager)
+
+        result = service.delete_channel("mailbox:target")
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(service.channels_payload()["channels"], [])
 
 
 if __name__ == "__main__":
