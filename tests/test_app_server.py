@@ -786,8 +786,11 @@ class AppServerTests(unittest.TestCase):
             [
                 "calibrate_timing",
                 "write_presence",
-                "publish_before_poll",
+                # Poll precedes publish: with one publication identity per
+                # user, writing before looking is a lost update rather than
+                # merely a stale one.
                 "poll_and_apply",
+                "publish_after_poll",
                 "adopt_peer_updates",
                 "publish_response",
             ],
@@ -1026,7 +1029,11 @@ class AppServerTests(unittest.TestCase):
             "query_string": b"", "headers": [(b"content-type", b"application/json")],
         }, receive)
 
-    def test_post_connect_token_composes_one_target_and_assigns_selected_board(self):
+    def test_post_connect_token_refuses_a_channel_not_used_for_the_board(self):
+        # Inviting someone to a channel is a decision to publish the board
+        # there, and that decision is "use this channel for this board" -
+        # taken first, and visible. Composing used to make it silently, so
+        # asking for a token once bound the board to that channel for good.
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as relay_root:
             runtime, board = _runtime_with_topic(8210, {
                 "storage_file": str(Path(tmp) / "state.json"),
@@ -1049,13 +1056,47 @@ class AppServerTests(unittest.TestCase):
                     "topic_uuid": board.uuid,
                 },
             )))
+
+            self.assertEqual(response.status_code, 409)
+            self.assertIn("use this channel", json.loads(response.body)["reason"])
+            self.assertIsNone(manager.target_for_topic(board.uuid))
+
+    def test_post_connect_token_composes_once_the_channel_is_in_use(self):
+        with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as relay_root:
+            runtime, board = _runtime_with_topic(8212, {
+                "storage_file": str(Path(tmp) / "state.json"),
+                "relay_state_directory": tmp,
+            })
+            app = app_server.build_app(runtime)
+            endpoint = next(
+                route.endpoint for route in app.routes
+                if getattr(route, "path", None) == "/api/core/invitations"
+            )
+            manager = runtime.relay_manager
+            target_id = manager.create_target({
+                "name": "Company", "backend": "local", "root": relay_root,
+            }).value
+            manager.assign_topic_target(board.uuid, target_id)
+
+            response = asyncio.run(endpoint(self._post_request(
+                "/api/core/invitations",
+                {
+                    "channel_ref": f"mailbox:{target_id}",
+                    "topic_uuid": board.uuid,
+                },
+            )))
             payload = json.loads(response.body)
 
             self.assertEqual(payload["token_version"], 1)
             self.assertEqual(payload["topic_uuids"], sorted([board.uuid, runtime.session.identity.uuid]))
             self.assertEqual([channel["type"] for channel in payload["channels"]], ["relay"])
             self.assertEqual(payload["channels"][0]["target_id"], target_id)
-            self.assertEqual(manager.target_for_topic(board.uuid), target_id)
+            # The identity topic is not a board and is never "used for"
+            # anything; it follows the invitation's route so the invitee can
+            # see who invited them.
+            self.assertEqual(
+                manager.target_for_topic(runtime.session.identity.uuid), target_id,
+            )
             shared = manager.connection_for_target(target_id)._state["shared"]
             self.assertIn(board.uuid, shared)
             self.assertIn(runtime.session.identity.uuid, shared)

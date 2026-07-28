@@ -152,22 +152,18 @@ class CollaborationService:
         return channel.test_instance(values)
 
     def delete_channel(self, channel_ref: str) -> ChannelResult:
+        """Remove a channel from this client, releasing whatever it carried.
+
+        Deliberately unconditional. This used to refuse while any topic was
+        still assigned to the channel, which turned the assignment - something
+        the user never sees, and which nothing clears when the peers go away -
+        into a lock on the channel list, reported as a bare topic uuid. A
+        topic left with no channel is simply private again, and that is what
+        deleting a channel means.
+        """
         channel, instance_id = self._channel_instance(channel_ref)
         if not channel or not instance_id:
             return ChannelResult.error("channel not found", 404)
-        instances = {
-            item.get("ref"): item
-            for item in channel.management_descriptor().get("instances") or []
-        }
-        instance = instances.get(channel_ref)
-        if not instance:
-            return ChannelResult.error("channel not found", 404)
-        topics = instance.get("topic_uuids") or []
-        if topics:
-            return ChannelResult.error(
-                "channel is still used by: " + ", ".join(sorted(topics)),
-                409,
-            )
         return channel.delete_instance(instance_id)
 
     def set_topic_channel(
@@ -211,6 +207,62 @@ class CollaborationService:
 
     def accept_invitation(self, token: dict) -> ChannelResult:
         return self._channels.accept_token(token)
+
+    # ---- pairing -------------------------------------------------------
+
+    def compose_pairing_token(self, target_id: str = "") -> ChannelResult:
+        manager = self._relay_manager()
+        if not manager:
+            return ChannelResult.error("no mailbox channel", 404)
+        result = manager.compose_pairing_token(target_id)
+        if result.status != "ok":
+            return ChannelResult.error(result.reason or "could not pair", 409)
+        return ChannelResult.success(result.value)
+
+    def accept_pairing_token(self, token: dict) -> ChannelResult:
+        manager = self._relay_manager()
+        if not manager:
+            return ChannelResult.error("no mailbox channel", 404)
+        result = manager.accept_pairing_token(token or {})
+        if result.status != "ok":
+            return ChannelResult.error(result.reason or "could not pair", 409)
+        return ChannelResult.success(result.value)
+
+    # ---- sibling alarms ------------------------------------------------
+
+    def _relay_manager(self):
+        channel = self._channels.channel("mailbox")
+        return getattr(channel, "manager", None) if channel else None
+
+    def sibling_alarms_payload(self) -> dict:
+        """Topics where another client of this user published something that
+        this client's own unpublished work was not built on.
+
+        Session decides a topic is in this state; what to do about it is the
+        application's to ask. The title is included because "one of your
+        topics" is not something a person can act on.
+        """
+        manager = self._relay_manager()
+        alarms = manager.sibling_alarms() if manager else []
+        described = []
+        for alarm in alarms:
+            node = self.session.get_node(alarm["topic_uuid"])
+            data = node.data if node else {}
+            described.append({
+                **alarm,
+                "title": data.get("name") or data.get("title") or "",
+            })
+        return {"status": "ok", "alarms": described}
+
+    def resolve_sibling_alarm(self, topic_uuid: str,
+                              decision: str) -> ChannelResult:
+        manager = self._relay_manager()
+        if not manager:
+            return ChannelResult.error("no mailbox channel", 404)
+        result = manager.resolve_sibling_alarm(topic_uuid, decision)
+        if result.status != "ok":
+            return ChannelResult.error(result.reason or "could not resolve", 409)
+        return ChannelResult.success(result.value)
 
     def _managed_channel(self, kind: Any):
         channel = self._channels.channel(str(kind or "").strip())

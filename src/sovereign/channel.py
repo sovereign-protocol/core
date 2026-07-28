@@ -195,6 +195,18 @@ class ChannelManager:
             or token.get("token_version") != CONNECT_TOKEN_VERSION
         ):
             return ChannelResult.error("unrecognized token version", 400)
+        if token.get("token_kind"):
+            # A pairing token carries this user's own publication identity.
+            # Admitted here it would register the user's own second client as
+            # another person, and accept_invitation's reconnect-replace loop
+            # would then unbind the first client from exactly the topics the
+            # token covers. Refused explicitly rather than by accident: that
+            # failure presents as a working connection.
+            return ChannelResult.error(
+                "that is a pairing token - use it to add one of your own"
+                " clients, not to connect to someone else",
+                400,
+            )
         return self.accept_invitation(
             token.get("identity"),
             token.get("topic_uuids") or [],

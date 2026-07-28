@@ -9,6 +9,7 @@ from sovereign.channel import (
     Invitation,
     PollingChannel,
 )
+from sovereign.collaboration import CollaborationService
 from sovereign.http_channel import DirectHttpChannel
 from sovereign.mailbox_channel import MailboxChannel
 from sovereign.session import Session, SessionEffect
@@ -372,34 +373,173 @@ class ChannelManagerTests(unittest.TestCase):
         direct.invite_to_discuss("http://b", "topic", read_only=True)
         self.assertEqual(adapter.invites[0][1], {"read_only": True})
 
-    def test_mailbox_channel_assigns_offer_and_accepts_with_inviter_identity(self):
+    def _offer_manager(self, session, assigned_topics=()):
         class Manager:
             def __init__(self):
+                self.session = session
+                self.assigned = list(assigned_topics)
                 self.assignments = []
                 self.accepted = []
 
             def target_descriptor(self, target_id):
                 return {"type": "relay", "identity": "A", "target_id": target_id}
 
+            def target_for_topic(self, topic_uuid):
+                return "target" if topic_uuid in self.assigned else None
+
             def assign_topics_target(self, topics, target_id):
                 self.assignments.append((topics, target_id))
+                self.assigned.extend(topics)
                 return type("Result", (), {"status": "ok", "value": target_id})()
 
             def accept_descriptor(self, descriptor, topics, inviter_uuid):
                 self.accepted.append((descriptor, topics, inviter_uuid))
                 return type("Result", (), {"status": "ok", "value": "target"})()
 
-        manager = Manager()
+        return Manager()
+
+    def test_mailbox_offer_refuses_a_topic_the_channel_is_not_used_for(self):
+        # Composing an invitation is not how a board gets bound to a channel.
+        # It used to be, so asking for a token once bound it for good.
+        session = Session("http://a")
+        manager = self._offer_manager(session)
         channel = MailboxChannel(manager)
+
         offered = channel.offer_descriptor(("topic",), {"target_id": "target"})
-        self.assertTrue(offered.ok)
-        self.assertEqual(manager.assignments, [(["topic"], "target")])
+
+        self.assertFalse(offered.ok)
+        self.assertIn("use this channel", offered.reason)
+        self.assertEqual(manager.assignments, [])
+
+    def test_mailbox_offer_accepts_with_inviter_identity_once_in_use(self):
+        session = Session("http://a")
+        identity_uuid = session.identity.uuid
+        manager = self._offer_manager(session, assigned_topics=["topic"])
+        channel = MailboxChannel(manager)
+
+        offered = channel.offer_descriptor(
+            ("topic", identity_uuid), {"target_id": "target"},
+        )
+
+        self.assertTrue(offered.ok, offered.reason)
+        # Only the identity topic is assigned here: it is not a board, so it
+        # follows the invitation's route rather than needing its own decision.
+        self.assertEqual(manager.assignments, [([identity_uuid], "target")])
 
         invitation = Invitation({"uuid": "inviter"}, ("topic",))
         accepted = channel.accept_descriptor(offered.value, invitation)
         self.assertTrue(accepted.ok)
         self.assertEqual(accepted.value.peer_addr, "relay:A")
         self.assertEqual(manager.accepted[0][2], "inviter")
+
+
+class _MailboxManagerStub:
+    """Just enough RelayManager for the channel's topic bookkeeping."""
+
+    def __init__(self, session, targets):
+        self.session = session
+        self.targets = {
+            target_id: list(topics) for target_id, topics in targets.items()
+        }
+        self.deleted = []
+
+    @staticmethod
+    def _ok(value=None):
+        return type("Result", (), {"status": "ok", "value": value, "reason": None})()
+
+    def list_targets(self):
+        return [
+            {
+                "id": target_id,
+                "name": target_id,
+                "backend": "local",
+                "topic_uuids": sorted(topics),
+            }
+            for target_id, topics in sorted(self.targets.items())
+        ]
+
+    def target_for_topic(self, topic_uuid):
+        for target_id, topics in self.targets.items():
+            if topic_uuid in topics:
+                return target_id
+        return None
+
+    def assign_topic_target(self, topic_uuid, target_id):
+        for topics in self.targets.values():
+            if topic_uuid in topics:
+                topics.remove(topic_uuid)
+        if target_id:
+            self.targets[target_id].append(topic_uuid)
+        return self._ok(target_id or "")
+
+    def delete_target(self, target_id):
+        self.deleted.append(target_id)
+        self.targets.pop(target_id, None)
+        return self._ok(target_id)
+
+    def all_connections(self):
+        return []
+
+
+class MailboxTopicReleaseTests(unittest.TestCase):
+    def _session_with_both_channels(self):
+        session = Session("http://a")
+        session.note_indirect_peer_topic("relay:B", "board")
+        session.bind_peer_topic_channel("relay:B", "board", "mailbox")
+        session.add_peer("http://c", "board")
+        session.bind_peer_topic_channel("http://c", "board", "http")
+        return session
+
+    def test_stopping_a_mailbox_channel_returns_the_topic_to_private(self):
+        # A topic no channel carries has no members, so the application can
+        # tell "was on this board" from "is on this board" - which is what
+        # lets a participant be taken off a card and not put back.
+        session = self._session_with_both_channels()
+        channel = MailboxChannel(
+            _MailboxManagerStub(session, {"target": ["board"]}),
+        )
+
+        result = channel.detach_instance_topics(("board",), "target")
+
+        self.assertTrue(result.ok)
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+
+    def test_stopping_a_mailbox_channel_keeps_peers_the_direct_one_carries(self):
+        session = self._session_with_both_channels()
+        channel = MailboxChannel(
+            _MailboxManagerStub(session, {"target": ["board"]}),
+        )
+
+        channel.detach_instance_topics(("board",), "target")
+
+        self.assertIn("board", session.peer_topic_sets["http://c"])
+
+    def test_deleting_a_mailbox_channel_releases_the_topics_it_carried(self):
+        session = self._session_with_both_channels()
+        manager = _MailboxManagerStub(session, {"target": ["board"]})
+        channel = MailboxChannel(manager)
+
+        result = channel.delete_instance("target")
+
+        self.assertTrue(result.ok)
+        self.assertEqual(manager.deleted, ["target"])
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+
+    def test_a_channel_still_holding_topics_can_be_deleted(self):
+        # It used to refuse with "channel is still used by: <uuid>". The
+        # assignment is invisible to the user and nothing clears it when the
+        # peers go, so the refusal made channels undeletable in practice.
+        session = self._session_with_both_channels()
+        manager = ChannelManager(session)
+        manager.register(MailboxChannel(
+            _MailboxManagerStub(session, {"target": ["board"]}),
+        ))
+        service = CollaborationService(session, manager)
+
+        result = service.delete_channel("mailbox:target")
+
+        self.assertTrue(result.ok, result.reason)
+        self.assertEqual(service.channels_payload()["channels"], [])
 
 
 if __name__ == "__main__":

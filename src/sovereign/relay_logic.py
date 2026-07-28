@@ -111,7 +111,7 @@ from .blob_store import blob_hex, referenced_blob_ids
 from .protocol import ProtocolNode, protocol_node_from_envelope
 from .session import Session, SessionResult
 from .relay_storage import LocalFolderRelayStorage, SftpRelayStorage, now_iso
-from .versions import CHANNEL_DESCRIPTOR_VERSION
+from .versions import CHANNEL_DESCRIPTOR_VERSION, CONNECT_TOKEN_VERSION
 
 
 def _storage_fingerprint(config: dict) -> str:
@@ -337,7 +337,17 @@ class RelayLogic:
         except (TypeError, ValueError):
             lease_seconds = 300.0
         self.blob_lease_seconds = max(30.0, lease_seconds)
-        self.identity = config.get("relay_identity") or self.session.identity.uuid
+        # A paired client publishes under its siblings' id, and that has to
+        # survive a restart: falling back to this session's own uuid would
+        # silently make it a *peer* of its siblings, publishing into a slot
+        # of its own next to theirs. Persisted beside the adopted storage
+        # descriptor, and for the same reason - a token-provisioned client
+        # has no local config saying any of this.
+        self.identity = (
+            config.get("relay_identity")
+            or self.session.app_metadata.get("relay_paired_client_id")
+            or self.session.identity.uuid
+        )
         self.storage = self._build_storage(config)
         adopted_descriptor = None
         if self.storage is None:
@@ -364,6 +374,17 @@ class RelayLogic:
         # cancels out clock skew between machines entirely, with no
         # explicit offset calculation needed - see peer_liveness().
         self._own_presence_mtime: float | None = None
+        # Which peer ids the relay listed per topic on the previous poll.
+        # In memory only, and for the same reason `applied` is: it describes
+        # peer_perspectives, which does not survive a restart either. A
+        # persisted copy would report peers as departed that this process
+        # never saw arrive.
+        self._relay_listed_peers: dict[str, set[str]] = {}
+        # Topics where a sibling published something this client's own
+        # unpublished work was not built on. In memory deliberately: the
+        # condition is re-derived from `published` and the local tree on
+        # every poll, so a persisted copy could only ever be stale.
+        self._sibling_alarms: set[str] = set()
         # An explicit pin (tests, or a user who set it) overrides the
         # location-derived default - kept so adopt_storage_from_descriptor
         # honors the pin instead of recomputing a data/ path.
@@ -545,6 +566,13 @@ class RelayLogic:
         # The registry applies target assignment only to scoped application
         # topics. Core-owned topics (currently the public profile) opt out and
         # ride every relationship, so this channel names no node type.
+        if self._state.get("pair_all_topics"):
+            # Except for a sibling, which needs the whole environment.
+            # Target assignment scopes what a *peer* may be shown, and there
+            # is no peer here - this is the same person's other client. Left
+            # scoped, the pairing token promises every topic and the slot
+            # receives only the ones nobody assigned anywhere.
+            return self.session.shared_topic_uuids()
         return self.session.shared_topic_uuids(
             self._scoped_topic_uuids,
         )
@@ -613,6 +641,18 @@ class RelayLogic:
         ]
         self._save_state()
         return SessionResult("ok", value=sorted(remove))
+
+    @_relay_io_locked
+    def pair_all_topics(self) -> SessionResult:
+        """Publish everything this account owns over this connection.
+
+        Durable intent, like `shared` and `desired`, so it survives a restart
+        and is not undone by refresh_scopes recomputing target assignments -
+        pairing is not an assignment, and there is no target to assign to.
+        """
+        self._state["pair_all_topics"] = True
+        self._save_state()
+        return SessionResult("ok", value=True)
 
     @_relay_io_locked
     def mark_topics_shared(self, topic_uuids: list[str]) -> SessionResult:
@@ -794,11 +834,258 @@ class RelayLogic:
         }
 
     @_relay_io_locked
+    def _forget_departed_relay_peers(self, topic_uuid: str,
+                                     listed_peer_ids) -> None:
+        """Drop the cached content of peers the relay no longer lists.
+
+        What a relay carries is what this channel can currently see, so the
+        connection view follows it: a peer whose publication is gone stops
+        appearing in the network info the Sharing pane is built from, and
+        comes back by itself if it publishes again.
+
+        Only the *cache* goes. peer_topic_sets - the relationship, and the
+        peer's vote in prune_deleted_nodes - is deliberately kept, so a peer
+        that is merely absent for a poll cannot cause a deletion to be
+        pruned and then re-proposed on its return. Nothing in the content is
+        touched either: cards keep naming the person as owner or member,
+        because removing those references is a deliberate act and not
+        something a missing directory should decide.
+
+        `applied` must be cleared with the cache. It records "peer hash X is
+        already in peer_perspectives", so leaving it would make the returning
+        peer's unchanged hash look like nothing to do, and the cache would
+        never refill - the same trap _save_state describes for persisting it
+        across a restart.
+        """
+        listed = set(listed_peer_ids) - {self.identity}
+        previously = self._relay_listed_peers.get(topic_uuid)
+        self._relay_listed_peers[topic_uuid] = listed
+        if previously is None:
+            # First sight of this topic since start-up. There is no earlier
+            # observation to have departed from, and the cache is empty
+            # anyway - peer_perspectives does not survive a restart.
+            return
+        for peer_id in sorted(previously - listed):
+            peer_addr = f"relay:{peer_id}"
+            with self._session_lock:
+                forgotten = self.session.forget_peer_topic_perspective(
+                    peer_addr, topic_uuid,
+                )
+            self._state.get("applied", {}).get(topic_uuid, {}).pop(
+                peer_id, None,
+            )
+            self.session.trace_event(
+                "relay.peer_publication_withdrawn",
+                relay_identity=self.identity,
+                topic_uuid=topic_uuid,
+                peer_id=peer_id,
+                perspective_forgotten=forgotten,
+            )
+
+    def sibling_address(self) -> str:
+        """Where a sibling's cached version of a topic is kept.
+
+        Not a `relay:` address. A sibling is not a peer - it must never reach
+        the participant lists, the deletion quorum, or anything else built
+        from the peer registries.
+        """
+        return f"{Session.SIBLING_ADDRESS_PREFIX}{self.identity}"
+
+    def sibling_alarm_topics(self) -> list[str]:
+        return sorted(self._sibling_alarms)
+
+    def clear_sibling_alarm(self, topic_uuid: str) -> None:
+        self._sibling_alarms.discard(topic_uuid)
+
+    # The two answers to the alarm. Both are offered at the application, not
+    # decided here; this only carries them out.
+
+    def take_sibling_version(self, topic_uuid: str) -> SessionResult:
+        """Replace this client's topic with the one in the slot.
+
+        Everything unpublished on this client is lost, which is why the
+        person is asked first and told where the storage file is - copying
+        it is the only way back, and deliberately so (section 4.4).
+        """
+        head = self.storage.read_head(topic_uuid, self.identity) or {}
+        relay_hash = head.get("hash")
+        if not relay_hash:
+            return SessionResult("error", reason="nothing published to take")
+        payload = self.storage.read_snapshot(
+            topic_uuid, self.identity, relay_hash,
+        )
+        if not payload:
+            return SessionResult("error", reason="published version not found")
+        self._take_sibling_publication(topic_uuid, payload, relay_hash)
+        return SessionResult("ok", value=topic_uuid)
+
+    def keep_local_version(self, topic_uuid: str) -> SessionResult:
+        """Publish this client's topic over the sibling's.
+
+        Publishes here rather than lifting the alarm and leaving the next
+        cycle to it. That cycle polls before it publishes (section 4.1), so
+        it would find the sibling's version still in the slot and raise the
+        same alarm again - the decision would never survive long enough to
+        be acted on.
+        """
+        if topic_uuid not in self._sibling_alarms:
+            return SessionResult("error", reason="no sibling alarm on this topic")
+        self._sibling_alarms.discard(topic_uuid)
+        published = self.publish_due_topics()
+        self.session.trace_event(
+            "relay.sibling_local_version_kept",
+            relay_identity=self.identity,
+            topic_uuid=topic_uuid,
+            published=topic_uuid in published,
+        )
+        return SessionResult("ok", value=topic_uuid)
+
+    def _reconcile_sibling_publication(self, topic_uuid: str) -> bool:
+        """Apply the sibling rule to whatever is in our own slot.
+
+            relay == current                         already in agreement
+            relay == published                       nothing happened
+            relay != published, current == published take it
+            relay != published, current != published alarm
+
+        The first line is not bookkeeping - it is the definition. If the slot
+        holds exactly what this client holds, nothing has diverged, whatever
+        the local record says about who published it. Without it a client
+        that never recorded publishing a topic - a fresh install, a lost
+        state file, or the account profile that both clients hold identically
+        from the moment they pair - raises an alarm over content that is
+        already the same on both sides, and stops syncing it.
+
+        The third line is the one that carries the design. If everything
+        this client had was published, a sibling had nowhere else to start,
+        so whatever it wrote was written on top of our work and taking it
+        loses nothing. That is a fast-forward established from two local
+        facts, without inspecting a single node.
+
+        The last line is the plane case: this client holds work the relay
+        never saw, so the sibling's version descends from something older.
+        There is no correct automatic answer and the person is the only one
+        who knows which side matters. See DESIGN_MULTI_CLIENT_PAIRING.md 2.
+        """
+        head = self.storage.read_head(topic_uuid, self.identity)
+        if not head:
+            return False
+        relay_hash = head.get("hash")
+        published = self._state["published"].get(topic_uuid)
+        if not relay_hash or relay_hash == published:
+            self._sibling_alarms.discard(topic_uuid)
+            return False
+        with self._session_lock:
+            current_hash = self.session.node_state_hash(topic_uuid)
+        if current_hash == relay_hash:
+            # Identical on both sides. Only the local record was missing, so
+            # record it rather than reporting a disagreement that is not one.
+            self._state["published"][topic_uuid] = relay_hash
+            self._save_state()
+            self._sibling_alarms.discard(topic_uuid)
+            return False
+        if current_hash is not None and current_hash != published:
+            if topic_uuid not in self._sibling_alarms:
+                self._sibling_alarms.add(topic_uuid)
+                self.session.trace_event(
+                    "relay.sibling_alarm",
+                    relay_identity=self.identity,
+                    topic_uuid=topic_uuid,
+                    relay_state_hash=relay_hash,
+                    published_state_hash=published,
+                    local_state_hash=current_hash,
+                )
+            return False
+        payload = self.storage.read_snapshot(
+            topic_uuid, self.identity, relay_hash,
+        )
+        if not payload:
+            return False
+        self._take_sibling_publication(topic_uuid, payload, relay_hash)
+        return True
+
+    def _take_sibling_publication(self, topic_uuid: str, payload: dict,
+                                  relay_hash: str) -> None:
+        subtree = protocol_node_from_envelope(payload)
+        sibling_addr = self.sibling_address()
+        with self._session_lock:
+            known = self.session.protocol.index.get(topic_uuid) is not None
+            if not known and self.session.shared_topic_handler_for(subtree):
+                self.session.accept_shared_topic_invitation(subtree)
+            self.session.apply_peer_subtree(
+                sibling_addr, copy.deepcopy(subtree), payload.get("parent_uuid"),
+            )
+            result = self.session.adopt_sibling_topic(sibling_addr, topic_uuid)
+            # The cache has done its job. Keeping it would leave a sibling
+            # perspective sitting in the session for a client that is not a
+            # peer and has nothing left to disagree about.
+            self.session.forget_peer_topic_perspective(sibling_addr, topic_uuid)
+        # `published` records what the relay holds, not what we wrote - the
+        # sibling wrote it, and this client agreeing with it is the point.
+        self._state["published"][topic_uuid] = relay_hash
+        self._sibling_alarms.discard(topic_uuid)
+        self._save_state()
+        self.session.trace_event(
+            "relay.sibling_publication_taken",
+            relay_identity=self.identity,
+            topic_uuid=topic_uuid,
+            relay_state_hash=relay_hash,
+            changed=bool(getattr(result, "value", False)),
+        )
+
+    def _relay_holds_our_publication(self, topic_uuid: str) -> bool:
+        """Does the relay still list a publication of ours for this topic?
+
+        `published` records "I already wrote state X for this topic", and
+        _save_state justifies persisting it on the grounds that it "tracks
+        snapshots that stay on the server, which does persist". That is an
+        assumption, not an invariant: a relay can be wiped, rotated, moved,
+        or restored from an older backup, and then every peer sits silently
+        on a local flag claiming it has already published, republishing
+        nothing until its own content happens to change. The relay looks
+        alive - presence heartbeats are unconditional - while carrying no
+        content at all, and a peer arriving later syncs nothing.
+
+        So the relay is asked. This is only reached on the path that would
+        otherwise skip, and it costs one directory listing per published
+        topic per tick; being wrong here is silent and open-ended, which is
+        worth more than the listing.
+
+        A listing failure answers True: an unreachable relay is not evidence
+        that our publication is gone, and republishing the world on every
+        transient error is its own harm.
+        """
+        try:
+            present = self.identity in set(self.storage.list_peers(topic_uuid))
+        except Exception as error:  # noqa: BLE001 - see docstring
+            self.session.trace_event(
+                "relay.publication_presence_unknown",
+                relay_identity=self.identity,
+                topic_uuid=topic_uuid,
+                reason=str(error)[:200],
+            )
+            return True
+        if not present:
+            # Worth a line of its own: from the outside this looks like a
+            # spontaneous republication of unchanged content.
+            self.session.trace_event(
+                "relay.publication_missing_republishing",
+                relay_identity=self.identity,
+                topic_uuid=topic_uuid,
+                published_state_hash=self._state["published"].get(topic_uuid),
+            )
+        return present
+
     def publish_due_topics(self) -> list[str]:
         if not self.storage:
             return []
         published = []
         for topic_uuid in self.relay_topic_uuids():
+            if topic_uuid in self._sibling_alarms:
+                # A sibling's version is in the slot and this client's work
+                # was not built on it. Publishing would overwrite the very
+                # state the person is being asked about.
+                continue
             # Reads under the shared session lock: a sibling connection's
             # poll_and_apply may be grafting a topic into the same tree
             # concurrently (the channel poll tick runs connection I/O in parallel),
@@ -824,7 +1111,8 @@ class RelayLogic:
             ).hexdigest()[:20]
             if (self._state["published"].get(topic_uuid) == current_hash
                     and self._state["published_observations"].get(topic_uuid)
-                    == observed_digest):
+                    == observed_digest
+                    and self._relay_holds_our_publication(topic_uuid)):
                 continue
             # Re-read hash and subtree together so the snapshot we write is
             # the one current_hash actually names (a concurrent apply between
@@ -1078,13 +1366,38 @@ class RelayLogic:
             # Explicit targets never enumerate unrelated discussions that
             # happen to share the same SFTP root. Desired topics come from
             # accepted tokens; scoped topics are locally assigned application topics.
+            scoped = set(self._scoped_topic_uuids)
+            if self._state.get("pair_all_topics"):
+                # A paired client must *read* its own slot on every topic it
+                # publishes, not only the ones assigned to a target. The
+                # client that issued the token has no desired topics and no
+                # assignments, so without this it publishes to its siblings
+                # and never looks - sync runs one way only, and its own
+                # slot's changes are never seen.
+                scoped |= set(self.relay_topic_uuids())
             topic_uuids = sorted(
-                self._scoped_topic_uuids
+                scoped
                 | set(self._state.get("desired", []))
             )
         for topic_uuid in topic_uuids:
-            for peer_id in self.storage.list_peers(topic_uuid):
+            listed_peer_ids = self.storage.list_peers(topic_uuid)
+            self._forget_departed_relay_peers(topic_uuid, listed_peer_ids)
+            for peer_id in listed_peer_ids:
                 if peer_id == self.identity:
+                    # Our own slot is not a no-op any more: with one
+                    # publication identity per user rather than per client,
+                    # something here that is not what we last published was
+                    # written by a sibling.
+                    #
+                    # A take must be reported, not just performed. The tick
+                    # persists the session only when a cycle reports work,
+                    # so a silent adoption lives in memory until the process
+                    # ends and is then lost - and the client republishes the
+                    # state it reverted to over the sibling's, losing the
+                    # work on both sides. Same trap the module docstring
+                    # records for relay-applied peer content.
+                    if self._reconcile_sibling_publication(topic_uuid):
+                        applied.add((topic_uuid, peer_id))
                     continue
                 peer_addr = f"relay:{peer_id}"
                 presence, _mtime = read_presence(peer_id)
@@ -1429,6 +1742,7 @@ class RelayLogic:
             "received_publications": {},
             "observed_publications": {}, "peer_observed_publications": {},
             "applied": {}, "desired": [], "identity_topics": [], "shared": [],
+            "pair_all_topics": False,
         }
 
     def _save_state(self) -> None:
@@ -1440,9 +1754,15 @@ class RelayLogic:
         # empty cache, so poll_and_apply's "hash unchanged since last
         # applied" check skips the very re-fetch that would repopulate it -
         # the peer silently vanishes until it happens to change something.
-        # Caught live: A restarted and lost sight of B entirely. `published`
-        # DOES persist (it tracks snapshots that stay on the server, which
-        # does persist); `desired`/`shared` persist (durable consent/intent).
+        # Caught live: A restarted and lost sight of B entirely.
+        #
+        # `published` persists, but its old justification - "it tracks
+        # snapshots that stay on the server, which does persist" - was an
+        # assumption, not an invariant, and a wiped or restored relay
+        # falsifies it. It is kept only as a cheap first check now:
+        # _relay_holds_our_publication asks the relay before the skip is
+        # honoured, so nothing rests on the local record alone.
+        # `desired`/`shared` persist (durable consent/intent).
         # Same lesson as not persisting Session.peer_sync_state.
         path = Path(self._state_path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -2077,6 +2397,231 @@ class RelayManager:
 
     def has_any_active_relationship(self) -> bool:
         return any(conn.has_active_relationship() for conn in self.all_connections())
+
+    # ---- pairing -------------------------------------------------------
+    #
+    # A pairing token carries the topic-identity-channel relationship a
+    # second client of this same user needs. It is deliberately not a
+    # connect token: accepting one through the peer path would register the
+    # user's own laptop as a stranger and then trip the reconnect-replace
+    # loop, unbinding the desktop from the very topics the token covers.
+    # DESIGN_MULTI_CLIENT_PAIRING.md 1.
+
+    PAIRING_TOKEN_KIND = "pairing"
+
+    def _connection_for_descriptor(self, descriptor: dict) -> RelayLogic | None:
+        """An already-registered connection to this relay, if there is one."""
+        storage = RelayLogic._storage_from_descriptor(descriptor)
+        if storage is None:
+            return None
+        with self._manager_lock:
+            return self.connections.get(_relay_fingerprint(storage))
+
+    def _pairing_connections(self, target_id: str = "") -> list[RelayLogic]:
+        """Every relay this client can pair over.
+
+        Not simply `primary`. A relay added through Manage channels is a
+        *target*, and every target gets its own connection keyed by storage
+        fingerprint; primary holds storage only when the process was started
+        with `relay_root` in a config file, which the packaged executable
+        never is. Looking only at primary refused pairing for everyone whose
+        relay was configured the ordinary way.
+
+        All of them, not a chosen one. A sibling is a copy of this client, so
+        whatever this client can reach it must be able to reach too. Picking
+        one meant refusing with "several relays are configured - say which one
+        to pair over" the moment a second relay existed, which is the ordinary
+        state for anyone using more than one.
+        """
+        if target_id:
+            connection = self.connection_for_target(target_id)
+            return [connection] if connection and connection.storage else []
+        usable: list[RelayLogic] = []
+        seen: set[str] = set()
+        for connection in (self.primary, *self.all_connections()):
+            if connection.storage is None:
+                continue
+            # primary and a target can be the same relay; the fingerprint is
+            # what tells two connections apart everywhere else, so use it here
+            # rather than letting one relay into the token twice.
+            fingerprint = _relay_fingerprint(connection.storage)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            usable.append(connection)
+        return usable
+
+    def compose_pairing_token(self, target_id: str = "") -> SessionResult:
+        connections = self._pairing_connections(target_id)
+        if not connections:
+            return SessionResult(
+                "error",
+                reason=(
+                    "no relay to pair over - add one under Manage channels"
+                    " first, since the other client reaches this one through it"
+                ),
+            )
+        # Siblings publish under one identity, so a token covering several
+        # relays can only carry one. Divergent identities mean this client is
+        # already inconsistent with itself; say so rather than pick one and
+        # leave the sibling a *peer* on every relay the guess was wrong for.
+        identities = {conn.identity for conn in connections}
+        if len(identities) > 1:
+            return SessionResult(
+                "error",
+                reason=(
+                    "these relays publish under different identities, so one"
+                    " pairing token cannot cover them - pair over one at a time"
+                ),
+            )
+        descriptors = []
+        for connection in connections:
+            descriptor = connection.channel_descriptor()
+            if descriptor:
+                descriptors.append(dict(descriptor))
+        if not descriptors:
+            return SessionResult("error", reason="no relay channel to pair over")
+        # Everything the account owns, not a selected subset. Scoping is for
+        # peers; a sibling needs the whole environment.
+        topic_uuids = sorted(self.session.shared_topic_uuids())
+        # Issuing a pairing token is issuing a relationship, exactly as
+        # issuing a connect token is. Without this the loop stays idle - a
+        # drop-box relay has no back-channel announcing that the sibling
+        # arrived - so this client would publish nothing and the sibling
+        # would find an empty slot and never receive anything at all.
+        for connection in connections:
+            if topic_uuids:
+                connection.mark_topics_shared(list(topic_uuids))
+            connection.pair_all_topics()
+        return SessionResult("ok", value={
+            "token_version": CONNECT_TOKEN_VERSION,
+            "token_kind": self.PAIRING_TOKEN_KIND,
+            "client_id": connections[0].identity,
+            "channels": descriptors,
+            "topic_uuids": sorted(topic_uuids),
+            "profile": self.session.identity.to_dict(),
+        })
+
+    def accept_pairing_token(self, token: dict) -> SessionResult:
+        if not isinstance(token, dict):
+            return SessionResult("error", reason="that is not a pairing token")
+        if token.get("token_kind") != self.PAIRING_TOKEN_KIND:
+            return SessionResult(
+                "error", reason="that is a connection token, not a pairing token",
+            )
+        if token.get("token_version") != CONNECT_TOKEN_VERSION:
+            return SessionResult("error", reason="unrecognized token version")
+        client_id = str(token.get("client_id") or "").strip()
+        descriptors = [
+            item for item in (token.get("channels") or []) if isinstance(item, dict)
+        ]
+        if not client_id or not descriptors:
+            return SessionResult("error", reason="pairing token is incomplete")
+        profile = token.get("profile")
+        if isinstance(profile, dict):
+            adopted = self.session.adopt_pairing_identity(profile)
+            if adopted.status != "ok":
+                return adopted
+        topic_uuids = [
+            str(item) for item in (token.get("topic_uuids") or []) if item
+        ]
+        # Identity before storage: the state file is keyed by identity and
+        # location together, so binding storage under the old identity would
+        # tie this client's bookkeeping to a slot it is about to leave. Set
+        # once, before any connection is created, because a connection built
+        # after this point reads it from app_metadata as its own identity.
+        self.session.app_metadata["relay_paired_client_id"] = client_id
+        for descriptor in descriptors:
+            accepted = self._adopt_pairing_channel(
+                descriptor, client_id, topic_uuids,
+            )
+            if accepted.status != "ok":
+                return accepted
+        self.session.trace_event(
+            "relay.pairing_token_accepted",
+            client_id=client_id,
+            channel_count=len(descriptors),
+            topic_count=len(topic_uuids),
+        )
+        return SessionResult("ok", value=client_id)
+
+    def _adopt_pairing_channel(
+        self, descriptor: dict, client_id: str, topic_uuids: list[str],
+    ) -> SessionResult:
+        """Take one relay from a pairing token, adding it if it is new.
+
+        Additive on purpose. A later pairing token may name relays this
+        client already has and relays it does not; the ones it already has
+        are re-keyed to the sibling identity and the rest are registered as
+        ordinary targets, so pairing again with more channels adds them
+        instead of replacing what is here.
+        """
+        # Reuse the connection for this relay if there already is one - the
+        # accepting client may have the same relay configured as a target -
+        # and otherwise let primary adopt it, which is the existing entry
+        # point for a client with no relay config of its own. Deliberately a
+        # lookup and not ensure_connection: creating a second connection to
+        # storage primary is about to adopt would leave two writers on one
+        # machine publishing into the same slot.
+        connection = self._connection_for_descriptor(descriptor)
+        if connection is None and self.primary.storage is None:
+            connection = self.primary
+        if connection is None:
+            # primary is already carrying a different relay, so this one
+            # becomes a target of its own - the same shape it would have had
+            # if the user had added it under Manage channels.
+            registered = self.register_descriptor(descriptor)
+            if registered.status != "ok":
+                return registered
+            connection = self.connection_for_target(registered.value)
+            if connection is None:
+                return SessionResult(
+                    "error", reason="relay connection could not be created",
+                )
+        connection.identity = client_id
+        if connection.storage is None:
+            connection.adopt_storage_from_descriptor(descriptor)
+        else:
+            # Already has the storage; re-key its bookkeeping to the paired
+            # identity, which is what adopting would otherwise have done.
+            connection._install_adopted_storage(connection.storage, descriptor)
+        if connection.storage is None:
+            return SessionResult(
+                "error", reason="could not open the relay named in the token",
+            )
+        if topic_uuids:
+            connection.mark_topics_desired(topic_uuids)
+        connection.pair_all_topics()
+        return SessionResult("ok", value=connection.identity)
+
+    # ---- sibling alarms ------------------------------------------------
+    # A topic can only be in alarm on the connection whose slot holds the
+    # sibling's version, so these fold across connections rather than
+    # picking one.
+
+    def sibling_alarms(self) -> list[dict]:
+        return sorted(
+            (
+                {"topic_uuid": topic_uuid, "relay_identity": conn.identity}
+                for conn in self.all_connections()
+                for topic_uuid in conn.sibling_alarm_topics()
+            ),
+            key=lambda item: (item["topic_uuid"], item["relay_identity"]),
+        )
+
+    def resolve_sibling_alarm(self, topic_uuid: str,
+                              decision: str) -> SessionResult:
+        if decision not in ("take_sibling", "keep_local"):
+            return SessionResult("error", reason="unknown decision")
+        for conn in self.all_connections():
+            if topic_uuid not in conn.sibling_alarm_topics():
+                continue
+            return (
+                conn.take_sibling_version(topic_uuid)
+                if decision == "take_sibling"
+                else conn.keep_local_version(topic_uuid)
+            )
+        return SessionResult("error", reason="no sibling alarm on this topic")
 
     def peer_liveness(self, peer_id: str, target_id: str | None = None) -> dict:
         # The same identity may exist on an old and a current target. An

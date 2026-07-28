@@ -1210,12 +1210,21 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
             await relay_phase(
                 relay, cycle_id, "write_presence", relay.write_presence,
             )
-            published_before = await relay_phase(
-                relay, cycle_id, "publish_before_poll",
-                relay.publish_due_topics,
-            )
+            # Poll first, always. With one publication identity per user
+            # rather than per client, publishing before looking would write
+            # this client's state over a sibling's without ever comparing
+            # the two - and the sibling, having published everything it had,
+            # would then correctly conclude the result was safe to adopt.
+            # Both clients follow the rule and the work is gone. See
+            # DESIGN_MULTI_CLIENT_PAIRING.md 4.1.
             applied = await relay_phase(
                 relay, cycle_id, "poll_and_apply", relay.poll_and_apply,
+            )
+            # Still "before" in the sense the trace field means: before the
+            # adoption drain and its publish_response pass below.
+            published_before = await relay_phase(
+                relay, cycle_id, "publish_after_poll",
+                relay.publish_due_topics,
             )
         except Exception as exc:
             print(f"[channel] sync failed: {exc}", flush=True)

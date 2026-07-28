@@ -25,7 +25,28 @@ class MailboxChannel:
         descriptor = self.manager.target_descriptor(target_id)
         if not descriptor:
             return ChannelResult.error("mailbox target not found", 404)
-        assigned = self.manager.assign_topics_target(list(topic_uuids), target_id)
+        # Composing an invitation no longer assigns. Inviting someone to a
+        # channel is a decision to publish this topic there, and that decision
+        # is "use this channel for this board" - taken first, visible in the
+        # interface, and revocable from the same place. Assigning here made
+        # pressing "Get token" once bind the board to the channel for good,
+        # with nothing on screen saying so and nothing ever clearing it.
+        identity_uuid = self.manager.session.identity.uuid
+        unassigned = sorted(
+            topic_uuid for topic_uuid in topic_uuids
+            if topic_uuid != identity_uuid
+            and self.manager.target_for_topic(topic_uuid) != target_id
+        )
+        if unassigned:
+            return ChannelResult.error(
+                "use this channel for the topic before inviting anyone to it",
+                409,
+            )
+        # The identity topic is the exception: it is not a board, is never
+        # "used for" anything, and has to travel over whatever route the
+        # invitation takes or the invitee cannot see who invited them. It
+        # follows the decision rather than needing one of its own.
+        assigned = self.manager.assign_topics_target([identity_uuid], target_id)
         if assigned.status != "ok":
             return ChannelResult.error(assigned.reason or "could not assign topics")
         return ChannelResult.success(descriptor)
@@ -79,7 +100,34 @@ class MailboxChannel:
             result = self.manager.assign_topic_target(str(topic_uuid), None)
             if result.status != "ok":
                 return ChannelResult.error(result.reason or "could not detach topic")
+            self._release_topic_peers(str(topic_uuid))
         return ChannelResult.success()
+
+    def _release_topic_peers(self, topic_uuid: str) -> None:
+        """Stop tracking the peers this channel was carrying for a topic.
+
+        The direct channel gets this for free: its detach_topics calls
+        Session.leave_topic. A mailbox detach has to be narrower, because
+        leave_topic drops every peer on the topic - a board also shared over
+        a direct connection would lose those peers too.
+
+        Deliberately not the case _forget_departed_relay_peers describes,
+        which keeps peer_topic_sets when a peer merely goes quiet for a poll.
+        This is the user saying "stop using this channel here", so the
+        relationship goes with it: the topic is private again and its people
+        stop being members of it. The content is untouched - cards keep naming
+        the person as owner or participant, and removing those is the user's
+        own act, not something a detach may decide.
+        """
+        session = self.manager.session
+        departing = [
+            peer_addr
+            for peer_addr, topics in session.peer_topic_sets.items()
+            if topic_uuid in topics
+            and session.peer_channel_for_topic(peer_addr, topic_uuid) == self.kind
+        ]
+        for peer_addr in departing:
+            session.remove_peer_topics(peer_addr, [topic_uuid])
 
     def status(self) -> dict:
         return self.manager.status_payload()
@@ -200,7 +248,20 @@ class MailboxChannel:
         )
 
     def delete_instance(self, instance_id: str) -> ChannelResult:
-        return self._result(self.manager.delete_target(instance_id))
+        # delete_target already drops the topic assignments; the peers those
+        # assignments were carrying have to go the same way a "stop using"
+        # would send them, or the topic stays populated by a channel that no
+        # longer exists.
+        assigned = [
+            target.get("topic_uuids") or []
+            for target in self.manager.list_targets()
+            if target.get("id") == instance_id
+        ]
+        result = self._result(self.manager.delete_target(instance_id))
+        if result.ok:
+            for topic_uuid in [item for topics in assigned for item in topics]:
+                self._release_topic_peers(str(topic_uuid))
+        return result
 
     def polling_endpoints(self):
         return self.manager.all_connections()
@@ -230,6 +291,7 @@ class MailboxChannel:
             result = self.manager.assign_topic_target(topic_uuid, None)
             if result.status != "ok":
                 return ChannelResult.error(result.reason or "could not detach topic")
+            self._release_topic_peers(topic_uuid)
         return ChannelResult.success()
 
     def peer_liveness(self, peer_id: str, target_id: str | None = None):
