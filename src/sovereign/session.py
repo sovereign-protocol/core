@@ -1,36 +1,9 @@
-"""
-Sovereign session component.
+"""Public protocol Session facade.
 
-Offered API:
-  Session(address)
-  start_discussion(topic_uuid)
-  add_peer(peer_addr, topic_uuid)
-  handle_join(message)
-  handle_announce(message)
-  handle_leave(message)
-  apply_peer_subtree(peer_addr, subtree, parent_uuid)
-  watch_topic(peer_addr, topic_uuid)
-  unwatch_topic(peer_addr, topic_uuid)
-  leave()
-  get_network_info()
-  peer_discusses_node(peer_addr, node_uuid)
-  accept_peer_node(peer_addr, node_uuid, adopt_absence=False,
-                   adopt_descendants=True)
-  reconcile_peer_changes(peer_addr, topic_uuid, node_is_eligible=None)
-    Generic peer-content reconciliation (the "adopt incoming changes"
-    mechanism): walks a peer's transitions for one topic and adopts each
-    eligible change. Apps supply only their own eligibility policy via
-    node_is_eligible; the walk itself is app-agnostic, and shallow-vs-graft
-    is chosen per node by accept_peer_node from the event type.
-  protocol operation wrappers: create_child, modify, delete, copy, move,
-
-Used API:
-  protocol.ProtocolState and protocol.ProtocolNode only.
-
-Transport contract:
-  Session never sends data. It returns SessionEffect values that a server or
-  transport adapter can execute using HTTP, local memory, relay, or another
-  mechanism.
+Session owns local mutations, peer snapshots, topic membership, reconciliation,
+ordering, agenda policy, application metadata namespaces, and its persisted
+registries. It never sends data: channels publish and poll independently.
+Public peer/topic views are detached snapshots; mutable registries stay private.
 """
 
 from __future__ import annotations
@@ -175,6 +148,7 @@ class ReadOnlyProtocolView:
 
 
 class Session:
+    ORDER_GAP_EPSILON = 1e-9
     # Another client of this same user caches its version of a topic under an
     # address with this prefix. It is not a peer address and must never be
     # treated as one: a sibling has no place in the participant lists, and no
@@ -195,12 +169,8 @@ class Session:
         # receives a larger value; adopted/forwarded revisions preserve the
         # originator's value instead of consuming this counter.
         self.local_revision_seq = 0
-        self.members: set[str] = {address}
-        self.peer_topics: dict[str, str] = {}
-        self.peer_topic_sets: dict[str, set[str]] = {}
-        self.peer_fetch_topic_sets: dict[str, set[str]] = {}
-        self.peer_perspectives: dict[str, ProtocolNode] = {}
-        self.peer_status: dict[str, dict[str, Any]] = {}
+        self._peer_topic_sets: dict[str, set[str]] = {}
+        self._peer_perspectives: dict[str, ProtocolNode] = {}
         # Which channel type last successfully delivered to/from a peer
         # address - purely informational (the only transport-shaped thing
         # an app is allowed to surface to its UI, per the connect-channel
@@ -212,23 +182,21 @@ class Session:
         # Canonical addr -> identity_key registry. Knowledge, not
         # registration: an entry records "this address belongs to this
         # identity", a fact that stays true even after the peer's
-        # registration (members/peer_topic_sets/...) is torn down - so
-        # remove_peer deliberately leaves it alone. Written the instant
-        # any channel learns the fact (set_peer_identity_key), never
-        # re-derived from cached content on demand.
-        self.peer_identity_key: dict[str, str] = {}
-        self.peer_sync_state: dict[str, dict[str, Any]] = {}
-        # Exact local node revisions each peer has confirmed fetching.
-        # Ephemeral for direct HTTP; relay acknowledgements are rebuilt from
-        # durable relay heads after restart.
+        # registration (peer_topic_sets/...) is torn down - so remove_peer
+        # deliberately leaves it alone. Written the instant any channel
+        # learns the fact (set_peer_identity_key), never re-derived from
+        # cached content on demand.
+        self._peer_identity_key: dict[str, str] = {}
+        # Exact local node revisions each peer has confirmed fetching,
+        # rebuilt from durable relay heads after restart.
         self.peer_observed_node_revisions: dict[str, dict[str, str]] = {}
-        self.active_topic_uuids: set[str] = set()
+        self._active_topic_uuids: set[str] = set()
         # Runtime-only consent markers for invited application topics that
         # arrived while their application was inactive. Passive relay cache
         # entries are deliberately absent and must never be grafted merely
         # because an application is activated later.
         self.pending_topic_invitations: set[str] = set()
-        self.app_metadata: dict[str, Any] = {}
+        self._app_metadata: dict[str, Any] = {}
         # Runtime-only application hooks used by channels to enumerate and
         # mount shared topic roots without importing application modules.
         self.shared_topics = SharedTopicRegistry()
@@ -237,18 +205,208 @@ class Session:
             {"shared_user_profile"},
             lambda: [self.identity],
             self.accept_profile_invitation,
-            assignment_scoped=False,
             mount_invitation=False,
         )
-        # Read-only observation: addresses/topics we poll for their cached
-        # perspective only. Deliberately kept separate from
-        # members/peer_topic_sets - an observed address is never a peer, so
-        # it's invisible to health checks, network info, and sync effects.
-        self.observed_topics: dict[str, set[str]] = {}
 
     @property
     def active_topic_uuid(self) -> str | None:
-        return sorted(self.active_topic_uuids)[0] if self.active_topic_uuids else None
+        return sorted(self._active_topic_uuids)[0] if self._active_topic_uuids else None
+
+    @property
+    @_session_locked
+    def active_topic_uuids(self) -> frozenset[str]:
+        return frozenset(self._active_topic_uuids)
+
+    @property
+    @_session_locked
+    def peer_topic_sets(self) -> dict[str, frozenset[str]]:
+        return {
+            address: frozenset(topics)
+            for address, topics in self._peer_topic_sets.items()
+        }
+
+    @property
+    @_session_locked
+    def peer_perspectives(self) -> dict[str, ProtocolNode]:
+        return self.peer_perspectives_for_topic()
+
+    @property
+    @_session_locked
+    def peer_identity_key(self) -> dict[str, str]:
+        return dict(self._peer_identity_key)
+
+    @property
+    @_session_locked
+    def app_metadata(self) -> dict[str, Any]:
+        return copy.deepcopy(self._app_metadata)
+
+    @_session_locked
+    def active_topic_ids(self) -> tuple[str, ...]:
+        """Return a stable snapshot of locally active topic identifiers."""
+        return tuple(sorted(self._active_topic_uuids))
+
+    @_session_locked
+    def active_topics(self) -> tuple[ProtocolNode, ...]:
+        """Return detached snapshots of all locally active topic roots."""
+        topics = []
+        for topic_uuid in sorted(self._active_topic_uuids):
+            node = self._protocol.index.get(topic_uuid)
+            if node is not None:
+                topics.append(ProtocolNode.from_dict(node.to_dict()))
+        return tuple(topics)
+
+    @_session_locked
+    def is_node_in_active_topic(self, node_uuid: str) -> bool:
+        """Whether *node_uuid* is contained by any locally active topic."""
+        return any(
+            self._is_descendant_or_self(topic_uuid, node_uuid)
+            for topic_uuid in self._active_topic_uuids
+        )
+
+    @_session_locked
+    def peer_addresses(self, topic_uuid: str | None = None) -> tuple[str, ...]:
+        """Return known peer addresses, optionally filtered by topic."""
+        if topic_uuid is None:
+            addresses = set(self._peer_topic_sets) | set(self._peer_perspectives)
+        else:
+            addresses = {
+                address
+                for address, topics in self._peer_topic_sets.items()
+                if topic_uuid in topics
+            }
+        return tuple(sorted(addresses))
+
+    @_session_locked
+    def peer_topic_uuids(self, peer_addr: str) -> tuple[str, ...]:
+        """Return a snapshot of topics registered for one peer."""
+        return tuple(sorted(self._peer_topic_sets.get(peer_addr, ())))
+
+    @_session_locked
+    def peer_perspectives_for_topic(
+        self, topic_uuid: str | None = None,
+    ) -> dict[str, ProtocolNode]:
+        """Return detached peer-tree snapshots, optionally filtered by topic."""
+        addresses = (
+            self.peer_addresses(topic_uuid)
+            if topic_uuid is not None
+            else tuple(sorted(self._peer_perspectives))
+        )
+        return {
+            address: ProtocolNode.from_dict(tree.to_dict())
+            for address in addresses
+            if (tree := self._peer_perspectives.get(address)) is not None
+        }
+
+    @_session_locked
+    def peer_identity_key_for_address(self, peer_addr: str) -> str | None:
+        return self._peer_identity_key.get(peer_addr)
+
+    @_session_locked
+    def application_metadata(self, application_id: str) -> dict[str, Any]:
+        """Return the mutable metadata namespace owned by one application."""
+        apps = self._app_metadata.setdefault("apps", {})
+        if not isinstance(apps, dict):
+            apps = {}
+            self._app_metadata["apps"] = apps
+        namespace = apps.setdefault(application_id, {})
+        if not isinstance(namespace, dict):
+            namespace = {}
+            apps[application_id] = namespace
+        return namespace
+
+    @_session_locked
+    def component_metadata(self, component_id: str) -> dict[str, Any]:
+        """Return a private Core component's persisted metadata namespace."""
+        components = self._app_metadata.setdefault("core_components", {})
+        if not isinstance(components, dict):
+            components = {}
+            self._app_metadata["core_components"] = components
+        namespace = components.setdefault(component_id, {})
+        if not isinstance(namespace, dict):
+            namespace = {}
+            components[component_id] = namespace
+        if component_id == "relay":
+            for key in list(self._app_metadata):
+                if key.startswith("relay_"):
+                    namespace.setdefault(key, self._app_metadata.pop(key))
+        return namespace
+
+    @_session_locked
+    def persistence_metadata(self) -> dict[str, Any]:
+        """Return the Session-owned persistence fields as a detached value."""
+        return {
+            "local_revision_seq": self.local_revision_seq,
+            "active_topic_uuids": sorted(self._active_topic_uuids),
+            "peer_topic_sets": {
+                addr: sorted(topics)
+                for addr, topics in sorted(self._peer_topic_sets.items())
+            },
+            "peer_identity_key": dict(sorted(self._peer_identity_key.items())),
+            "peer_topic_channel": {
+                addr: dict(sorted(bindings.items()))
+                for addr, bindings in sorted(self.peer_topic_channel.items())
+            },
+            "app_metadata": copy.deepcopy(self._app_metadata),
+        }
+
+    @_session_locked
+    def restore_persistence_metadata(self, metadata: dict[str, Any]) -> None:
+        """Restore Session-owned registries while validating stored values."""
+        stored_revision_seq = metadata.get("local_revision_seq", 0)
+        self.local_revision_seq = (
+            stored_revision_seq
+            if isinstance(stored_revision_seq, int)
+            and not isinstance(stored_revision_seq, bool)
+            and stored_revision_seq >= 0
+            else 0
+        )
+        self._active_topic_uuids = {
+            uuid for uuid in metadata.get("active_topic_uuids", [])
+            if self._protocol.index.get(uuid) is not None
+        }
+        self._peer_topic_sets.clear()
+        self.peer_topic_channel.clear()
+        self._app_metadata = copy.deepcopy(
+            dict(metadata.get("app_metadata") or {}),
+        )
+        self._peer_identity_key = {
+            addr: key
+            for addr, key in (metadata.get("peer_identity_key") or {}).items()
+            if isinstance(addr, str) and isinstance(key, str) and addr and key
+        }
+        self.peer_topic_channel = {
+            addr: {
+                topic_uuid: channel_kind
+                for topic_uuid, channel_kind in bindings.items()
+                if (
+                    isinstance(topic_uuid, str)
+                    and topic_uuid
+                    and isinstance(channel_kind, str)
+                    and channel_kind
+                )
+            }
+            for addr, bindings in (
+                metadata.get("peer_topic_channel") or {}
+            ).items()
+            if isinstance(addr, str) and addr and isinstance(bindings, dict)
+        }
+        for peer, stored_topics in sorted(
+            (metadata.get("peer_topic_sets") or {}).items(),
+        ):
+            topics = {
+                topic for topic in stored_topics
+                if (
+                    self._protocol.index.get(topic) is not None
+                    or self.peer_channel_for_topic(peer, topic)
+                )
+            }
+            if topics:
+                self._peer_topic_sets[peer] = topics
+        self.peer_topic_channel = {
+            addr: bindings
+            for addr, bindings in self.peer_topic_channel.items()
+            if addr in self._peer_topic_sets and bindings
+        }
 
     # Identity - a session-owned meta-topic. Any app gets "who am I"/"who is
     # this peer" for free through these, instead of reimplementing its own
@@ -399,7 +557,7 @@ class Session:
             return []
         mounted = []
         seen = set()
-        stack = list(self.peer_perspectives.values())
+        stack = list(self._peer_perspectives.values())
         while stack:
             node = stack.pop()
             if node.uuid in seen:
@@ -418,14 +576,6 @@ class Session:
                     continue
             stack.extend(node.children)
         return sorted(mounted)
-
-    @_session_locked
-    def registered_application_ids(self) -> tuple[str, ...]:
-        return tuple(sorted(
-            registration.application_id
-            for registration in self.shared_topics.registrations()
-            if registration.application_id != "Sovereign Core profile"
-        ))
 
     @_session_locked
     def shared_topic_uuids(
@@ -460,16 +610,12 @@ class Session:
     ) -> bool:
         return self.shared_topics.invitation_requires_mount(tree)
 
-    @_session_locked
-    def has_application_topic_handlers(self) -> bool:
-        return self.shared_topics.has_assignment_scoped_handlers()
-
     def find_peer_identity(self, identity_key: str) -> ProtocolNode | None:
         # Searches across every cached peer perspective's values, not one
         # peer's cache keyed by address - this is what lets identity survive
         # a peer's address changing, since lookup never depends on which
         # dict key the matching tree happens to be cached under.
-        for tree in self.peer_perspectives.values():
+        for tree in self._peer_perspectives.values():
             found = self._find_identity_in_tree(tree, identity_key)
             if found:
                 return found
@@ -480,7 +626,7 @@ class Session:
         # address we're tracking" to "their identity" - find_peer_identity
         # alone can't do this once it's keyed by identity_key instead of
         # address, since a bare address gives no identity_key to search for.
-        tree = self.peer_perspectives.get(peer_addr)
+        tree = self._peer_perspectives.get(peer_addr)
         return self._find_identity_in_tree(tree) if tree else None
 
     def set_peer_identity_key(self, peer_addr: str, identity_key: str) -> None:
@@ -491,9 +637,9 @@ class Session:
         # whether/when full content has been cached.
         if not peer_addr or not identity_key:
             return
-        if self.peer_identity_key.get(peer_addr) == identity_key:
+        if self._peer_identity_key.get(peer_addr) == identity_key:
             return
-        self.peer_identity_key[peer_addr] = identity_key
+        self._peer_identity_key[peer_addr] = identity_key
         self.trace_event(
             "session.set_peer_identity_key",
             peer_addr=peer_addr,
@@ -502,7 +648,7 @@ class Session:
 
     def addresses_for_identity(self, identity_key: str) -> list[str]:
         return sorted(
-            addr for addr, key in self.peer_identity_key.items()
+            addr for addr, key in self._peer_identity_key.items()
             if key == identity_key
         )
 
@@ -598,32 +744,24 @@ class Session:
         node = self._protocol.index.get(node_uuid)
         return node.state_hash if node else None
 
-    def cached_peer_topic_state_hash(self, peer_addr: str, topic_uuid: str) -> str | None:
-        cached = self.peer_perspectives.get(peer_addr)
-        topic = self._find_in_tree(cached, topic_uuid) if cached else None
-        return topic.state_hash if topic else None
-
     # Discussion/session state
 
     @_session_locked
     def start_discussion(self, topic_uuid: str) -> SessionResult:
         if topic_uuid not in self._protocol.index:
             return SessionResult("error", reason="topic not found")
-        self.active_topic_uuids.add(topic_uuid)
+        self._active_topic_uuids.add(topic_uuid)
         return SessionResult("ok", value=topic_uuid)
 
     @_session_locked
     def note_indirect_peer_topic(self, peer_addr: str, topic_uuid: str) -> None:
-        # Indirect peers never go through
-        # add_peer - that would also add them to self.members, which
-        # pending_sync_effects/sync_effects iterate to decide who to push
-        # real HTTP effects to, and a relay identity isn't HTTP-reachable at
-        # that address. Application auto-adopt policies gate candidates on
-        # peer_topic_sets (_peer_discusses_node) to know a cached peer
-        # perspective actually applies to a given topic - without this, a
-        # relay-sourced cache update would be silently invisible to
-        # auto-adopt even though the data arrived correctly.
-        self.peer_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
+        # The one way a peer relationship is recorded. Application auto-adopt
+        # policies gate candidates on peer_topic_sets (_peer_discusses_node)
+        # to know a cached peer perspective actually applies to a given
+        # topic - without this, a relay-sourced cache update would be
+        # silently invisible to auto-adopt even though the data arrived
+        # correctly.
+        self._peer_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
 
     def bind_peer_topic_channel(
         self, peer_addr: str, topic_uuid: str, channel_kind: str,
@@ -655,82 +793,11 @@ class Session:
         if not bindings:
             self.peer_topic_channel.pop(peer_addr, None)
 
-    def add_peer(self, peer_addr: str, topic_uuid: str,
-                 fetch_from_peer: bool = True) -> None:
-        if peer_addr == self.address:
-            self.active_topic_uuids.add(topic_uuid)
-            return
-        self.members.add(peer_addr)
-        self.peer_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
-        if fetch_from_peer:
-            self.peer_fetch_topic_sets.setdefault(peer_addr, set()).add(topic_uuid)
-        self.peer_topics.setdefault(peer_addr, topic_uuid)
-        self.peer_status.setdefault(peer_addr, self._new_peer_status())
-        self.peer_sync_state.setdefault(peer_addr, self._new_peer_sync_state())
-
-    def add_peer_topics(self, peer_addr: str, topic_uuids: list[str] | set[str],
-                        fetch_from_peer: bool = True) -> None:
-        for topic_uuid in sorted(set(topic_uuids)):
-            self.add_peer(peer_addr, topic_uuid, fetch_from_peer=fetch_from_peer)
-
-    def set_peer_fetch_topics(self, peer_addr: str, topic_uuids: list[str] | set[str]) -> None:
-        if peer_addr == self.address:
-            return
-        self.members.add(peer_addr)
-        self.peer_fetch_topic_sets[peer_addr] = set(topic_uuids)
-        self.peer_status.setdefault(peer_addr, self._new_peer_status())
-        self.peer_sync_state.setdefault(peer_addr, self._new_peer_sync_state())
-
-    def fetch_topic_uuids(self, peer_addr: str) -> list[str]:
-        topics = self.peer_fetch_topic_sets.get(peer_addr)
-        if topics is None:
-            topics = self.peer_topic_sets.get(peer_addr, set())
-        return sorted(topics)
-
-    def remove_peer_fetch_topic(self, peer_addr: str, topic_uuid: str) -> None:
-        topics = self.peer_fetch_topic_sets.get(peer_addr)
-        if not topics:
-            return
-        topics.discard(topic_uuid)
-
-    def topic_members(self, topic_uuid: str) -> set[str]:
-        # "member" here specifically means "a real, HTTP-reachable address
-        # worth telling other peers about" - peer_topic_sets alone isn't
-        # enough evidence of that. A relay pseudo-address (e.g. "relay:B")
-        # also lives in peer_topic_sets (note_indirect_peer_topic - deliberate,
-        # so application auto-adopt/eligibility checks still recognize it) but
-        # was never registered via add_peer specifically to keep it out of
-        # self.members and everything self.members feeds (pending_sync_effects,
-        # mesh-propagation via handle_join/join_discussion's own member
-        # loops). Without this filter, mentioning a relay identity in one
-        # topic_members exchange would propagate it into every peer's own
-        # self.members via handle_join's blind add_peer loop, not just the
-        # two sides actually using that relay channel.
-        members = {self.address} if topic_uuid in self.active_topic_uuids else set()
-        for peer, topics in self.peer_topic_sets.items():
-            if topic_uuid in topics and peer in self.members:
-                members.add(peer)
-        return members
-
     def peers_for_topic(self, topic_uuid: str) -> list[str]:
         return sorted(
-            peer for peer, topics in self.peer_topic_sets.items()
+            peer for peer, topics in self._peer_topic_sets.items()
             if topic_uuid in topics
         )
-
-    def topic_members_by_topic(self, topic_uuids: list[str] | set[str]) -> dict[str, list[str]]:
-        return {
-            topic_uuid: sorted(self.topic_members(topic_uuid))
-            for topic_uuid in sorted(set(topic_uuids))
-        }
-
-    @staticmethod
-    def topic_members_from_map(topic_members: dict,
-                               topic_uuids: list[str]) -> dict[str, set[str]]:
-        return {
-            topic_uuid: set(topic_members.get(topic_uuid, []))
-            for topic_uuid in topic_uuids
-        }
 
     @_session_locked
     def accept_topic_invitation(self, tree: ProtocolNode,
@@ -741,98 +808,20 @@ class Session:
         )
         if not result.ok:
             return SessionResult("error", reason=result.reason)
-        self.active_topic_uuids.add(result.value)
+        self._active_topic_uuids.add(result.value)
         return SessionResult("ok", value=result.value)
 
-    def leave(self) -> SessionResult:
-        # Also tells each peer about the others, so the mesh survives our
-        # departure - otherwise identical to disconnect().
-        return self._leave_all(announce=True)
-
-    def disconnect(self) -> SessionResult:
-        return self._leave_all(announce=False)
-
-    def _leave_all(self, announce: bool) -> SessionResult:
-        peers = sorted(self.members - {self.address})
-        effects = []
-        if announce:
-            for peer in peers:
-                topic_uuids = set(self.peer_topic_sets.get(peer) or [])
-                others = [other for other in peers if other != peer]
-                if not topic_uuids or not others:
-                    continue
-                routed = self._topics_by_channel(peer, topic_uuids)
-                for channel_kind, channel_topics in sorted(routed.items()):
-                    effects.append(SessionEffect(
-                        "announce_peer",
-                        peer,
-                        {
-                            "new_addrs": others,
-                            "topic_uuids": channel_topics,
-                            "topic_uuid": channel_topics[0],
-                        },
-                        channel_kind=channel_kind,
-                    ))
-        for peer in peers:
-            for channel_kind, channel_topics in sorted(
-                self._topics_by_channel(
-                    peer, self.peer_topic_sets.get(peer) or set(),
-                ).items(),
-            ):
-                effects.append(SessionEffect(
-                    "send_leave",
-                    peer,
-                    {
-                        "from_addr": self.address,
-                        "topic_uuid": channel_topics[0],
-                        "topic_uuids": channel_topics,
-                    },
-                    channel_kind=channel_kind,
-                ))
-        self._clear_all_peer_state()
-        return SessionResult("ok", effects=effects)
-
-    def _clear_all_peer_state(self) -> None:
-        # Bulk counterpart of remove_peer - clears every per-peer structure
-        # for *every* peer (including relay pseudo-addresses, which live in
-        # peer_topic_sets/peer_perspectives without ever being members).
-        # peer_identity_key is deliberately kept, for the same reason
-        # remove_peer keeps it: it's knowledge, not registration.
-        self.members = {self.address}
-        self.peer_topics.clear()
-        self.peer_topic_sets.clear()
-        self.peer_fetch_topic_sets.clear()
-        self.peer_perspectives.clear()
-        self.peer_status.clear()
-        self.peer_sync_state.clear()
-        self.peer_topic_channel.clear()
-        self.observed_topics.clear()
-        self.active_topic_uuids.clear()
-
     def leave_topic(self, topic_uuid: str) -> SessionResult:
+        # No message goes out. A relay peer is told by absence: this client
+        # stops publishing into the slot, and stops polling theirs.
         tracked_peers = sorted(
-            peer for peer, topics in self.peer_topic_sets.items()
+            peer for peer, topics in self._peer_topic_sets.items()
             if topic_uuid in topics
         )
-        effects = []
-        for peer in tracked_peers:
-            channel_kind = self.peer_channel_for_topic(peer, topic_uuid)
-            if peer not in self.members or not channel_kind:
-                continue
-            effects.append(SessionEffect(
-                "send_leave",
-                peer,
-                {
-                    "from_addr": self.address,
-                    "topic_uuid": topic_uuid,
-                    "topic_uuids": [topic_uuid],
-                },
-                channel_kind=channel_kind,
-            ))
-        self.active_topic_uuids.discard(topic_uuid)
+        self._active_topic_uuids.discard(topic_uuid)
         for peer in tracked_peers:
             self._remove_peer_topic(peer, topic_uuid)
-        return SessionResult("ok", effects=effects)
+        return SessionResult("ok")
 
     def end_topic_sharing(self, topic_uuid: str) -> SessionResult:
         """End the Session relationship and ask Core to release all channels.
@@ -849,90 +838,6 @@ class Session:
             ))
         return result
 
-    # Incoming session messages
-
-    def handle_sync_status(self, message: dict) -> SessionResult:
-        from_addr = message.get("from_addr")
-        summary = message.get("summary") or {}
-        topics = summary.get("topics") or {}
-        incoming_sync_hash = summary.get("sync_hash")
-        if not from_addr:
-            return SessionResult("error", reason="missing from_addr")
-        if not isinstance(topics, dict):
-            return SessionResult("error", reason="invalid topics")
-
-        for topic_uuid in sorted(topics):
-            self.add_peer(from_addr, topic_uuid, fetch_from_peer=topic_uuid not in self._protocol.index)
-        self.mark_peer_reachable(from_addr)
-        state = self.peer_sync_state.setdefault(from_addr, self._new_peer_sync_state())
-        state["last_received_sync_hash"] = incoming_sync_hash
-
-        effects = []
-        for topic_uuid, topic_state_hash in sorted(topics.items()):
-            cached_state_hash = self.cached_peer_topic_state_hash(from_addr, topic_uuid)
-            if cached_state_hash != topic_state_hash:
-                channel_kind = self.peer_channel_for_topic(
-                    from_addr, topic_uuid,
-                )
-                if channel_kind:
-                    effects.append(SessionEffect(
-                        "pull_subtree",
-                        from_addr,
-                        {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-                        channel_kind=channel_kind,
-                    ))
-
-        self.trace_event(
-            "session.handle_sync_status",
-            from_addr=from_addr,
-            incoming_sync_hash=incoming_sync_hash,
-            changed_topics=[
-                topic_uuid
-                for topic_uuid, topic_state_hash in sorted(topics.items())
-                if self.cached_peer_topic_state_hash(from_addr, topic_uuid) != topic_state_hash
-            ],
-            effects=[effect.type for effect in effects],
-        )
-        return SessionResult("ok", value={
-            "summary": summary,
-            "my_summary": self.sync_summary(from_addr),
-        }, effects=effects)
-
-    def handle_sync_response(self, peer_addr: str, response: dict) -> SessionResult:
-        if response.get("status") not in ("ok", "partial"):
-            return SessionResult("error", reason=response.get("reason") or "sync failed")
-        self.mark_peer_reachable(peer_addr)
-        my_summary = self.sync_summary(peer_addr)
-        state = self.peer_sync_state.setdefault(peer_addr, self._new_peer_sync_state())
-        delivered = (
-            response.get("status") == "ok"
-            and response.get("delivered_sync_hash") == my_summary["sync_hash"]
-        )
-        if delivered:
-            state["last_delivered_sync_hash"] = my_summary["sync_hash"]
-            state["retry_after"] = None
-            state["retry_delay"] = 1.0
-            for topic_uuid, state_hash in my_summary["topics"].items():
-                topic = self._protocol.index.get(topic_uuid)
-                if topic and topic.state_hash == state_hash:
-                    self.record_peer_observations(
-                        peer_addr, self.node_revision_map(topic),
-                    )
-
-        peer_summary = response.get("my_summary") or {}
-        if peer_summary.get("sync_hash"):
-            state["last_received_sync_hash"] = peer_summary.get("sync_hash")
-        effects = self._pull_effects_for_peer_summary(peer_addr, peer_summary)
-        self.trace_event(
-            "session.handle_sync_response",
-            peer_addr=peer_addr,
-            delivered_sync_hash=response.get("delivered_sync_hash"),
-            current_sync_hash=my_summary["sync_hash"],
-            delivered=delivered,
-            peer_sync_hash=peer_summary.get("sync_hash"),
-            effects=[effect.type for effect in effects],
-        )
-        return SessionResult("ok", effects=effects)
 
     @staticmethod
     def node_revision(node: ProtocolNode) -> str:
@@ -974,129 +879,6 @@ class Session:
             == self.node_revision(node)
         )
 
-    def handle_join(self, message: dict) -> SessionResult:
-        from_addr = message.get("from_addr")
-        topic_uuids = self._message_topic_uuids(message)
-        pull_topic_uuids = message.get("pull_topic_uuids") or topic_uuids
-        topic_members = self.topic_members_from_map(
-            message.get("topic_members") or {}, topic_uuids,
-        )
-        if not from_addr:
-            return SessionResult("error", reason="missing from_addr")
-        if not topic_uuids:
-            return SessionResult("error", reason="missing topic_uuid")
-
-        pull_topic_set = set(pull_topic_uuids)
-        for topic_uuid in topic_uuids:
-            self.add_peer(
-                from_addr,
-                topic_uuid,
-                fetch_from_peer=topic_uuid in pull_topic_set,
-            )
-            # Bug fix: accepting a join means we're now actively discussing
-            # this topic too, not just tracking the joiner as a peer -
-            # without this, the side that only ever *generated* a share
-            # token (never called start_discussion themselves, since
-            # generating a token is a pure client-side operation) never
-            # gets its own board marked active. active_topic_uuids gates
-            # auto-adopt (_is_active_discussion_node), so that side's
-            # auto-adopt silently never ran for this board at all - not a
-            # classification bug, the check was never reached in the first
-            # place. No-ops harmlessly if we don't have this topic locally
-            # yet (start_discussion just returns an error result, ignored).
-            self.start_discussion(topic_uuid)
-        for topic_uuid in topic_uuids:
-            for member in sorted(topic_members.get(topic_uuid, set())):
-                if member == self.address:
-                    continue
-                if member == from_addr:
-                    self.add_peer(
-                        member,
-                        topic_uuid,
-                        fetch_from_peer=topic_uuid in pull_topic_set,
-                    )
-                else:
-                    # A peer mentioning another participant is not authority
-                    # to create a direct route to that participant.
-                    self.note_indirect_peer_topic(member, topic_uuid)
-
-        effects = []
-        for topic_uuid in pull_topic_uuids:
-            channel_kind = self.peer_channel_for_topic(from_addr, topic_uuid)
-            if channel_kind:
-                effects.append(SessionEffect(
-                    "pull_subtree",
-                    from_addr,
-                    {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-                    channel_kind=channel_kind,
-                ))
-        response_topic_members = self.topic_members_by_topic(topic_uuids)
-        return SessionResult(
-            "ok",
-            value={
-                "members": sorted(self.members),
-                "topic_uuids": topic_uuids,
-                "topic_uuid": topic_uuids[0],
-                "topic_members": response_topic_members,
-            },
-            effects=effects,
-        )
-
-    def handle_announce(self, message: dict) -> SessionResult:
-        new_addr = message.get("new_addr")
-        topic_uuids = self._message_topic_uuids(message)
-        if not new_addr:
-            return SessionResult("error", reason="missing new_addr")
-        if not topic_uuids:
-            return SessionResult("error", reason="missing topic_uuid")
-        # A third party mentioning an address does not authorize a transport
-        # route to it. Keep the participant relationship, but wait for an
-        # explicit channel invitation before exchanging data.
-        for topic_uuid in topic_uuids:
-            self.note_indirect_peer_topic(new_addr, topic_uuid)
-        return SessionResult("ok")
-
-    def handle_leave(self, message: dict) -> SessionResult:
-        from_addr = message.get("from_addr")
-        topic_uuids = self._message_topic_uuids(message)
-        if topic_uuids:
-            for topic_uuid in topic_uuids:
-                self._remove_peer_topic(from_addr, topic_uuid)
-                tree = self.peer_perspectives.get(from_addr)
-                if not tree:
-                    continue
-                if tree.uuid == topic_uuid:
-                    # The cache root is the topic itself - dropping children
-                    # can't remove it, so drop the whole perspective.
-                    self.peer_perspectives.pop(from_addr, None)
-                    continue
-                self._remove_uuid_from_tree(tree, topic_uuid)
-                self._refresh_tree_hashes(tree)
-            return SessionResult("ok")
-        self.remove_peer(from_addr)
-        return SessionResult("ok")
-
-    def mark_peer_reachable(self, peer_addr: str) -> bool:
-        status = self.peer_status.setdefault(peer_addr, self._new_peer_status())
-        changed = status.get("state") != "online" or status.get("failures", 0) != 0
-        status.update({
-            "state": "online",
-            "failures": 0,
-            "last_seen": time.time(),
-            "last_error": None,
-        })
-        return changed
-
-    def mark_peer_unreachable(self, peer_addr: str, reason: str | None = None) -> bool:
-        status = self.peer_status.setdefault(peer_addr, self._new_peer_status())
-        was_offline = status.get("state") == "offline"
-        status.update({
-            "state": "offline",
-            "failures": int(status.get("failures", 0)) + 1,
-            "last_error": reason or "unreachable",
-        })
-        return not was_offline
-
     # Peer cache
 
     @_session_locked
@@ -1110,9 +892,9 @@ class Session:
         # the addr -> identity_key registry.
         if self.is_identity_node(subtree) and subtree.data.get("identity_key"):
             self.set_peer_identity_key(peer_addr, subtree.data["identity_key"])
-        cached = self.peer_perspectives.get(peer_addr)
+        cached = self._peer_perspectives.get(peer_addr)
         if cached is None:
-            self.peer_perspectives[peer_addr] = subtree
+            self._peer_perspectives[peer_addr] = subtree
             self.trace_event(
                 "session.apply_peer_subtree",
                 peer_addr=peer_addr,
@@ -1173,7 +955,7 @@ class Session:
                 subtree.parent_uuid = aggregate.uuid
                 aggregate.children = [existing, subtree]
                 aggregate.refresh_hashes_deep()
-                self.peer_perspectives[peer_addr] = aggregate
+                self._peer_perspectives[peer_addr] = aggregate
                 self.trace_event(
                     "session.apply_peer_subtree",
                     peer_addr=peer_addr,
@@ -1184,7 +966,7 @@ class Session:
                 )
                 self.prune_deleted_nodes()
                 return
-            self.peer_perspectives[peer_addr] = subtree
+            self._peer_perspectives[peer_addr] = subtree
             self.trace_event(
                 "session.apply_peer_subtree",
                 peer_addr=peer_addr,
@@ -1237,7 +1019,7 @@ class Session:
         self.prune_deleted_nodes()
 
     def get_cached_peer_subtree(self, peer_addr: str, node_uuid: str) -> ProtocolNode | None:
-        tree = self.peer_perspectives.get(peer_addr)
+        tree = self._peer_perspectives.get(peer_addr)
         if not tree:
             return None
         node = self._find_in_tree(tree, node_uuid)
@@ -1246,41 +1028,25 @@ class Session:
     def peer_discusses_node(self, peer_addr: str, node_uuid: str) -> bool:
         return any(
             self._is_descendant_or_self(topic_uuid, node_uuid)
-            for topic_uuid in self.peer_topic_sets.get(peer_addr, set())
+            for topic_uuid in self._peer_topic_sets.get(peer_addr, set())
         )
 
     def peer_topics_for_node(
         self, peer_addr: str, node_uuid: str,
     ) -> list[str]:
-        tree = self.peer_perspectives.get(peer_addr)
+        tree = self._peer_perspectives.get(peer_addr)
         if not tree:
             return []
         return [
             topic_uuid
             for topic_uuid in sorted(
-                self.peer_topic_sets.get(peer_addr, set()),
+                self._peer_topic_sets.get(peer_addr, set()),
             )
             if (
                 (topic := self._find_in_tree(tree, topic_uuid))
                 and self._find_in_tree(topic, node_uuid)
             )
         ]
-
-    def watch_topic(self, peer_addr: str, topic_uuid: str) -> None:
-        self.observed_topics.setdefault(peer_addr, set()).add(topic_uuid)
-
-    def unwatch_topic(self, peer_addr: str, topic_uuid: str) -> bool:
-        topics = self.observed_topics.get(peer_addr)
-        if not topics or topic_uuid not in topics:
-            return False
-        topics.discard(topic_uuid)
-        if not topics:
-            self.observed_topics.pop(peer_addr, None)
-            # Only drop the cached perspective if nothing else still needs
-            # it (a real peer relationship for a different topic keeps it).
-            if peer_addr not in self.peer_topic_sets:
-                self.peer_perspectives.pop(peer_addr, None)
-        return True
 
     @_session_locked
     def forget_peer_topic_perspective(self, peer_addr: str,
@@ -1298,13 +1064,13 @@ class Session:
         for this peer, so pruning becomes more conservative here, never
         less.
         """
-        tree = self.peer_perspectives.get(peer_addr)
+        tree = self._peer_perspectives.get(peer_addr)
         if not tree:
             return False
         if tree.uuid == topic_uuid:
             # The cache root is the topic itself, so there is nothing left
             # to keep - same case handle_leave has to make.
-            self.peer_perspectives.pop(peer_addr, None)
+            self._peer_perspectives.pop(peer_addr, None)
             return True
         if not self._find_in_tree(tree, topic_uuid):
             return False
@@ -1312,16 +1078,9 @@ class Session:
         self._refresh_tree_hashes(tree)
         return True
 
-    def observed_topic_pairs(self) -> list[tuple[str, str]]:
-        return sorted(
-            (peer_addr, topic_uuid)
-            for peer_addr, topic_uuids in self.observed_topics.items()
-            for topic_uuid in topic_uuids
-        )
-
     def analyze_peer_transitions(self, peer_addr: str,
                                  node_uuid: str | None = None) -> list[dict]:
-        peer_root = self.peer_perspectives.get(peer_addr)
+        peer_root = self._peer_perspectives.get(peer_addr)
         if not peer_root:
             return []
         compare_uuid = node_uuid or peer_root.uuid
@@ -1385,8 +1144,7 @@ class Session:
             revision_origin=child.revision_origin,
             revision_seq=child.revision_seq,
         )
-        return SessionResult("ok", value=self._snapshot_node(child),
-                             effects=self.sync_effects(parent_uuid))
+        return SessionResult("ok", value=self._snapshot_node(child))
 
     @_session_locked
     def modify(self, node_uuid: str, data: dict,
@@ -1453,8 +1211,7 @@ class Session:
         if not result.ok:
             return SessionResult("error", reason=result.reason)
         clone = result.value
-        return SessionResult("ok", value=self._snapshot_node(clone),
-                             effects=self.sync_effects(destination_uuid))
+        return SessionResult("ok", value=self._snapshot_node(clone))
 
     @_session_locked
     def move(self, source_uuid: str, destination_uuid: str) -> SessionResult:
@@ -1520,8 +1277,7 @@ class Session:
             ok=True,
             remove_descendant_duplicates=remove_descendant_duplicates,
         )
-        return SessionResult("ok", value=self._snapshot_node(adopted),
-                             effects=self.sync_effects(adopted.uuid))
+        return SessionResult("ok", value=self._snapshot_node(adopted))
 
     @_session_locked
     def accept_peer_node(
@@ -1746,7 +1502,6 @@ class Session:
         return SessionResult(
             "ok",
             value=changed,
-            effects=self.sync_effects(topic_uuid) if changed else [],
         )
 
     @staticmethod
@@ -1808,51 +1563,37 @@ class Session:
             return None
         return protocol_tree_envelope(node)
 
-    @_session_locked
-    def snapshot_subtree_state(self, node_uuid: str) -> tuple[str, dict] | None:
-        """Return a hash and its exact matching wire snapshot atomically."""
-        node = self._protocol.index.get(node_uuid)
-        if not node:
-            return None
-        return node.state_hash, protocol_tree_envelope(node)
-
     def get_network_info(self) -> dict:
+        # No health or retry state here any more. Reachability was a fact
+        # about a direct connection; a channel that publishes into a slot
+        # and reads back has nothing of the kind to report, and the one
+        # thing there is to say - whether a peer's heartbeat is recent -
+        # belongs to the channel and is added by ChannelManager.network_info.
         return {
             "address": self.address,
             "root_uuid": self._protocol.root.uuid,
             "root_content_hash": self._protocol.root.content_hash,
             "root_state_hash": self._protocol.root.state_hash,
-            "members": sorted(self.members),
             # Siblings are excluded throughout: this view is "who else is on
             # this topic", and another client of mine is not someone else.
             "peer_addresses": sorted(
-                addr for addr in self.peer_perspectives
+                addr for addr in self._peer_perspectives
                 if not self.is_sibling_address(addr)
             ),
             "topic_uuid": self.active_topic_uuid,
-            "topic_uuids": sorted(self.active_topic_uuids),
+            "topic_uuids": sorted(self._active_topic_uuids),
             "peers": {
                 addr: {
                     "content_hash": tree.content_hash,
                     "state_hash": tree.state_hash,
                     "root_uuid": tree.uuid,
-                    "topic_uuid": self.peer_topics.get(addr),
-                    "topic_uuids": sorted(self.peer_topic_sets.get(addr) or []),
-                    "status": self.peer_status.get(addr, self._new_peer_status()),
+                    "topic_uuids": sorted(self._peer_topic_sets.get(addr) or []),
                     "topic_channels": dict(sorted(
                         self.peer_topic_channel.get(addr, {}).items()
                     )),
                 }
-                for addr, tree in self.peer_perspectives.items()
+                for addr, tree in self._peer_perspectives.items()
                 if not self.is_sibling_address(addr)
-            },
-            "peer_status": {
-                addr: self.peer_status.get(addr, self._new_peer_status())
-                for addr in sorted(self.members - {self.address})
-            },
-            "peer_sync": {
-                addr: self.peer_sync_state.get(addr, self._new_peer_sync_state())
-                for addr in sorted(self.members - {self.address})
             },
         }
 
@@ -1861,8 +1602,7 @@ class Session:
     def _operation_result(self, result, changed_uuid: str | None) -> SessionResult:
         if not result.ok:
             return SessionResult("error", reason=result.reason)
-        return SessionResult("ok", value=True,
-                             effects=self.sync_effects(changed_uuid))
+        return SessionResult("ok", value=True)
 
     def trace_event(self, kind: str, *, trace_level: str = "events",
                     **fields: Any) -> None:
@@ -1870,60 +1610,9 @@ class Session:
             kind, required_level=trace_level, **fields,
         )
 
-    def sync_summary(self, peer_addr: str) -> dict[str, Any]:
-        return self._sync_summary_for_topics(
-            peer_addr, self.peer_topic_sets.get(peer_addr) or set(),
-        )
-
-    def _sync_summary_for_topics(
-        self, peer_addr: str, topic_uuids: list[str] | set[str],
-    ) -> dict[str, Any]:
-        topics = {}
-        for topic_uuid in sorted(set(topic_uuids)):
-            topic = self._protocol.index.get(topic_uuid)
-            if not topic:
-                continue
-            topics[topic_uuid] = topic.state_hash
-        sync_hash = stable_hash({"topics": topics})
-        return {
-            "topics": topics,
-            "sync_hash": sync_hash,
-        }
-
-    def pending_sync_effects(self, now: float | None = None) -> list[SessionEffect]:
-        # The periodic sweep: every peer we owe a sync, minus those still in
-        # a retry backoff.
-        return self.sync_effects(respect_retry=True, now=now)
-
-    def record_sync_failure(self, peer_addr: str, reason: str | None = None) -> bool:
-        changed = self.mark_peer_unreachable(peer_addr, reason)
-        state = self.peer_sync_state.setdefault(peer_addr, self._new_peer_sync_state())
-        delay = min(max(float(state.get("retry_delay") or 1.0), 1.0) * 2, 60.0)
-        state["retry_delay"] = delay
-        state["retry_after"] = time.time() + delay
-        return changed
-
-    def _pull_effects_for_peer_summary(self, peer_addr: str, summary: dict) -> list[SessionEffect]:
-        effects = []
-        topics = summary.get("topics") or {}
-        for topic_uuid, topic_state_hash in sorted(topics.items()):
-            self.add_peer(peer_addr, topic_uuid, fetch_from_peer=topic_uuid not in self._protocol.index)
-            if self.cached_peer_topic_state_hash(peer_addr, topic_uuid) != topic_state_hash:
-                channel_kind = self.peer_channel_for_topic(
-                    peer_addr, topic_uuid,
-                )
-                if channel_kind:
-                    effects.append(SessionEffect(
-                        "pull_subtree",
-                        peer_addr,
-                        {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-                        channel_kind=channel_kind,
-                    ))
-        return effects
-
     def _topic_for_node(self, node_uuid: str) -> str | None:
-        topic_uuids = set(self.active_topic_uuids)
-        for topics in self.peer_topic_sets.values():
+        topic_uuids = set(self._active_topic_uuids)
+        for topics in self._peer_topic_sets.values():
             topic_uuids.update(topics)
         for topic_uuid in sorted(topic_uuids):
             if self._is_descendant_or_self(topic_uuid, node_uuid):
@@ -1933,7 +1622,7 @@ class Session:
     def _peer_topic_confirms_deletion(self, peer_addr: str,
                                       topic_uuid: str,
                                       node_uuid: str) -> bool:
-        cache = self.peer_perspectives.get(peer_addr)
+        cache = self._peer_perspectives.get(peer_addr)
         if not cache:
             return False
         topic = self._find_in_tree(cache, topic_uuid)
@@ -1944,76 +1633,6 @@ class Session:
             return True
         return bool(node.deleted)
 
-    def sync_effects(self, changed_uuid: str | None = None,
-                     respect_retry: bool = False,
-                     now: float | None = None) -> list[SessionEffect]:
-        # The one sync-status builder. Two callers, two optional filters:
-        # a local change syncs only the peers on the affected topic
-        # (changed_uuid); the periodic sweep skips peers still backing off
-        # (respect_retry). Everything else - the summary, the
-        # already-delivered check, the effect shape - is common.
-        effects = []
-        changed_topics = set(self._topics_for_change(changed_uuid))
-        if changed_uuid and not changed_topics:
-            return []
-        now = time.time() if now is None else now
-        for peer in sorted(self.members - {self.address}):
-            if changed_topics and not (changed_topics & self.peer_topic_sets.get(peer, set())):
-                continue
-            state = self.peer_sync_state.setdefault(peer, self._new_peer_sync_state())
-            if respect_retry:
-                retry_after = state.get("retry_after")
-                if retry_after is not None and float(retry_after) > now:
-                    continue
-            for channel_kind, channel_topics in sorted(
-                self._topics_by_channel(
-                    peer, self.peer_topic_sets.get(peer) or set(),
-                ).items(),
-            ):
-                summary = self._sync_summary_for_topics(peer, channel_topics)
-                if not summary["topics"]:
-                    continue
-                if summary["sync_hash"] == state.get("last_delivered_sync_hash"):
-                    continue
-                effects.append(self._sync_status_effect(
-                    peer, summary, channel_kind,
-                ))
-        return effects
-
-    def _topics_by_channel(
-        self, peer_addr: str, topic_uuids: list[str] | set[str],
-    ) -> dict[str, list[str]]:
-        grouped: dict[str, list[str]] = {}
-        for topic_uuid in sorted(set(topic_uuids)):
-            channel_kind = self.peer_channel_for_topic(peer_addr, topic_uuid)
-            if channel_kind:
-                grouped.setdefault(channel_kind, []).append(topic_uuid)
-        return grouped
-
-    def _sync_status_effect(
-        self, peer_addr: str, summary: dict[str, Any], channel_kind: str,
-    ) -> SessionEffect:
-        return SessionEffect(
-            "send_sync_status",
-            peer_addr,
-            {
-                "from_addr": self.address,
-                "summary": summary,
-            },
-            channel_kind=channel_kind,
-        )
-
-    def _topics_for_change(self, changed_uuid: str | None) -> list[str]:
-        if not self.active_topic_uuids:
-            return []
-        if not changed_uuid:
-            return sorted(self.active_topic_uuids)
-        return [
-            topic_uuid
-            for topic_uuid in sorted(self.active_topic_uuids)
-            if self._is_descendant_or_self(topic_uuid, changed_uuid)
-        ]
-
     def _is_descendant_or_self(self, root_uuid: str, node_uuid: str) -> bool:
         root = self._protocol.index.get(root_uuid)
         return bool(root and self._find_in_tree(root, node_uuid))
@@ -2021,48 +1640,30 @@ class Session:
     def _remove_peer_topic(self, peer_addr: str | None, topic_uuid: str) -> None:
         if not peer_addr:
             return
-        topics = self.peer_topic_sets.get(peer_addr)
+        topics = self._peer_topic_sets.get(peer_addr)
         if topics is not None:
             topics.discard(topic_uuid)
             if not topics:
-                self.peer_topic_sets.pop(peer_addr, None)
-        fetch_topics = self.peer_fetch_topic_sets.get(peer_addr)
-        if fetch_topics is not None:
-            fetch_topics.discard(topic_uuid)
-            if not fetch_topics:
-                self.peer_fetch_topic_sets.pop(peer_addr, None)
+                self._peer_topic_sets.pop(peer_addr, None)
         self.unbind_peer_topic_channel(peer_addr, topic_uuid)
-        if self.peer_topics.get(peer_addr) == topic_uuid:
-            remaining = sorted(self.peer_topic_sets.get(peer_addr) or [])
-            if remaining:
-                self.peer_topics[peer_addr] = remaining[0]
-            else:
-                self.peer_topics.pop(peer_addr, None)
-        if not self.peer_topic_sets.get(peer_addr):
+        if not self._peer_topic_sets.get(peer_addr):
             # Last topic gone - nothing left to track this peer for.
             self.remove_peer(peer_addr)
 
     @_session_locked
     def remove_peer(self, peer_addr: str) -> None:
         # The single per-peer teardown: every path that stops tracking a
-        # peer (reconnect superseding an old address, handle_leave, the
-        # last-topic case above) goes through here. They used to each pop
-        # their own subset, and the subsets had drifted apart - which is
-        # how stale routing entries survived a leave.
+        # peer (reconnect superseding an old address, the last-topic case
+        # above) goes through here. They used to each pop their own subset,
+        # and the subsets had drifted apart - which is how stale routing
+        # entries survived a departure.
         #
         # peer_identity_key is deliberately NOT cleared: it's knowledge
         # ("this address belongs to identity X"), not registration, and it
-        # stays true after teardown. Clearing it here would erase the very
-        # evidence relay's redundancy check needs to keep suppressing this
-        # address on later polls - the self-erasing-evidence flip-flop.
-        self.peer_topic_sets.pop(peer_addr, None)
-        self.peer_fetch_topic_sets.pop(peer_addr, None)
-        self.peer_topics.pop(peer_addr, None)
-        self.peer_perspectives.pop(peer_addr, None)
-        self.peer_status.pop(peer_addr, None)
-        self.peer_sync_state.pop(peer_addr, None)
+        # stays true after teardown.
+        self._peer_topic_sets.pop(peer_addr, None)
+        self._peer_perspectives.pop(peer_addr, None)
         self.peer_topic_channel.pop(peer_addr, None)
-        self.members.discard(peer_addr)
 
     def remove_peer_topics(
         self, peer_addr: str, topic_uuids: list[str] | set[str] | tuple[str, ...],
@@ -2072,34 +1673,9 @@ class Session:
             self._remove_peer_topic(peer_addr, topic_uuid)
 
     @staticmethod
-    def _message_topic_uuids(message: dict) -> list[str]:
-        topic_uuids = message.get("topic_uuids")
-        if topic_uuids:
-            return sorted(str(uuid) for uuid in set(topic_uuids))
-        topic_uuid = message.get("topic_uuid")
-        return [topic_uuid] if topic_uuid else []
-
-    @staticmethod
     def _snapshot_node(node: ProtocolNode) -> ProtocolNode:
         return ProtocolNode.from_dict(node.to_dict())
 
-    @staticmethod
-    def _new_peer_status() -> dict[str, Any]:
-        return {
-            "state": "online",
-            "failures": 0,
-            "last_seen": None,
-            "last_error": None,
-        }
-
-    @staticmethod
-    def _new_peer_sync_state() -> dict[str, Any]:
-        return {
-            "last_delivered_sync_hash": None,
-            "last_received_sync_hash": None,
-            "retry_after": None,
-            "retry_delay": 1.0,
-        }
 
     @staticmethod
     def _peer_cache_root(peer_addr: str) -> ProtocolNode:
@@ -2145,7 +1721,7 @@ class Session:
         # topics are shared, not a move either peer made, so only content is
         # comparable at that level.
         local_identity = self._local_revision_origin()
-        peer_identity = self.peer_identity_key.get(peer_addr)
+        peer_identity = self._peer_identity_key.get(peer_addr)
         if is_topic_root:
             event_type = self._classify_content(
                 local_node, peer_node, local_identity, peer_identity,
@@ -2167,7 +1743,7 @@ class Session:
     AUTO_ADOPT_MODES = ("always", "never")
 
     def auto_adopt_mode(self, topic_uuid: str, default: str = "always") -> str:
-        stored = self.app_metadata.get("auto_adopt_by_topic", {})
+        stored = self._app_metadata.get("auto_adopt_by_topic", {})
         value = stored.get(topic_uuid) if isinstance(stored, dict) else None
         return value if isinstance(value, str) and value else default
 
@@ -2176,10 +1752,10 @@ class Session:
         permitted = allowed or self.AUTO_ADOPT_MODES
         if mode not in permitted:
             return SessionResult("error", reason=f"unknown auto-adopt mode: {mode}")
-        stored = self.app_metadata.setdefault("auto_adopt_by_topic", {})
+        stored = self._app_metadata.setdefault("auto_adopt_by_topic", {})
         if not isinstance(stored, dict):
             stored = {}
-            self.app_metadata["auto_adopt_by_topic"] = stored
+            self._app_metadata["auto_adopt_by_topic"] = stored
         stored[topic_uuid] = mode
         return SessionResult("ok", value=mode)
 
@@ -2254,7 +1830,7 @@ class Session:
             order = high - 1.0
         elif high is None:
             order = low + 1.0
-        elif low < high:
+        elif high - low >= self.ORDER_GAP_EPSILON:
             order = (low + high) / 2.0
         else:
             # Two peers appending concurrently each pick max+1, so equal
@@ -2266,6 +1842,29 @@ class Session:
         data = dict(node.data)
         data["order"] = order
         return self.modify(node.uuid, data, node.weights)
+
+    @_session_locked
+    def move_child_to_parent_index(
+        self, node_uuid: str, parent_uuid: str, index: int,
+    ) -> SessionResult:
+        """Move a child between parents and place it in fractional order."""
+        node = self._protocol.index.get(node_uuid)
+        parent = self._protocol.index.get(parent_uuid)
+        if node is None:
+            return SessionResult("error", reason="node not found")
+        if parent is None:
+            return SessionResult("error", reason="destination not found")
+        effects = []
+        if node.parent_uuid != parent_uuid:
+            moved = self.move_child(node_uuid, parent_uuid)
+            if moved.status != "ok":
+                return moved
+            effects.extend(moved.effects)
+        placed = self.move_child_to_index(node_uuid, index)
+        if placed.status != "ok":
+            return placed
+        effects.extend(placed.effects)
+        return SessionResult("ok", value=node_uuid, effects=effects)
 
     def _renumber_children(self, siblings: list[ProtocolNode], index: int,
                            node: ProtocolNode) -> SessionResult:
@@ -2362,7 +1961,9 @@ class Session:
 
         out = [describe(self.identity.uuid, self.identity.data, self.address)]
         seen = {self.identity.uuid}
-        addrs = (self.members | set(self.peer_perspectives)) - {self.address}
+        addrs = (
+            set(self._peer_perspectives) | set(self._peer_topic_sets)
+        ) - {self.address}
         for addr in sorted(addr for addr in addrs
                            if not self.is_sibling_address(addr)):
             profile = self.peer_identity(addr)

@@ -5,8 +5,8 @@ Sovereign Protocol (S-Protocol): local-first collaboration in which every
 participant owns an explicit perspective and decides how differences converge.
 
 It provides the protocol tree, Session transition and reaction mechanics,
-application hosting, direct HTTP channels, Local/SFTP mailbox channels, and
-content-addressed blob storage. It contains no product-application policy.
+application hosting, Local/SFTP mailbox channels, and content-addressed
+blob storage. It contains no product-application policy.
 
 ## Quickstart
 

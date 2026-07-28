@@ -17,31 +17,7 @@ class SessionTests(unittest.TestCase):
 
         self.assertEqual(result.status, "ok")
         self.assertEqual(session.active_topic_uuid, topic.uuid)
-        self.assertEqual(session.members, {"si-a"})
 
-    def test_topic_members_excludes_relay_pseudo_addresses(self):
-        # Regression, found live: a relay pseudo-address (e.g. "relay:B")
-        # lives in peer_topic_sets (Session.note_indirect_peer_topic -
-        # deliberate, so kanban's eligibility checks recognize it) but is
-        # never registered via add_peer, specifically to keep it out of
-        # self.members. topic_members used to union in peer_topic_sets
-        # unconditionally, so mentioning that topic anywhere near a real
-        # HTTP join (topic_members_by_topic feeds both the outgoing join
-        # request and handle_join's response) would leak "relay:B" into
-        # self.members via handle_join's blind add_peer loop over whatever
-        # the other side reports - not just on the two sides actually using
-        # that relay channel, but on every peer who later joins that topic.
-        session = Session("si-a")
-        topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
-        session.start_discussion(topic.uuid)
-        session.note_indirect_peer_topic("relay:B", topic.uuid)
-        session.add_peer("si-c", topic.uuid)
-
-        members = session.topic_members(topic.uuid)
-
-        self.assertEqual(members, {"si-a", "si-c"})
-        self.assertNotIn("relay:B", members)
-        self.assertNotIn("relay:B", session.topic_members_by_topic([topic.uuid])[topic.uuid])
 
     def test_start_discussion_allows_multiple_topics(self):
         session = Session("si-a")
@@ -62,66 +38,35 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(session.active_topic_uuids, {first.uuid, second.uuid})
 
-    def test_local_change_returns_sync_status_effects(self):
+    def test_peer_registry_views_are_detached_snapshots(self):
         session = Session("si-a")
-        topic = session.create_child(
-            session.protocol.root.uuid,
-            {"name": "topic"},
-            {},
-        ).value
-        session.start_discussion(topic.uuid)
-        session.add_peer("si-b", topic.uuid)
-        session.bind_peer_topic_channel("si-b", topic.uuid, "http")
+        peer_tree = ProtocolNode({"name": "peer topic"})
+        session.note_indirect_peer_topic("relay:B", peer_tree.uuid)
+        session.apply_peer_subtree("relay:B", peer_tree, None)
 
-        result = session.create_child(topic.uuid, {"name": "child"}, {})
+        topics = session.peer_topic_sets
+        perspectives = session.peer_perspectives
+        topics["relay:B"] = frozenset()
+        perspectives["relay:B"].data["name"] = "changed"
 
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(len(result.effects), 1)
-        self.assertEqual(result.effects[0].type, "send_sync_status")
-        self.assertEqual(result.effects[0].target, "si-b")
         self.assertEqual(
-            result.effects[0].payload["summary"]["topics"][topic.uuid],
-            session.node_state_hash(topic.uuid),
+            session.peer_topic_uuids("relay:B"), (peer_tree.uuid,),
+        )
+        self.assertEqual(
+            session.get_cached_peer_subtree(
+                "relay:B", peer_tree.uuid,
+            ).data["name"],
+            "peer topic",
         )
 
-    def test_successful_sync_response_acknowledges_exact_node_revisions(self):
+    def test_application_metadata_is_namespaced(self):
         session = Session("si-a")
-        topic = session.create_child(
-            session.protocol.root.uuid, {"name": "topic"}, {},
-        ).value
-        child = session.create_child(topic.uuid, {"name": "card"}, {}).value
-        session.start_discussion(topic.uuid)
-        session.add_peer("si-b", topic.uuid)
-        summary = session.sync_summary("si-b")
+        session.application_metadata("one")["selected"] = "a"
 
-        result = session.handle_sync_response("si-b", {
-            "status": "ok",
-            "delivered_sync_hash": summary["sync_hash"],
-            "my_summary": {},
-        })
-
-        self.assertEqual(result.status, "ok")
-        topic = session.protocol.index[topic.uuid]
-        child = session.protocol.index[child.uuid]
-        self.assertTrue(session.peer_observed_node("si-b", topic))
-        self.assertTrue(session.peer_observed_node("si-b", child))
-
-    def test_partial_sync_response_does_not_acknowledge_nodes(self):
-        session = Session("si-a")
-        topic = session.create_child(
-            session.protocol.root.uuid, {"name": "topic"}, {},
-        ).value
-        session.start_discussion(topic.uuid)
-        session.add_peer("si-b", topic.uuid)
-        summary = session.sync_summary("si-b")
-
-        session.handle_sync_response("si-b", {
-            "status": "partial",
-            "delivered_sync_hash": summary["sync_hash"],
-            "my_summary": {},
-        })
-
-        self.assertFalse(session.peer_observed_node("si-b", topic))
+        self.assertEqual(
+            session.application_metadata("one"), {"selected": "a"},
+        )
+        self.assertEqual(session.application_metadata("two"), {})
 
     def test_node_revision_changes_when_node_moves(self):
         session = Session("si-a")
@@ -139,159 +84,6 @@ class SessionTests(unittest.TestCase):
 
         moved = session.protocol.index[child.uuid]
         self.assertNotEqual(before, session.node_revision(moved))
-
-    def test_local_change_outside_topic_does_not_sync_topic_peers(self):
-        session = Session("si-a")
-        topic = session.create_child(
-            session.protocol.root.uuid,
-            {"name": "topic"},
-            {},
-        ).value
-        session.start_discussion(topic.uuid)
-        session.add_peer("si-b", topic.uuid)
-
-        result = session.modify(session.protocol.root.uuid, {"name": "local setting"}, {})
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(result.effects, [])
-
-    def test_peer_can_be_marked_offline_and_recovered(self):
-        session = Session("si-a")
-        session.add_peer("si-b", "topic-1")
-
-        changed = session.mark_peer_unreachable("si-b", "timeout")
-
-        self.assertTrue(changed)
-        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "offline")
-        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["last_error"], "timeout")
-
-        recovered = session.mark_peer_reachable("si-b")
-
-        self.assertTrue(recovered)
-        self.assertEqual(session.get_network_info()["peer_status"]["si-b"]["state"], "online")
-
-    def test_handle_join_ignores_unrelated_members_without_topic_backing(self):
-        # A join request that only names "si-c" via an unrelated/legacy
-        # global member list - not per-topic topic_members - must not
-        # register si-c against this topic. There's no real member data for
-        # topic-1 beyond the joiner itself, and treating an absent topic key
-        # as "fall back to some other list" is exactly the bug that let a
-        # peer from an unrelated topic leak into this one.
-        session = Session("si-a")
-        session.bind_peer_topic_channel("si-b", "topic-1", "http")
-
-        result = session.handle_join({
-            "from_addr": "si-b",
-            "topic_uuid": "topic-1",
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertEqual(session.members, {"si-a", "si-b"})
-        self.assertEqual(session.peer_topics["si-b"], "topic-1")
-        self.assertNotIn("si-c", session.peer_topics)
-        self.assertEqual(
-            [(effect.type, effect.target, effect.payload["node_uuid"])
-             for effect in result.effects],
-            [
-                ("pull_subtree", "si-b", "topic-1"),
-            ],
-        )
-
-    def test_handle_join_uses_members_per_topic(self):
-        session = Session("si-a")
-        session.bind_peer_topics_channel(
-            "si-b", {"topic-1", "topic-2"}, "http",
-        )
-
-        result = session.handle_join({
-            "from_addr": "si-b",
-            "topic_uuids": ["topic-1", "topic-2"],
-            "topic_members": {
-                "topic-1": ["si-c"],
-                "topic-2": ["si-d"],
-            },
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertIn("si-c", session.peer_topic_sets)
-        self.assertIn("si-d", session.peer_topic_sets)
-        self.assertEqual(session.peer_topic_sets["si-c"], {"topic-1"})
-        self.assertEqual(session.peer_topic_sets["si-d"], {"topic-2"})
-        self.assertEqual(
-            [(effect.target, effect.payload["topic_uuid"])
-             for effect in result.effects],
-            [
-                ("si-b", "topic-1"),
-                ("si-b", "topic-2"),
-            ],
-        )
-
-    def test_handle_join_can_limit_pull_topics(self):
-        session = Session("si-a")
-        session.bind_peer_topics_channel(
-            "si-b", {"owned-by-a", "owned-by-b"}, "http",
-        )
-
-        result = session.handle_join({
-            "from_addr": "si-b",
-            "topic_uuids": ["owned-by-a", "owned-by-b"],
-            "pull_topic_uuids": ["owned-by-b"],
-            "topic_members": {
-                "owned-by-a": ["si-a", "si-b"],
-                "owned-by-b": ["si-a", "si-b"],
-            },
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertIn("owned-by-a", session.peer_topic_sets["si-b"])
-        self.assertIn("owned-by-b", session.peer_topic_sets["si-b"])
-        self.assertEqual(
-            [(effect.target, effect.payload["topic_uuid"])
-             for effect in result.effects],
-            [("si-b", "owned-by-b")],
-        )
-        self.assertEqual(
-            session.fetch_topic_uuids("si-b"),
-            ["owned-by-b"],
-        )
-
-    def test_handle_join_preserves_existing_peer_cache(self):
-        session = Session("si-a")
-        cached = ProtocolNode({"name": "cached-topic"})
-        session.apply_peer_subtree("si-b", cached, None)
-        session.bind_peer_topic_channel("si-b", "topic-1", "http")
-
-        result = session.handle_join({
-            "from_addr": "si-b",
-            "topic_uuid": "topic-1",
-            "known_members": [],
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertIsNotNone(session.get_cached_peer_subtree(
-            "si-b",
-            cached.uuid,
-        ))
-        self.assertEqual(result.effects[0].type, "pull_subtree")
-        self.assertEqual(result.effects[0].payload["node_uuid"], "topic-1")
-
-    def test_handle_announce_preserves_existing_peer_cache(self):
-        session = Session("si-a")
-        cached = ProtocolNode({"name": "cached-topic"})
-        session.apply_peer_subtree("si-b", cached, None)
-
-        result = session.handle_announce({
-            "new_addr": "si-b",
-            "topic_uuid": "topic-1",
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertIsNotNone(session.get_cached_peer_subtree(
-            "si-b",
-            cached.uuid,
-        ))
-        self.assertEqual(result.effects, [])
-        self.assertNotIn("si-b", session.members)
 
     def test_accept_topic_invitation_attaches_topic_under_other_perspectives(self):
         inviter = Session("si-a")
@@ -608,8 +400,8 @@ class SessionTests(unittest.TestCase):
         topic = peer.create_child(peer.protocol.root.uuid, {"name": "topic"}, {}).value
         child = peer.create_child(topic.uuid, {"name": "child"}, {}).value
         peer.start_discussion(topic.uuid)
-        peer.add_peer("si-a", topic.uuid)
-        local.add_peer("si-b", topic.uuid)
+        peer.note_indirect_peer_topic("si-a", topic.uuid)
+        local.note_indirect_peer_topic("si-b", topic.uuid)
         local.apply_peer_subtree(
             "si-b",
             ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
@@ -625,7 +417,7 @@ class SessionTests(unittest.TestCase):
             topic.uuid,
         )
 
-        cached_child = local._find_in_tree(local.peer_perspectives["si-b"], child.uuid)
+        cached_child = local.get_cached_peer_subtree("si-b", child.uuid)
         peer_child = peer.protocol.index[child.uuid]
         self.assertTrue(cached_child.deleted)
         self.assertEqual(cached_child.base_hash, peer_child.base_hash)
@@ -633,7 +425,7 @@ class SessionTests(unittest.TestCase):
         # topic hash would never match what the peer reports, causing an
         # endless re-pull loop.
         self.assertEqual(
-            local.cached_peer_topic_state_hash("si-b", topic.uuid),
+            local.get_cached_peer_subtree("si-b", topic.uuid).state_hash,
             peer.protocol.index[topic.uuid].state_hash,
         )
 
@@ -643,7 +435,7 @@ class SessionTests(unittest.TestCase):
         child = local.create_child(topic.uuid, {"name": "child"}, {}).value
         stale_topic = ProtocolNode.from_dict(local.protocol.index[topic.uuid].to_dict())
         local.start_discussion(topic.uuid)
-        local.add_peer("si-b", topic.uuid)
+        local.note_indirect_peer_topic("si-b", topic.uuid)
 
         result = local.delete(child.uuid)
 
@@ -673,160 +465,55 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertNotIn(child.uuid, local.protocol.index)
 
-    def test_leave_returns_transport_effects_and_clears_session(self):
-        session = Session("si-a")
-        session.add_peer("si-b", "topic-1")
-        session.add_peer("si-c", "topic-1")
-        session.bind_peer_topic_channel("si-b", "topic-1", "http")
-        session.bind_peer_topic_channel("si-c", "topic-1", "http")
-
-        result = session.leave()
-
-        self.assertEqual(session.members, {"si-a"})
-        self.assertEqual(session.peer_topics, {})
-        self.assertEqual(
-            sorted((effect.type, effect.target) for effect in result.effects),
-            [
-                ("announce_peer", "si-b"),
-                ("announce_peer", "si-c"),
-                ("send_leave", "si-b"),
-                ("send_leave", "si-c"),
-            ],
-        )
-
-    def test_watch_topic_tracks_pairs_independently_of_membership(self):
-        session = Session("si-a")
-
-        session.watch_topic("si-b", "topic-1")
-        session.watch_topic("si-b", "topic-2")
-        session.watch_topic("si-c", "topic-1")
-
-        self.assertEqual(
-            session.observed_topic_pairs(),
-            [("si-b", "topic-1"), ("si-b", "topic-2"), ("si-c", "topic-1")],
-        )
-        self.assertNotIn("si-b", session.members)
-        self.assertNotIn("si-b", session.peer_topic_sets)
-
-    def test_unwatch_topic_stops_tracking_and_drops_unused_cache(self):
-        session = Session("si-a")
-        peer_topic = session.create_child(session.protocol.root.uuid, {"name": "topic"}, {}).value
-        session.watch_topic("si-b", "topic-1")
-        session.apply_peer_subtree(
-            "si-b",
-            ProtocolNode.from_dict(peer_topic.to_dict()),
-            session.protocol.root.uuid,
-        )
-
-        removed = session.unwatch_topic("si-b", "topic-1")
-
-        self.assertTrue(removed)
-        self.assertEqual(session.observed_topics, {})
-        # Nothing else needs si-b's cache, so it's cleaned up too.
-        self.assertNotIn("si-b", session.peer_perspectives)
-
-    def test_unwatch_topic_keeps_cache_if_still_a_real_peer(self):
-        session = Session("si-a")
-        session.watch_topic("si-b", "topic-1")
-        session.add_peer("si-b", "topic-2")
-        session.peer_perspectives["si-b"] = session.protocol.root
-
-        session.unwatch_topic("si-b", "topic-1")
-
-        self.assertIn("si-b", session.peer_perspectives)
-
-    def test_unwatch_topic_returns_false_when_not_watching(self):
-        session = Session("si-a")
-
-        self.assertFalse(session.unwatch_topic("si-b", "topic-1"))
-
-    def test_leave_clears_observed_topics(self):
-        session = Session("si-a")
-        session.watch_topic("si-b", "topic-1")
-
-        session.leave()
-
-        self.assertEqual(session.observed_topics, {})
 
     def test_leave_topic_removes_only_that_topic(self):
-        session = Session("si-a")
-        session.add_peer("si-b", "topic-1")
-        session.add_peer("si-b", "topic-2")
-        session.add_peer("si-c", "topic-1")
-        session.bind_peer_topics_channel(
-            "si-b", {"topic-1", "topic-2"}, "http",
-        )
-        session.bind_peer_topic_channel("si-c", "topic-1", "http")
-
-        result = session.leave_topic("topic-1")
-
-        self.assertEqual(session.peer_topic_sets["si-b"], {"topic-2"})
-        self.assertNotIn("si-c", session.members)
-        self.assertEqual(
-            sorted((effect.target, effect.payload["topic_uuids"])
-                   for effect in result.effects),
-            [
-                ("si-b", ["topic-1"]),
-                ("si-c", ["topic-1"]),
-            ],
-        )
-
-    def test_leave_topic_does_not_emit_live_effect_for_indirect_peer(self):
+        # Nothing is sent. A peer on a relay learns this side has gone by
+        # its slot going quiet, not by being told.
         session = Session("si-a")
         session.note_indirect_peer_topic("relay:B", "topic-1")
+        session.note_indirect_peer_topic("relay:B", "topic-2")
+        session.note_indirect_peer_topic("relay:C", "topic-1")
+        session.bind_peer_topics_channel(
+            "relay:B", {"topic-1", "topic-2"}, "mailbox",
+        )
+        session.bind_peer_topic_channel("relay:C", "topic-1", "mailbox")
 
         result = session.leave_topic("topic-1")
 
         self.assertEqual(result.effects, [])
-        self.assertNotIn("relay:B", session.peer_topic_sets)
-
-    def test_handle_leave_removes_only_named_topics(self):
-        session = Session("si-a")
-        session.add_peer("si-b", "topic-1")
-        session.add_peer("si-b", "topic-2")
-
-        result = session.handle_leave({
-            "from_addr": "si-b",
-            "topic_uuids": ["topic-1"],
-        })
-
-        self.assertEqual(result.status, "ok")
-        self.assertIn("si-b", session.members)
-        self.assertEqual(session.peer_topic_sets["si-b"], {"topic-2"})
+        self.assertEqual(session.peer_topic_sets["relay:B"], {"topic-2"})
+        self.assertNotIn("relay:C", session.peer_topic_sets)
+        self.assertIsNone(
+            session.peer_channel_for_topic("relay:B", "topic-1"),
+        )
 
     def test_remove_peer_clears_only_that_peer(self):
         session = Session("si-a")
-        session.add_peer("si-b", "topic-1")
-        session.add_peer("si-b", "topic-2")
-        session.add_peer("si-c", "topic-1")
+        session.note_indirect_peer_topic("relay:B", "topic-1")
+        session.note_indirect_peer_topic("relay:B", "topic-2")
+        session.note_indirect_peer_topic("relay:C", "topic-1")
         bob_session = Session("si-b")
         bob_session.set_identity("Bob")
-        session.apply_peer_identity_snapshot("si-b", bob_session.identity.to_dict())
+        session.apply_peer_identity_snapshot("relay:B", bob_session.identity.to_dict())
         session.bind_peer_topics_channel(
-            "si-b", {"topic-1", "topic-2"}, "http",
+            "relay:B", {"topic-1", "topic-2"}, "mailbox",
         )
 
-        session.remove_peer("si-b")
+        session.remove_peer("relay:B")
 
-        self.assertNotIn("si-b", session.members)
-        self.assertNotIn("si-b", session.peer_topic_sets)
-        self.assertNotIn("si-b", session.peer_fetch_topic_sets)
-        self.assertNotIn("si-b", session.peer_topics)
-        self.assertNotIn("si-b", session.peer_perspectives)
-        self.assertNotIn("si-b", session.peer_status)
-        self.assertNotIn("si-b", session.peer_sync_state)
-        self.assertNotIn("si-b", session.peer_topic_channel)
+        self.assertNotIn("relay:B", session.peer_topic_sets)
+        self.assertNotIn("relay:B", session.peer_perspectives)
+        self.assertNotIn("relay:B", session.peer_topic_channel)
         # Unrelated peer untouched.
-        self.assertIn("si-c", session.members)
-        self.assertEqual(session.peer_topic_sets["si-c"], {"topic-1"})
+        self.assertEqual(session.peer_topic_sets["relay:C"], {"topic-1"})
 
     def test_remove_peer_on_unknown_address_is_a_no_op(self):
         session = Session("si-a")
-        session.add_peer("si-b", "topic-1")
+        session.note_indirect_peer_topic("relay:B", "topic-1")
 
         session.remove_peer("si-nobody")
 
-        self.assertIn("si-b", session.members)
+        self.assertIn("relay:B", session.peer_topic_sets)
 
     def test_identity_is_lazily_created_and_stable(self):
         # No KanbanLogic/app involved at all - identity is a Session-owned
@@ -888,7 +575,7 @@ class SessionTests(unittest.TestCase):
             "picture": "",
         })
         peer_profile.refresh_hashes()
-        session.peer_perspectives["si-b"] = peer_profile
+        session.apply_peer_subtree("si-b", peer_profile, None)
 
         found = session.find_peer_identity("key-b")
 
@@ -908,14 +595,14 @@ class SessionTests(unittest.TestCase):
             "display_name": "Bob", "picture": "",
         })
         bob_v1.refresh_hashes()
-        session.peer_perspectives["old-address"] = bob_v1
+        session.apply_peer_subtree("old-address", bob_v1, None)
         bob_v2 = ProtocolNode({
             "type": "shared_user_profile", "name": "public_profile",
             "profile_schema_version": 1, "identity_key": "key-bob",
             "display_name": "Bob", "picture": "",
         })
         bob_v2.refresh_hashes()
-        session.peer_perspectives["new-address"] = bob_v2
+        session.apply_peer_subtree("new-address", bob_v2, None)
 
         found = session.find_peer_identity("key-bob")
 
@@ -974,10 +661,10 @@ class SessionTests(unittest.TestCase):
     def test_remove_peer_keeps_the_identity_registry_entry(self):
         # Knowledge, not registration: tearing down a peer's registration
         # must not erase the fact that its address belongs to an identity -
-        # relay's redundancy check reads exactly this entry on every later
-        # poll to keep the address suppressed.
+        # It stays true after the teardown, and could not be re-learned
+        # from content once forgotten.
         session = Session("si-a")
-        session.add_peer("relay:B", "topic-1")
+        session.note_indirect_peer_topic("relay:B", "topic-1")
         session.set_peer_identity_key("relay:B", "key-bob")
 
         session.remove_peer("relay:B")
@@ -993,7 +680,7 @@ class SessionTests(unittest.TestCase):
             "display_name": "Bob", "picture": "",
         })
         bob.refresh_hashes()
-        session.peer_perspectives["addr-bob"] = bob
+        session.apply_peer_subtree("addr-bob", bob, None)
 
         self.assertEqual(session.peer_identity("addr-bob").data["display_name"], "Bob")
         self.assertIsNone(session.peer_identity("addr-nobody"))
@@ -1055,7 +742,7 @@ class SessionTests(unittest.TestCase):
             session.protocol.root.uuid, {"type": "note", "name": "t"}, {},
         ).value
         child = session.create_child(topic.uuid, {"type": "note_item"}, {}).value
-        session.peer_topic_sets["si-b"] = {topic.uuid}
+        session.note_indirect_peer_topic("si-b", topic.uuid)
 
         self.assertTrue(session.peer_discusses_node("si-b", child.uuid))
         self.assertFalse(session.peer_discusses_node("si-b", "no-such-uuid"))

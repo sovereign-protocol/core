@@ -2,6 +2,35 @@
 
 ## Unreleased
 
+- Core is now version `0.1.4`; Session registries are private, controller
+  result handling is centralized, and pairing/storage capability contracts
+  are explicit.
+- Core `0.1.3` distinguished the connect-token v2 and public
+  API changes from the published `0.1.2` contract. Release-contract snapshots
+  now guard public exports and format versions.
+- The shipped Notes example now uses the host's real asset routes, mounts the
+  shared shell safely, and activates accepted topics.
+- Removed the unused `requests` runtime dependency and its exclusive
+  transitive dependencies from the reviewed inventory.
+- Channel extensibility remains public through explicit management, liveness,
+  blob, persistence, and polling capability protocols. Polling endpoints now
+  own their complete cycle and diagnostics behind `poll_once`; the host only
+  schedules them.
+- **Every topic now has one visible home channel, including the Core
+  identity.** The first channel created becomes the identity home
+  automatically; Manage Channels shows it, lets the user move it, and warns
+  that moving or deleting it breaks earlier invitations. Deleting a channel
+  continues to remove every topic assigned to it.
+  - Connect tokens are now version 2 and carry an explicit topic-to-channel
+    mapping. An invitation can therefore route the identity and application
+    topic through different relay targets without ambiguity; missing or
+    incomplete mappings are rejected.
+  - The profile handler is assignment-scoped like every application topic,
+    and invitation composition no longer moves the identity as a hidden side
+    effect.
+  - Relay presence remains the one-time bootstrap by which an inviter learns
+    who accepted. Once known, later profile changes are accepted only from the
+    identity topic's home channel, so the heartbeat cannot bypass the home.
 - **Several clients for one user, over one publication identity.** A pairing
   token carries the client id, one channel descriptor, every topic the account
   owns and its profile; a client that imports it becomes a copy of its
@@ -124,6 +153,65 @@
   rather than needing one of its own. Polling follows use for the same
   reason: an outstanding invitation to a channel you have stopped using is an
   invitation to a channel you are no longer polling.
+- **The direct HTTP channel is gone.** It needed a routable address between
+  peers - port forwarding or a VPN - which for this project's users is
+  effectively never, and the relay already covers both real cases: SFTP
+  across the internet, a shared folder across a LAN. It was also the one
+  channel that could not have a home for a topic: no assignment, no polling,
+  no publication slot, so every rule in `DESIGN_TOPIC_HOME_CHANNELS.md` would
+  have needed an "…except direct" exception. Two already existed. Deleted:
+  `http_channel.py`, `transport.py`, the `/p2p/*` endpoints,
+  `/api/join_discussion`, `/api/observe_topic`, `/api/unwatch_topic`,
+  `/api/invite_discuss`, `/api/leave`, and the `relay_only` policy that
+  existed only to switch direct HTTP off.
+  - **Session no longer describes how anything moves.** The message handlers
+    (`handle_join`, `handle_announce`, `handle_leave`, `handle_sync_status`,
+    `handle_sync_response`), the sync-effect builders, the observation
+    (`watch_topic`) surface, and the reachability bookkeeping
+    (`members`, `peer_status`, `peer_sync_state`, `peer_fetch_topic_sets`,
+    `peer_topics`) are all gone. What is left is the tree, the peer
+    perspectives cached against it, and the reconciliation between them. A
+    peer relationship is now one flat fact - `peer_topic_sets`: which topics
+    we track it for.
+  - **`SessionEffect` stays, carrying one type.** `release_topic_channels`
+    is an application lifecycle signal, not a message, so `deliver_effects`
+    and every application's `result.effects` contract are unchanged and no
+    application repository needed a production change. `ChannelManager` no
+    longer routes effects at all; `EffectDeliveryChannel` is withdrawn from
+    the public API.
+  - **Reachability is now the channel's answer, not the session's.**
+    Session's network info carried a retry/failure record that only meant
+    anything for a live connection. Whether a peer is reachable is now read
+    from the heartbeat beside its publications, and added by
+    `ChannelManager.network_info`.
+  - **A peer is a publication identity, not a URL.** Peer addresses are
+    `relay:<identity>` throughout. `advertise_host` survives only because
+    the session address is built from it; nobody is told to connect to it.
+  - The Protocol Explorer loses its address-based connect, watch and leave
+    controls - it has no channel of its own to publish over, so it can only
+    ever be an invitee.
+- **Multi-client tests now run over a relay, not an in-process transport.**
+  `MemoryHttpClient` answered a peer's message by calling the other runtime's
+  handler directly. It was instant, and it exercised a route no user takes:
+  direct HTTP needs a routable address between peers, which for this
+  project's users means port forwarding or a VPN. The fixture it replaces
+  (`s-kanban/tests/relay_clients.py`, and smaller equivalents in Core and
+  S-Agreement) gives each client its own relay target on one shared folder
+  and makes the test say when a cycle happens. This is the prerequisite for
+  retiring the direct channel - see `DESIGN_TOPIC_HOME_CHANNELS.md` section
+  3. Three tests changed what they assert, because "no implicit HTTP mesh"
+  is a property of that transport and not of the design: everyone given a
+  topic on a relay sees everyone else publishing it, and has to, or the board
+  shows anonymous authors. What survives, and is now what they check, is that
+  a board shared onward carries only that board.
+- **Fixed: answering a sibling alarm only answered it on one relay.**
+  `sibling_alarms` reports per (topic, relay), but the person is asked once,
+  about their work. `resolve_sibling_alarm` stopped at the first connection
+  holding the alarm, so with the topic on two relays - which is the ordinary
+  state after pairing, since a pairing token carries every relay this client
+  has and puts the whole account on each - the answer was carried out on one
+  and the alarm came back on the next poll. It is now carried out on every
+  connection holding it.
 - **Fixed: a host with no topic could not be given one.** The shell disabled
   the connection button whenever no topic was selected, which on a first run
   is always - and the invite-token form lives behind that button. There was

@@ -11,9 +11,11 @@ this file is ever deleted, Core stops proving that anything other than a
 mock can implement its contract.
 """
 
+import asyncio
 import json
 import tempfile
 import unittest
+from html.parser import HTMLParser
 from pathlib import Path
 
 from sovereign import app_server
@@ -37,6 +39,57 @@ def _runtime(port, directory):
     config = app_server.load_config(None, "notes", EXAMPLE_ALIAS)
     config["storage_file"] = str(Path(directory) / f"{port}.json")
     return app_server.create_runtime(port, config)
+
+
+class _AssetReferences(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.paths = []
+
+    def handle_starttag(self, tag, attrs):
+        values = dict(attrs)
+        path = values.get("href") if tag == "link" else values.get("src")
+        if path:
+            self.paths.append(path)
+
+
+async def _fetch(app, path: str) -> tuple[int, bytes]:
+    sent = []
+    received = False
+
+    async def receive():
+        nonlocal received
+        if received:
+            return {"type": "http.disconnect"}
+        received = True
+        return {"type": "http.request", "body": b"", "more_body": False}
+
+    async def send(message):
+        sent.append(message)
+
+    await app({
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "GET",
+        "scheme": "http",
+        "path": path,
+        "raw_path": path.encode(),
+        "query_string": b"",
+        "root_path": "",
+        "headers": [],
+        "server": ("test", 80),
+        "client": ("test", 1),
+    }, receive, send)
+    status = next(
+        message["status"] for message in sent
+        if message["type"] == "http.response.start"
+    )
+    body = b"".join(
+        message.get("body", b"") for message in sent
+        if message["type"] == "http.response.body"
+    )
+    return status, body
 
 
 class ExampleLogicTests(unittest.TestCase):
@@ -78,6 +131,17 @@ class ExampleLogicTests(unittest.TestCase):
         self.assertEqual(note.parent_uuid, note_list.uuid)
         self.assertIn(note.uuid, session.protocol.index)
 
+    def test_accepting_an_invitation_marks_the_note_list_active(self):
+        source = NotesLogic(Session("http://source"), {})
+        note_list = source.ensure_list()
+        target_session = Session("http://target")
+        target = NotesLogic(target_session, {})
+
+        result = target.accept_invitation(source.session.get_node(note_list.uuid))
+
+        self.assertEqual(result.status, "ok", result.reason)
+        self.assertIn(note_list.uuid, target_session.active_topic_uuids)
+
 
 class ExampleThroughTheHostTests(unittest.TestCase):
     def test_the_host_discovers_the_manifest_and_mounts_the_routes(self):
@@ -92,6 +156,28 @@ class ExampleThroughTheHostTests(unittest.TestCase):
         # Core's own routes must still be there alongside the application's.
         self.assertIn("/api/protocol", paths)
 
+    def test_every_asset_referenced_by_the_installed_page_is_served(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = _runtime(8406, tmp)
+            app = app_server.build_app(runtime)
+            page_status, page_body = asyncio.run(
+                _fetch(app, "/apps/example-notes"),
+            )
+            parser = _AssetReferences()
+            parser.feed(page_body.decode())
+
+            self.assertEqual(page_status, 200)
+            self.assertEqual(set(parser.paths), {
+                "/shared.css",
+                "/shared-api.js",
+                "/shared.js",
+                "/apps/example-notes/styles.css",
+            })
+            for path in parser.paths:
+                status, body = asyncio.run(_fetch(app, path))
+                self.assertEqual(status, 200, path)
+                self.assertTrue(body, path)
+
     def test_the_registration_makes_the_note_list_shareable(self):
         with tempfile.TemporaryDirectory() as tmp:
             runtime = _runtime(8402, tmp)
@@ -105,11 +191,25 @@ class ExampleThroughTheHostTests(unittest.TestCase):
             )
 
     def test_an_invitation_composes_for_the_example_topic(self):
-        with tempfile.TemporaryDirectory() as tmp:
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as relay_root:
             runtime = _runtime(8403, tmp)
             note_list = runtime.logic.ensure_list()
+            # An invitation names a place to publish, so the example needs a
+            # channel before it has one to offer.
+            created = runtime.relay_manager.create_target({
+                "name": "relay", "backend": "local", "root": relay_root,
+            })
+            self.assertEqual(created.status, "ok", created.reason)
+            channel_ref = f"mailbox:{created.value}"
+            used = runtime.collaboration.set_topic_channel(
+                note_list.uuid, channel_ref, True,
+            )
+            self.assertTrue(used.ok, getattr(used, "reason", None))
 
-            result = runtime.collaboration.compose_invitation(note_list.uuid, "http")
+            result = runtime.collaboration.compose_invitation(
+                note_list.uuid, channel_ref,
+            )
 
             self.assertTrue(result.ok, getattr(result, "reason", None))
             self.assertEqual(

@@ -6,7 +6,7 @@ Dependency direction is one-way:
 applications -> public Sovereign Core API
 Core host -> registered application contracts
 Session -> Protocol
-ChannelManager -> direct and mailbox channel implementations
+ChannelManager -> mailbox channel implementation
 mailbox channel -> Local/SFTP storage backends
 ```
 

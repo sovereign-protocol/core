@@ -48,7 +48,9 @@ class NotesLogic:
         ).value
 
     def accept_invitation(self, tree: ProtocolNode) -> SessionResult:
-        return self.session.adopt_subtree(tree, self.session.protocol.root.uuid)
+        return self.session.accept_topic_invitation(
+            tree, self.session.protocol.root.uuid,
+        )
 
     def create_note(self, text: str) -> SessionResult:
         return self.session.create_child(

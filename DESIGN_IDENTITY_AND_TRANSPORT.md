@@ -1,5 +1,14 @@
 # Identity, transport exclusivity, and relay scoping — design doc
 
+> **Partly superseded, 2026-07-28.** The direct HTTP channel has been
+> retired. Everything below about `http` as a *connect* channel — the
+> `/p2p/join` handshake in §1.5, `"offer_http_channel"` and `"relay_only"`
+> in §1.3, transport exclusivity between two live channels — describes a
+> route that no longer exists. What survives, and is now the whole of it, is
+> the relay: §1.4 and §1.6 still hold. Kept as the record of how the
+> identity-not-address rule was arrived at, which outlived the transport it
+> was found in. See `DESIGN_TOPIC_HOME_CHANNELS.md` §3.
+
 Written up from a live-testing session that surfaced three related bugs, all
 tracing back to one root cause: addresses, not identities, are the unit of
 "who is this peer" throughout the stack. Status tags per item: **[DONE]**

@@ -1,15 +1,18 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>Example Notes</title>
-<link rel="stylesheet" href="/assets/shared.css">
-<link rel="stylesheet" href="/assets/notes.css">
-<script src="/assets/shared.js" defer></script>
+<link rel="stylesheet" href="/shared.css">
+<link rel="stylesheet" href="/apps/example-notes/styles.css">
 
 <!--
-  The shell draws the header, the collaboration pane and every dialog. An
-  application supplies its content area and nothing else; that is what keeps
-  chrome identical across applications (DESIGN_UI_CONSISTENCY, U1).
+  The shell draws the header and collaboration pane. The application supplies
+  its content area and the generic confirm-dialog mount points required by the
+  shared script.
 -->
+<div id="toast" class="toast"></div>
+<header>
+  <div id="shell"></div>
+</header>
 <main id="notes">
   <ul id="note-list"></ul>
   <form id="add-note">
@@ -18,9 +21,24 @@
   </form>
 </main>
 
+<dialog id="confirmModal">
+  <form method="dialog">
+    <h2 id="confirmModalTitle"></h2>
+    <p id="confirmModalMessage"></p>
+    <menu>
+      <button type="button" id="confirmModalCancelBtn">Cancel</button>
+      <button type="button" id="confirmModalConfirmBtn" class="danger">Confirm</button>
+    </menu>
+  </form>
+</dialog>
+<script src="/shared-api.js"></script>
+<script src="/shared.js"></script>
 <script>
+  let currentState = {};
+
   async function refresh() {
     const state = await fetch("/api/example-notes/state").then((r) => r.json());
+    currentState = state;
     const list = document.getElementById("note-list");
     list.replaceChildren(...state.notes.map((note) => {
       const item = document.createElement("li");
@@ -43,5 +61,12 @@
     refresh();
   });
 
+  SovereignShell.mount({
+    container: document.querySelector("#shell"),
+    applicationId: "example-notes",
+    topicUuid: () => currentState.list_uuid || "",
+    state: () => currentState,
+    onChanged: () => refresh(),
+  });
   refresh();
 </script>

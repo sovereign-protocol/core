@@ -45,8 +45,8 @@ Layout is unchanged (identical on every backend):
 <root>/identities/<peer_id>/presence.json
 ```
 
-Dependency posture: **no new library needed.** `requests` is already a
-dependency (used in `transport.py`), and it issues custom verbs
+Dependency posture: **one new runtime library would be needed.** `requests`
+is not otherwise used by Core, but it issues custom verbs
 (`requests.request("PROPFIND", …)`); XML responses parse with stdlib
 `xml.etree.ElementTree`.
 

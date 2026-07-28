@@ -22,5 +22,5 @@ def create_application(services: ApplicationServices) -> ApplicationInstance:
         manifest=APPLICATION_MANIFEST,
         logic=logic,
         registration=logic.application_registration(),
-        controllers=tuple(build_routes(logic, services, dict(services.settings))),
+        controllers=tuple(build_routes(logic, services)),
     )

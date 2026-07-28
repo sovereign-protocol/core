@@ -272,42 +272,6 @@ button:hover {
   grid-template-rows: auto auto minmax(0, 1fr);
 }
 
-.observed-topics {
-  display: grid;
-  gap: 4px;
-  padding: 0 10px;
-}
-
-.observed-topics:empty {
-  padding: 0;
-}
-
-.observed-topic-row {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr) auto;
-  align-items: center;
-  gap: 8px;
-  padding: 6px 8px;
-  border: 1px dashed var(--line);
-  border-radius: 6px;
-  margin-bottom: 6px;
-  background: #fbfcfe;
-  font-size: 12px;
-}
-
-.observed-topic-label {
-  min-width: 0;
-  overflow: hidden;
-  color: var(--muted);
-  text-overflow: ellipsis;
-  white-space: nowrap;
-}
-
-.observed-topic-row button {
-  min-height: 24px;
-  padding: 2px 8px;
-  font-size: 12px;
-}
 
 .panel-head {
   position: relative;

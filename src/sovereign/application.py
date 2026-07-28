@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 import re
 from dataclasses import dataclass, replace
@@ -166,7 +167,7 @@ class ApplicationResultView:
     ok: bool
 
 
-def application_result_view(result, deliveries=()) -> ApplicationResultView:
+def application_result_view(result) -> ApplicationResultView:
     if result.status != "ok":
         return ApplicationResultView(
             {"status": "error", "reason": str(result.reason or "unknown error")},
@@ -175,17 +176,20 @@ def application_result_view(result, deliveries=()) -> ApplicationResultView:
     payload: dict[str, JsonValue] = {"status": "ok"}
     if result.value is not None:
         payload["value"] = json_value(result.value)
-    errors = [item for item in deliveries if not item.ok]
-    if errors:
-        payload["delivery_errors"] = [
-            {
-                "effect_type": str(item.effect_type),
-                "target": json_value(item.target),
-                "reason": str(item.reason or "delivery failed"),
-            }
-            for item in errors
-        ]
     return ApplicationResultView(payload, True)
+
+
+async def application_json_response(
+    services, result, *, change_kind: str = "application",
+) -> Any:
+    """Execute application effects, persist changes, and render JSON."""
+    from starlette.responses import JSONResponse
+
+    if result.status == "ok":
+        await asyncio.to_thread(services.deliver_effects, result.effects)
+        services.notify_change(change_kind)
+    view = application_result_view(result)
+    return JSONResponse(view.payload, status_code=200 if view.ok else 409)
 
 
 def json_value(value: Any) -> JsonValue:

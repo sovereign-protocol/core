@@ -265,14 +265,7 @@ const SovereignShell = {
   },
 
   async _post(path, body) {
-    const response = await fetch(path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body || {}),
-    });
-    const value = await response.json().catch(() => ({}));
-    if (!response.ok) throw new Error(value.reason || "Request failed");
-    return value;
+    return SovereignApi.request(path, body || {});
   },
 
   // options: { container, applicationId, topicUuid(), state(), onChanged() }
@@ -1444,6 +1437,7 @@ Object.assign(SovereignShell, {
       '<button type="button" id="shellChannelManagerClose" class="shell-pane-close" aria-label="Close">&times;</button>',
       "</div>",
       '<p class="shell-note">Channels belong to this session and are available to every topic.</p>',
+      '<p id="shellIdentityHomeNote" class="shell-note"></p>',
       '<div id="shellManagedChannelList" class="shell-target-list"></div>',
       '<button type="button" id="shellAddChannelBtn">+ Add channel</button>',
       '<fieldset id="shellChannelForm" class="shell-target-form" hidden>',
@@ -1688,7 +1682,7 @@ Object.assign(SovereignShell, {
     // Core serializes token_version; the channel descriptor carries its own
     // descriptor_version. Testing the wrong one rejects every valid token.
     if (
-      token.token_version !== 1 ||
+      token.token_version !== 2 ||
       !Array.isArray(token.topic_uuids) ||
       !token.topic_uuids.length
     ) {
@@ -1775,7 +1769,7 @@ Object.assign(SovereignShell, {
             }
           },
         ));
-      } else if (channel.type !== "direct") {
+      } else {
         actions.append(this._channelAction(
           "Use for this topic",
           async () => {
@@ -1793,9 +1787,9 @@ Object.assign(SovereignShell, {
       }
       // Only for a channel this topic is actually on. Inviting someone to a
       // channel is a decision to publish here, and that decision is the
-      // "Use for this topic" above - taken first, and revocable from the same
-      // row. A direct connection has nothing to assign, so it always offers.
-      if (channel.in_use || channel.type === "direct") {
+      // "Use for this topic" above - taken first, and revocable from the
+      // same row.
+      if (channel.in_use) {
         actions.append(this._channelAction(
           "Get invitation",
           () => this._copyToken(channel.ref, channel.name),
@@ -1837,6 +1831,16 @@ Object.assign(SovereignShell, {
   _renderManagedChannels() {
     const list = document.getElementById("shellManagedChannelList");
     list.replaceChildren();
+    const homeRef = this._channelCatalog.identity_channel_ref || "";
+    const home = (this._channelCatalog.channels || []).find(
+      (channel) => channel.ref === homeRef,
+    );
+    this._note(
+      "shellIdentityHomeNote",
+      home
+        ? `Your identity's home channel is ${home.name}.`
+        : "Your identity has no home channel. Choose one before inviting.",
+    );
     for (const channel of this._channelCatalog.channels || []) {
       const row = document.createElement("div");
       row.className = "shell-target-row";
@@ -1855,14 +1859,38 @@ Object.assign(SovereignShell, {
         channel.available ? "Available" : "Unavailable",
         channel.available ? "is-available" : "",
       ));
+      if (channel.identity_home) {
+        status.append(this._targetStatus("Identity home", "is-in-use"));
+      }
       const actions = document.createElement("div");
       actions.className = "shell-target-actions";
+      if (!channel.identity_home) {
+        actions.append(this._channelAction(
+          "Use for my identity",
+          () => {
+            const move = () => this._setIdentityHome(channel);
+            if (!homeRef) {
+              move();
+              return;
+            }
+            confirmAction(
+              `Move your identity home to ${channel.name}?`,
+              "People invited through the previous identity channel will"
+              + " no longer see current profile data.",
+              move,
+            );
+          },
+        ));
+      }
       if (channel.removable) {
         actions.append(this._channelAction(
           "Delete",
           () => confirmAction(
             `Delete ${channel.name}?`,
-            "A channel can be deleted only when no topic uses it.",
+            channel.identity_home
+              ? "This is your identity's home. Deleting it breaks previous"
+                + " invitations and removes every topic using the channel."
+              : "Deleting it removes every topic using the channel.",
             () => this._deleteChannel(channel),
           ),
           "danger",
@@ -1953,11 +1981,19 @@ Object.assign(SovereignShell, {
     try {
       const values = this._channelFormValues();
       this._note("shellChannelManagerNote", "Verifying the channel...");
-      await this._post("/api/core/channels", values);
+      const saved = await this._post("/api/core/channels", values);
       this._toggleChannelForm(false);
       await this._refreshChannelManager();
       await this._loadSharing();
-      this._note("shellChannelManagerNote", `${values.name} added.`);
+      const savedRef = `${values.kind}:${saved.value || ""}`;
+      const becameIdentityHome =
+        this._channelCatalog.identity_channel_ref === savedRef;
+      this._note(
+        "shellChannelManagerNote",
+        becameIdentityHome
+          ? `${values.name} added and set as your identity home.`
+          : `${values.name} added.`,
+      );
       await this._changed();
     } catch (error) {
       this._note("shellChannelManagerNote", error.message);
@@ -1972,6 +2008,29 @@ Object.assign(SovereignShell, {
       await this._refreshChannelManager();
       await this._loadSharing();
       this._note("shellChannelManagerNote", `${channel.name} deleted.`);
+      await this._changed();
+    } catch (error) {
+      this._note("shellChannelManagerNote", error.message);
+    }
+  },
+
+  async _setIdentityHome(channel) {
+    const topic = this._channelCatalog.identity_topic_uuid || "";
+    if (!topic) {
+      this._note("shellChannelManagerNote", "Identity topic not found.");
+      return;
+    }
+    try {
+      await this._post(
+        `/api/core/topics/${encodeURIComponent(topic)}/channels`,
+        { channel_ref: channel.ref, action: "use" },
+      );
+      await this._refreshChannelManager();
+      await this._loadSharing();
+      this._note(
+        "shellChannelManagerNote",
+        `${channel.name} is now your identity's home channel.`,
+      );
       await this._changed();
     } catch (error) {
       this._note("shellChannelManagerNote", error.message);

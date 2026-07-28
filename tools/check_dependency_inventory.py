@@ -9,7 +9,7 @@ from pathlib import Path
 from packaging.requirements import Requirement
 
 
-ROOTS = ("paramiko", "requests", "starlette", "uvicorn")
+ROOTS = ("paramiko", "starlette", "uvicorn")
 
 
 def normalized(value: str) -> str:

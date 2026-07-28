@@ -14,7 +14,7 @@ The following versions are independent and must not share a wire field:
 | Python distribution | `0.1.0` | implemented |
 | Protocol tree envelope | `protocol_schema_version: 2` | implemented |
 | Session persistence envelope | `format: sovereign-session`, `version: 1` | implemented |
-| Connect token | `token_version: 1` | implemented |
+| Connect token | `token_version: 2` | implemented |
 | Channel descriptor | `descriptor_version: 1` | implemented |
 | Core public-profile schema | `profile_schema_version: 1` | implemented |
 | Application data schema | owned and versioned by each application | implemented |

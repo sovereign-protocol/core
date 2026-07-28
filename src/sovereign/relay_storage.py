@@ -11,7 +11,7 @@ Offered API:
   LocalFolderRelayStorage(root)
   SftpRelayStorage(host, username, remote_root, port=22, password=None,
                    private_key_path=None, private_key_passphrase=None)
-    Both implement the same nine methods:
+    Both satisfy RelayStorage, including:
     write_snapshot(topic_uuid, peer_id, state_hash, payload)
     read_head(topic_uuid, peer_id) -> dict | None
     read_snapshot(topic_uuid, peer_id, state_hash) -> dict | None
@@ -33,6 +33,8 @@ Offered API:
     timing_probe() -> tuple[float | None, float]
       Returns relay-server mtime and one metadata-request roundtrip using a
       temporary probe that is removed before the call returns.
+    close() -> None
+      Releases any persistent backend connection.
 
 Used API:
   LocalFolderRelayStorage: Python standard library only.
@@ -68,6 +70,7 @@ import time
 import uuid as uuid_mod
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Protocol, runtime_checkable
 
 from .blob_store import blob_hex, blob_id_for
 
@@ -76,11 +79,50 @@ def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
 
 
+@runtime_checkable
+class RelayStorage(Protocol):
+    """Storage contract required by one relay polling endpoint."""
+
+    mtime_resolution_seconds: float
+
+    def write_snapshot(
+        self, topic_uuid: str, peer_id: str, state_hash: str,
+        payload: dict, blob_ids: set[str] | None = None,
+    ) -> None: ...
+
+    def verify_access(self) -> None: ...
+    def write_blob(self, blob_id: str, data: bytes) -> None: ...
+    def read_blob(self, blob_id: str) -> bytes | None: ...
+    def has_blob(self, blob_id: str) -> bool: ...
+    def list_blob_ids(self) -> list[str]: ...
+    def write_blob_lease(
+        self, blob_id: str, peer_id: str, payload: dict,
+    ) -> None: ...
+    def delete_blob_lease(self, blob_id: str, peer_id: str) -> None: ...
+    def list_blob_leases(self) -> dict[str, list[dict]]: ...
+    def read_head(self, topic_uuid: str, peer_id: str) -> dict | None: ...
+    def read_snapshot(
+        self, topic_uuid: str, peer_id: str, state_hash: str,
+    ) -> dict | None: ...
+    def list_peers(self, topic_uuid: str) -> list[str]: ...
+    def list_topics(self) -> list[str]: ...
+    def delete_topic(self, topic_uuid: str) -> None: ...
+    def write_presence(self, peer_id: str, payload: dict) -> float | None: ...
+    def read_presence_with_mtime(
+        self, peer_id: str,
+    ) -> tuple[dict | None, float | None]: ...
+    def timing_probe(self) -> tuple[float | None, float]: ...
+    def close(self) -> None: ...
+
+
 class LocalFolderRelayStorage:
     mtime_resolution_seconds = 0.001
 
     def __init__(self, root: str):
         self.root = Path(root)
+
+    def close(self) -> None:
+        """Local filesystem storage owns no persistent connection."""
 
     def write_snapshot(self, topic_uuid: str, peer_id: str, state_hash: str,
                        payload: dict, blob_ids: set[str] | None = None) -> None:
@@ -300,6 +342,9 @@ class SftpRelayStorage:
         # Relay polling and diagnostic/API reads can run in different worker
         # threads, so every operation on this shared connection is serialized.
         self._operation_lock = threading.RLock()
+
+    def close(self) -> None:
+        self._reset_connection()
 
     def write_snapshot(self, topic_uuid: str, peer_id: str, state_hash: str,
                        payload: dict, blob_ids: set[str] | None = None) -> None:

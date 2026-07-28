@@ -765,9 +765,8 @@ class PairingTokenTests(unittest.TestCase):
             / "src" / "sovereign" / "assets" / "shared.js"
         ).read_text(encoding="utf-8")
 
-        self.assertIn(
-            'if (channel.in_use || channel.type === "direct") {', shared_js,
-        )
+        self.assertIn("if (channel.in_use) {", shared_js)
+        self.assertNotIn('"direct"', shared_js)
         self.assertIn('"Get invitation"', shared_js)
         self.assertNotIn('"Get token"', shared_js)
 
@@ -777,13 +776,25 @@ class PairingTokenTests(unittest.TestCase):
             token = desktop.collaboration.compose_pairing_token().value
             self.assertEqual(token["token_kind"], "pairing")
 
+    def test_manage_channels_exposes_identity_home_and_consequence_warnings(self):
+        shared_js = (
+            Path(__file__).resolve().parents[1]
+            / "src" / "sovereign" / "assets" / "shared.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn('"Identity home"', shared_js)
+        self.assertIn('"Use for my identity"', shared_js)
+        self.assertIn("breaks previous", shared_js)
+        self.assertIn("removes every topic", shared_js)
+        self.assertIn("token.token_version !== 2", shared_js)
+
     def test_the_pairing_path_refuses_a_connection_token(self):
         with tempfile.TemporaryDirectory() as relay_root, \
                 tempfile.TemporaryDirectory() as state_dir:
             client = self.runtime(8817, "client", state_dir, relay_root)
 
             refused = client.collaboration.accept_pairing_token(
-                {"token_version": 1, "identity": {}, "topic_uuids": []},
+                {"token_version": 2, "identity": {}, "topic_uuids": []},
             )
 
             self.assertFalse(refused.ok)
@@ -883,6 +894,124 @@ class SiblingAlarmOverTheServiceTests(unittest.TestCase):
             )
             self.assertEqual(
                 laptop.collaboration.sibling_alarms_payload()["alarms"], [],
+            )
+
+
+class AlarmOnTwoConnectionsTests(unittest.TestCase):
+    """One topic, two relays, one decision.
+
+    `sibling_alarms` enumerates per (topic, relay_identity), so a topic
+    carried by two connections is reported twice; the decision the person
+    takes is about the topic, and has to reach every connection holding it.
+    Reachable through `pair_all_topics`, which deliberately puts every topic
+    of this account on the connection regardless of target assignment.
+    """
+
+    def runtime(self, roots, state_dir, port, name):
+        directory = tempfile.TemporaryDirectory()
+        runtime = app_server.create_runtime(port, {
+            "applications": [],
+            "storage_file": str(Path(directory.name) / f"{name}.json"),
+            "relay_root": roots[0],
+            "relay_identity": "USER",
+            "relay_state_file": str(Path(state_dir) / f"state-{name}.json"),
+            "relay_state_directory": str(Path(state_dir) / name),
+        })
+        runtime._test_tmp = directory
+        runtime._topics = register_notes_app(runtime.session)
+        manager = runtime.relay_manager
+        for root in roots[1:]:
+            created = manager.create_target({"backend": "local", "root": root})
+            self.assertEqual(created.status, "ok", created.reason)
+        for connection in manager.all_connections():
+            connection.pair_all_topics()
+        return runtime
+
+    def tick(self, runtime):
+        for connection in runtime.relay_manager.all_connections():
+            connection.write_presence()
+            connection.poll_and_apply()
+            connection.publish_due_topics()
+
+    def diverged_pair(self, roots, state_dir):
+        desktop = self.runtime(roots, state_dir, 8811, "desktop")
+        topic = desktop.session.create_child(
+            desktop.session.root_uuid(), {"type": "notes", "name": "plan"}, {},
+        ).value
+        desktop._topics.append(topic)
+        note = desktop.session.create_child(
+            topic.uuid, {"type": "note", "name": "first", "text": "start"}, {},
+        ).value
+        self.tick(desktop)
+
+        laptop = self.runtime(roots, state_dir, 8812, "laptop")
+        laptop._topics.append(topic)
+        for connection in laptop.relay_manager.all_connections():
+            connection.mark_topics_desired([topic.uuid])
+        self.tick(laptop)
+
+        def rewrite(runtime, text):
+            node = runtime.session.protocol.index[note.uuid]
+            runtime.session.modify(
+                note.uuid, {**node.data, "text": text}, node.weights,
+            )
+
+        rewrite(laptop, "edited on the plane")   # never published
+        rewrite(desktop, "edited at home")
+        self.tick(desktop)
+        self.tick(laptop)
+        return desktop, laptop, topic, note
+
+    def test_the_alarm_is_raised_on_every_connection_holding_the_topic(self):
+        with tempfile.TemporaryDirectory() as first, \
+                tempfile.TemporaryDirectory() as second, \
+                tempfile.TemporaryDirectory() as state_dir:
+            _desktop, laptop, topic, _note = self.diverged_pair(
+                (first, second), state_dir,
+            )
+
+            alarms = laptop.relay_manager.sibling_alarms()
+
+            self.assertEqual(
+                [item["topic_uuid"] for item in alarms], [topic.uuid] * 2,
+            )
+
+    def test_keeping_the_local_version_clears_both_alarms(self):
+        with tempfile.TemporaryDirectory() as first, \
+                tempfile.TemporaryDirectory() as second, \
+                tempfile.TemporaryDirectory() as state_dir:
+            _desktop, laptop, topic, note = self.diverged_pair(
+                (first, second), state_dir,
+            )
+
+            kept = laptop.relay_manager.resolve_sibling_alarm(
+                topic.uuid, "keep_local",
+            )
+
+            self.assertEqual(kept.status, "ok", kept.reason)
+            self.assertEqual(laptop.relay_manager.sibling_alarms(), [])
+            self.assertEqual(
+                laptop.session.protocol.index[note.uuid].data["text"],
+                "edited on the plane",
+            )
+
+    def test_taking_the_sibling_version_clears_both_alarms(self):
+        with tempfile.TemporaryDirectory() as first, \
+                tempfile.TemporaryDirectory() as second, \
+                tempfile.TemporaryDirectory() as state_dir:
+            _desktop, laptop, topic, note = self.diverged_pair(
+                (first, second), state_dir,
+            )
+
+            taken = laptop.relay_manager.resolve_sibling_alarm(
+                topic.uuid, "take_sibling",
+            )
+
+            self.assertEqual(taken.status, "ok", taken.reason)
+            self.assertEqual(laptop.relay_manager.sibling_alarms(), [])
+            self.assertEqual(
+                laptop.session.protocol.index[note.uuid].data["text"],
+                "edited at home",
             )
 
 

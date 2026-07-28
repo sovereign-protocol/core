@@ -146,14 +146,14 @@ class ApplicationHostTests(unittest.TestCase):
         )
         with patch.dict(sys.modules, {"test_notes": module}):
             host = ApplicationHost(_services(session), ["test_notes"])
-            self.assertEqual(session.registered_application_ids(), ("notes",))
+            self.assertEqual(tuple(sorted(host.instances)), ("notes",))
             self.assertEqual(
                 [route.path for route in host.controller_routes()],
                 ["/api/notes/ping"],
             )
             host.deactivate("notes")
 
-        self.assertEqual(session.registered_application_ids(), ())
+        self.assertEqual(tuple(sorted(host.instances)), ())
         self.assertEqual(host.controller_routes(), [])
         self.assertIsNotNone(session.get_subtree(topic.uuid))
         self.assertEqual(closed, [True])
@@ -170,7 +170,7 @@ class ApplicationHostTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "already handled"):
                 host.activate("test_second")
 
-        self.assertEqual(session.registered_application_ids(), ("first",))
+        self.assertEqual(tuple(sorted(host.instances)), ("first",))
 
     def test_activation_rejects_duplicate_application_id(self):
         session = Session("http://a")
@@ -184,7 +184,7 @@ class ApplicationHostTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "already active"):
                 host.activate("test_notes_duplicate")
 
-        self.assertEqual(session.registered_application_ids(), ("notes",))
+        self.assertEqual(tuple(sorted(host.instances)), ("notes",))
 
     def test_activation_mounts_matching_topic_cached_before_app_loaded(self):
         session = Session("http://a")

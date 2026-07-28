@@ -14,9 +14,6 @@
       </div>
       <div class="toolbar">
         <span id="statusText" class="top-status">Loading</span>
-        <button id="buildTokenBtn">Build token for topic</button>
-        <button id="connectTokenBtn">Connect via token</button>
-        <button id="leaveBtn">Leave</button>
       </div>
     </header>
 
@@ -46,7 +43,6 @@
             <h2>Known Perspectives</h2>
           </div>
         </div>
-        <div id="observedTopics" class="observed-topics"></div>
         <div id="peers" class="peers"></div>
       </aside>
 
@@ -160,11 +156,10 @@
       function render() {
         const network = appState.network;
         el("statusText").textContent =
-          `${network.address} | peers ${network.members.length - 1}` +
+          `${network.address} | peers ${network.peer_addresses.length}` +
           (network.topic_uuid ? ` | topic ${short(network.topic_uuid)}` : "");
         renderNetworkPeers();
         el("tree").replaceChildren(renderNode(appState.root, 0, "local", null));
-        renderObservedTopics();
         renderPeers();
         renderSelectedDetails();
         syncLayoutOffsets();
@@ -174,7 +169,7 @@
         const area = el("networkPeers");
         area.replaceChildren();
         const network = appState.network || {};
-        const peers = new Set([...(network.members || []), ...Object.keys(network.peers || {})]);
+        const peers = new Set([...(network.peer_addresses || []), ...Object.keys(network.peers || {})]);
         peers.delete(network.address);
         if (!peers.size) {
           area.append(textChip("No connected peers"));
@@ -344,7 +339,10 @@
       }
 
       function discussionMembers() {
-        const members = appState.network.members || [appState.network.address];
+        const members = [
+          appState.network.address,
+          ...(appState.network.peer_addresses || []),
+        ];
         return [...members].sort((a, b) => {
           if (a === appState.network.address) return -1;
           if (b === appState.network.address) return 1;
@@ -380,35 +378,6 @@
         return Boolean(findNode(topic, nodeUuid));
       }
 
-      function renderObservedTopics() {
-        const container = el("observedTopics");
-        container.replaceChildren();
-        const entries = Object.entries(appState.observed_topics || {});
-        for (const [addr, topicUuids] of entries) {
-          for (const topicUuid of topicUuids) {
-            const row = document.createElement("div");
-            row.className = "observed-topic-row";
-            const label = document.createElement("span");
-            label.className = "observed-topic-label";
-            label.textContent = `Watching ${peerLabel(addr)} - ${short(topicUuid)}`;
-            label.title = `${addr}\n${topicUuid}`;
-            const unwatchBtn = document.createElement("button");
-            unwatchBtn.type = "button";
-            unwatchBtn.textContent = "Unwatch";
-            unwatchBtn.onclick = async () => {
-              try {
-                await api("/api/unwatch_topic", { address: addr, topic_uuid: topicUuid });
-                log("Stopped watching");
-                await loadState(true);
-              } catch (error) {
-                log(error.message, true);
-              }
-            };
-            row.append(label, unwatchBtn);
-            container.append(row);
-          }
-        }
-      }
 
       function renderPeers() {
         const peers = el("peers");
@@ -645,22 +614,9 @@
       return match ? match[1] : text.replace(/^https?:\/\//, "") || "peer";
     }
 
-    function decodeConnectToken(token) {
-      const payload = JSON.parse(atob(token.trim()));
-      if (!payload.address || !Array.isArray(payload.topic_uuids) || !payload.topic_uuids.length) {
-        throw new Error("Invalid token");
-      }
-      return payload;
-    }
-
-    function encodeConnectToken(address, topicUuids) {
-      return btoa(JSON.stringify({ address, topic_uuids: topicUuids }));
-    }
-
     function peerStatus(address) {
-      return appState.network?.peer_status?.[address]
-        || appState.network?.peers?.[address]?.status
-        || {state: "online", failures: 0, last_error: null};
+      return appState.network?.peers?.[address]?.status
+        || {state: "online", last_error: null};
     }
 
       function weightSummary(weights) {
@@ -920,68 +876,6 @@
         }
       };
 
-      el("buildTokenBtn").onclick = () =>
-        openModal(
-          "Build token for topic",
-          [
-            { name: "address", label: "Peer address", value: "http://127.0.0.1:8001" },
-            { name: "topic", label: "Topic UUID (the board's top topic)", value: "" },
-            {
-              name: "readOnly",
-              label: "read-only",
-              type: "checkbox",
-            },
-          ],
-          async (form) => {
-            const address = form.get("address").trim();
-            const topicUuid = form.get("topic").trim();
-            if (!topicUuid) throw new Error("Topic UUID is required");
-            const readOnly = form.get("readOnly") === "on";
-            const token = encodeConnectToken(address, [topicUuid]);
-            await navigator.clipboard.writeText(token);
-            await api(readOnly ? "/api/observe_topic" : "/api/join_discussion", {
-              address,
-              topic_uuids: [topicUuid],
-            });
-            log(
-              readOnly
-                ? "Token copied - watching read-only"
-                : "Token copied and perspective fetched - watch the tree for changes over time",
-            );
-          },
-        );
-
-      el("connectTokenBtn").onclick = () =>
-        openModal(
-          "Connect via token",
-          [
-            { name: "token", label: "Invitation token", multiline: true },
-            {
-              name: "readOnly",
-              label: "read-only",
-              type: "checkbox",
-            },
-          ],
-          async (form) => {
-            const payload = decodeConnectToken(form.get("token"));
-            const readOnly = form.get("readOnly") === "on";
-            await api(readOnly ? "/api/observe_topic" : "/api/join_discussion", {
-              address: payload.address,
-              topic_uuids: payload.topic_uuids,
-            });
-            log(readOnly ? "Watching perspective (read-only)" : "Connected");
-          },
-        );
-
-      el("leaveBtn").onclick = async () => {
-        try {
-          await api("/api/leave", {});
-          log("Left discussion");
-          await loadState(true);
-        } catch (error) {
-          log(error.message, true);
-        }
-      };
 
       setInterval(() => {
         loadState(true);

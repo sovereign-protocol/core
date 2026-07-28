@@ -10,7 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Iterable
 
-from .channel import ChannelManager, ChannelResult
+from .channel import (
+    ChannelManager, ChannelResult, ManagedChannel, PairingChannel,
+)
 
 
 @dataclass(frozen=True)
@@ -51,24 +53,30 @@ class CollaborationService:
         return self._channels.peer_liveness_for_address(peer_addr, topic_uuid)
 
     def execute_effects(self, effects: Iterable[Any]) -> list[Any]:
-        """Execute application results without exposing channel machinery."""
-        ordinary = []
+        """Execute application results without exposing channel machinery.
+
+        One effect type reaches here, and it is a lifecycle signal rather
+        than a message: releasing a topic's channels when its sharing ends.
+        Nothing else is carried, because no channel sends anything on a
+        caller's schedule any more - a mailbox publishes and polls on its
+        own. Unknown effects are ignored rather than refused, so an
+        application that grows one does not break on a Core that has not
+        learned it yet.
+        """
         deliveries = []
         for effect in effects:
-            if getattr(effect, "type", "") == self.RELEASE_TOPIC_EFFECT:
-                topic_uuid = str(
-                    (getattr(effect, "payload", {}) or {}).get("topic_uuid")
-                    or getattr(effect, "target", "")
-                    or ""
-                ).strip()
-                if topic_uuid:
-                    released = self.release_topic(topic_uuid)
-                    if released.ok and released.value:
-                        deliveries.extend(released.value)
+            if getattr(effect, "type", "") != self.RELEASE_TOPIC_EFFECT:
                 continue
-            ordinary.append(effect)
-        if ordinary:
-            deliveries.extend(self._channels.execute_effects(ordinary))
+            topic_uuid = str(
+                (getattr(effect, "payload", {}) or {}).get("topic_uuid")
+                or getattr(effect, "target", "")
+                or ""
+            ).strip()
+            if not topic_uuid:
+                continue
+            released = self.release_topic(topic_uuid)
+            if released.ok and released.value:
+                deliveries.extend(released.value)
         return deliveries
 
     def release_topic(self, topic_uuid: str) -> ChannelResult:
@@ -84,17 +92,28 @@ class CollaborationService:
     def channels_payload(self) -> dict:
         channel_types = []
         instances = []
+        identity_uuid = self.session.identity.uuid
         for channel in self._channels.channels():
-            descriptor = getattr(channel, "management_descriptor", None)
-            if not descriptor:
+            if not isinstance(channel, ManagedChannel):
                 continue
-            described = descriptor()
+            described = channel.management_descriptor()
             channel_types.extend(described.get("types") or [])
-            instances.extend(described.get("instances") or [])
+            instances.extend({
+                **instance,
+                "identity_home": identity_uuid
+                in set(instance.get("topic_uuids") or []),
+            } for instance in (described.get("instances") or []))
+        identity_channel_ref = next((
+            str(instance.get("ref") or "")
+            for instance in instances
+            if instance.get("identity_home")
+        ), "")
         return {
             "status": "ok",
             "types": channel_types,
             "channels": instances,
+            "identity_topic_uuid": identity_uuid,
+            "identity_channel_ref": identity_channel_ref,
         }
 
     def topic_sharing_payload(self, topic_uuid: str) -> ChannelResult:
@@ -124,9 +143,8 @@ class CollaborationService:
 
         bindings = []
         for channel in self._channels.channels():
-            topic_bindings = getattr(channel, "topic_bindings", None)
-            if topic_bindings:
-                bindings.extend(topic_bindings(topic_uuid))
+            if isinstance(channel, ManagedChannel):
+                bindings.extend(channel.topic_bindings(topic_uuid))
         return ChannelResult.success({
             "status": "ok",
             "topic_uuid": topic_uuid,
@@ -179,10 +197,9 @@ class CollaborationService:
             options = {"instance_id": instance_id} if instance_id else {}
             return channel.attach_topics((topic_uuid,), options)
         if instance_id:
-            detach_instance = getattr(channel, "detach_instance_topics", None)
-            if not detach_instance:
+            if not isinstance(channel, ManagedChannel):
                 return ChannelResult.error("channel instance cannot be detached", 400)
-            return detach_instance((topic_uuid,), instance_id)
+            return channel.detach_instance_topics((topic_uuid,), instance_id)
         return channel.detach_topics((topic_uuid,))
 
     def compose_invitation(
@@ -196,14 +213,40 @@ class CollaborationService:
         channel, instance_id = self._channel_instance(channel_ref)
         if not channel:
             return ChannelResult.error("channel not found", 404)
-        options = {}
-        if instance_id:
-            options[channel.kind] = {"target_id": instance_id}
-        elif channel.kind == "http":
-            options[channel.kind] = {}
-        else:
+        if not instance_id:
             return ChannelResult.error("channel instance is required", 400)
-        return self._channels.compose_token((topic_uuid,), options)
+        topic_home = self._topic_home(topic_uuid)
+        if (
+            not topic_home
+            or topic_home[0] is not channel
+            or topic_home[1] != instance_id
+        ):
+            return ChannelResult.error(
+                "use this channel for the topic before inviting anyone to it",
+                409,
+            )
+        identity_uuid = self.session.identity.uuid
+        identity_home = self._topic_home(identity_uuid)
+        if not identity_home:
+            return ChannelResult.error(
+                "choose a home channel for your identity in Manage Channels"
+                " before inviting",
+                409,
+            )
+        identity_channel, identity_instance_id = identity_home
+        return self._channels.compose_token(
+            (topic_uuid,),
+            {
+                topic_uuid: {
+                    "kind": channel.kind,
+                    "target_id": instance_id,
+                },
+                identity_uuid: {
+                    "kind": identity_channel.kind,
+                    "target_id": identity_instance_id,
+                },
+            },
+        )
 
     def accept_invitation(self, token: dict) -> ChannelResult:
         return self._channels.accept_token(token)
@@ -211,28 +254,22 @@ class CollaborationService:
     # ---- pairing -------------------------------------------------------
 
     def compose_pairing_token(self, target_id: str = "") -> ChannelResult:
-        manager = self._relay_manager()
-        if not manager:
+        channel = self._pairing_channel()
+        if not channel:
             return ChannelResult.error("no mailbox channel", 404)
-        result = manager.compose_pairing_token(target_id)
-        if result.status != "ok":
-            return ChannelResult.error(result.reason or "could not pair", 409)
-        return ChannelResult.success(result.value)
+        return channel.compose_pairing_token(target_id)
 
     def accept_pairing_token(self, token: dict) -> ChannelResult:
-        manager = self._relay_manager()
-        if not manager:
+        channel = self._pairing_channel()
+        if not channel:
             return ChannelResult.error("no mailbox channel", 404)
-        result = manager.accept_pairing_token(token or {})
-        if result.status != "ok":
-            return ChannelResult.error(result.reason or "could not pair", 409)
-        return ChannelResult.success(result.value)
+        return channel.accept_pairing_token(token or {})
 
     # ---- sibling alarms ------------------------------------------------
 
-    def _relay_manager(self):
+    def _pairing_channel(self):
         channel = self._channels.channel("mailbox")
-        return getattr(channel, "manager", None) if channel else None
+        return channel if isinstance(channel, PairingChannel) else None
 
     def sibling_alarms_payload(self) -> dict:
         """Topics where another client of this user published something that
@@ -242,8 +279,8 @@ class CollaborationService:
         application's to ask. The title is included because "one of your
         topics" is not something a person can act on.
         """
-        manager = self._relay_manager()
-        alarms = manager.sibling_alarms() if manager else []
+        channel = self._pairing_channel()
+        alarms = channel.sibling_alarms() if channel else []
         described = []
         for alarm in alarms:
             node = self.session.get_node(alarm["topic_uuid"])
@@ -256,24 +293,28 @@ class CollaborationService:
 
     def resolve_sibling_alarm(self, topic_uuid: str,
                               decision: str) -> ChannelResult:
-        manager = self._relay_manager()
-        if not manager:
+        channel = self._pairing_channel()
+        if not channel:
             return ChannelResult.error("no mailbox channel", 404)
-        result = manager.resolve_sibling_alarm(topic_uuid, decision)
-        if result.status != "ok":
-            return ChannelResult.error(result.reason or "could not resolve", 409)
-        return ChannelResult.success(result.value)
+        return channel.resolve_sibling_alarm(topic_uuid, decision)
 
     def _managed_channel(self, kind: Any):
         channel = self._channels.channel(str(kind or "").strip())
-        return channel if channel and hasattr(channel, "management_descriptor") else None
+        return channel if isinstance(channel, ManagedChannel) else None
 
     def _channel_instance(self, channel_ref: str):
-        normalized = str(channel_ref or "").strip()
-        if normalized == "http":
-            return self._channels.channel("http"), ""
-        kind, separator, instance_id = normalized.partition(":")
-        if not separator:
+        # Every channel is an instance of a managed kind now, so a bare kind
+        # names nothing to publish into.
+        kind, separator, instance_id = str(channel_ref or "").strip().partition(":")
+        if not separator or not instance_id:
             return None, ""
-        channel = self._managed_channel(kind)
-        return channel, instance_id
+        return self._managed_channel(kind), instance_id
+
+    def _topic_home(self, topic_uuid: str):
+        for channel in self._channels.channels():
+            if not isinstance(channel, ManagedChannel):
+                continue
+            for binding in channel.topic_bindings(topic_uuid):
+                if binding.get("in_use") and binding.get("id"):
+                    return channel, str(binding["id"])
+        return None

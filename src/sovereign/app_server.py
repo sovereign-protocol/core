@@ -3,8 +3,8 @@
 Application server component.
 
 Functionality:
-  Bind the Core HTTP surface, explicit applications, persistence, Session,
-  and transport services.
+  Bind the Core HTTP surface, explicit applications, Session, and transport
+  services. Persistence mechanics live in persistence.py.
   Protocol meaning stays in protocol.py/session.py. Browsers learn about
   changes by polling - there is no push channel.
 
@@ -34,7 +34,6 @@ import os
 import sys
 import threading
 import time
-import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from importlib.resources import files
@@ -47,12 +46,10 @@ from starlette.requests import Request
 from starlette.responses import HTMLResponse, JSONResponse, Response
 from starlette.routing import Route
 
-from .protocol import ProtocolNode, UnsupportedProtocolVersion
 from .application import ApplicationServices
 from .channel import ChannelManager
 from .collaboration import CollaborationService
 from .host import ApplicationHost
-from .http_channel import DirectHttpChannel
 from .mailbox_channel import MailboxChannel
 from .collaboration_controller import build_routes as build_collaboration_routes
 from .profile import CoreProfileService
@@ -62,12 +59,9 @@ from .blob_store import (
 )
 from .session import Session, SessionEffect
 from .trace_log import TraceLogger
-from .transport import HttpTransportAdapter
 from .relay_logic import RelayManager
-from .versions import (
-    PROTOCOL_SCHEMA_VERSION,
-    SESSION_ENVELOPE_FORMAT,
-    SESSION_ENVELOPE_VERSION,
+from .persistence import (
+    load_session_from_file, save_session_to_file,
 )
 
 
@@ -80,15 +74,12 @@ DEFAULT_CONFIG = {
     "peer_sync_interval_seconds": 2,
     "trace_log_file": None,
     "trace_level": "events",
-    # advertise_host is what we tell peers to reach us at (e.g. a Tailscale
-    # IP or a public domain); bind_host is which network interface uvicorn
-    # actually listens on ("0.0.0.0" to accept from any interface). Both
-    # default to loopback-only, matching same-machine-only behavior.
+    # bind_host is which network interface uvicorn listens on for the local
+    # browser UI. advertise_host survives only because the session address
+    # is built from it; no peer is ever told to connect to it, because no
+    # peer connects to anything - a channel publishes and polls.
     "advertise_host": "127.0.0.1",
     "bind_host": "127.0.0.1",
-    # Keep the local browser UI available, but disable direct HTTP as a peer
-    # transport in both directions. Relay descriptors remain usable.
-    "relay_only": False,
     "applications": None,
     "primary_application_id": None,
 }
@@ -102,9 +93,6 @@ CORE_APPLICATION_ALIASES = {
     },
 }
 
-_SAVE_LOCKS: dict[str, threading.Lock] = {}
-_SAVE_LOCKS_GUARD = threading.Lock()
-
 
 @dataclass
 class AppRuntime:
@@ -112,13 +100,11 @@ class AppRuntime:
     address: str
     config: dict[str, Any]
     session: Session
-    adapter: HttpTransportAdapter
     blob_store: BlobStore
     profile: CoreProfileService
     relay_manager: RelayManager
     channel_manager: ChannelManager
     collaboration: CollaborationService
-    http_channel: DirectHttpChannel
     mailbox_channel: MailboxChannel
     host: ApplicationHost | None = None
     logic: Any = None
@@ -150,7 +136,7 @@ class AppRuntime:
     def collect_local_blobs(self) -> list[str]:
         with self.session.lock:
             referenced = referenced_blob_ids(self.session.protocol.root)
-            for tree in self.session.peer_perspectives.values():
+            for tree in self.session.peer_perspectives_for_topic().values():
                 referenced.update(referenced_blob_ids(tree))
             # Keep the mark and sweep atomic with respect to references being
             # added by local edits or incoming session updates.
@@ -216,263 +202,6 @@ def default_storage_file(config: dict, port: int) -> str:
     return str(Path.cwd() / "data" / f"{app_name}_{port}.json")
 
 
-def save_session_to_file(session: Session, path: str, logger=print) -> None:
-    absolute_path = os.path.abspath(path)
-    directory = os.path.dirname(absolute_path)
-    if directory:
-        os.makedirs(directory, exist_ok=True)
-    with _SAVE_LOCKS_GUARD:
-        lock = _SAVE_LOCKS.setdefault(absolute_path, threading.Lock())
-    with lock:
-        tmp_path = f"{absolute_path}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
-        with session.lock:
-            protocol_snapshot = session.export_protocol_root()
-            try:
-                ProtocolNode.from_dict(protocol_snapshot)
-            except ValueError as exc:
-                logger(
-                    "[persistence] in-memory session has invalid hashes before save "
-                    f"{absolute_path}: {exc}"
-                )
-                repaired = ProtocolNode.from_dict(protocol_snapshot, repair_hashes=True)
-                session.load_protocol_root(repaired)
-                protocol_snapshot = repaired.to_dict()
-            snapshot = {
-                "format": SESSION_ENVELOPE_FORMAT,
-                "version": SESSION_ENVELOPE_VERSION,
-                "protocol_schema_version": PROTOCOL_SCHEMA_VERSION,
-                "protocol_root": protocol_snapshot,
-                "session": _session_metadata(session),
-            }
-        with open(tmp_path, "w", encoding="utf-8") as f:
-            json.dump(snapshot, f, sort_keys=True, indent=2)
-            f.write("\n")
-        try:
-            _replace_with_retry(tmp_path, absolute_path, logger)
-        finally:
-            if os.path.exists(tmp_path):
-                try:
-                    os.remove(tmp_path)
-                except OSError:
-                    pass
-
-
-def _replace_with_retry(source: str, destination: str, logger=print) -> None:
-    for attempt in range(12):
-        try:
-            os.replace(source, destination)
-            return
-        except PermissionError as exc:
-            if attempt == 11:
-                raise
-            if attempt >= 2:
-                logger(
-                    "[persistence] save replace blocked, retrying "
-                    f"{attempt + 1}/11 for {destination}: {exc}"
-                )
-            time.sleep(0.08 * (attempt + 1))
-
-
-def load_session_from_file(session: Session, path: str, logger=print) -> bool:
-    if not os.path.exists(path):
-        return False
-    with open(path, encoding="utf-8") as f:
-        payload = json.load(f)
-    envelope_error = _session_envelope_error(payload)
-    if envelope_error:
-        logger(f"[persistence] unsupported session format {path}: {envelope_error}")
-        return False
-    protocol_payload = payload["protocol_root"]
-    try:
-        root = ProtocolNode.from_dict(protocol_payload)
-    except UnsupportedProtocolVersion as exc:
-        logger(f"[persistence] unsupported protocol schema {path}: {exc}")
-        return False
-    except ValueError as exc:
-        logger(f"[persistence] repairing invalid stored session {path}: {exc}")
-        root = ProtocolNode.from_dict(protocol_payload, repair_hashes=True)
-    core_schema_error = session.validate_core_tree(root)
-    if core_schema_error:
-        logger(f"[persistence] unsupported Core data schema {path}: {core_schema_error}")
-        return False
-    session.load_protocol_root(root)
-    _restore_session_metadata(session, payload.get("session", {}))
-    if root.to_dict() != protocol_payload:
-        logger(f"[persistence] saving repaired session {path}")
-        save_session_to_file(session, path, logger=logger)
-    return True
-
-
-def _is_session_envelope(payload: dict) -> bool:
-    return _session_envelope_error(payload) is None
-
-
-def _session_envelope_error(payload: dict) -> str | None:
-    if not isinstance(payload, dict):
-        return "expected a JSON object"
-    if payload.get("format") == "prsp-session-v1":
-        return "legacy format 'prsp-session-v1' is not supported"
-    if payload.get("format") != SESSION_ENVELOPE_FORMAT:
-        return f"expected format '{SESSION_ENVELOPE_FORMAT}'"
-    if payload.get("version") != SESSION_ENVELOPE_VERSION:
-        return f"unsupported envelope version {payload.get('version')!r}"
-    # Stored v1 sessions are upgraded in place: ProtocolNode.from_dict gives
-    # their nodes revision_seq=0, and the next save emits protocol v2.
-    if payload.get("protocol_schema_version") not in {
-        1, PROTOCOL_SCHEMA_VERSION,
-    }:
-        return (
-            "unsupported protocol schema version "
-            f"{payload.get('protocol_schema_version')!r}"
-        )
-    if "protocol_root" not in payload:
-        return "missing protocol_root"
-    return None
-
-
-def _session_metadata(session: Session) -> dict:
-    return {
-        "local_revision_seq": session.local_revision_seq,
-        "members": sorted(session.members - {session.address}),
-        "active_topic_uuids": sorted(session.active_topic_uuids),
-        "peer_topics": dict(sorted(session.peer_topics.items())),
-        "peer_topic_sets": {
-            addr: sorted(topics)
-            for addr, topics in sorted(session.peer_topic_sets.items())
-        },
-        "peer_fetch_topic_sets": {
-            addr: sorted(topics)
-            for addr, topics in sorted(session.peer_fetch_topic_sets.items())
-        },
-        "peer_status": dict(sorted(session.peer_status.items())),
-        "peer_identity_key": dict(sorted(session.peer_identity_key.items())),
-        "peer_topic_channel": {
-            addr: dict(sorted(bindings.items()))
-            for addr, bindings in sorted(session.peer_topic_channel.items())
-        },
-        "observed_topics": {
-            addr: sorted(topics)
-            for addr, topics in sorted(session.observed_topics.items())
-        },
-        "app_metadata": session.app_metadata,
-    }
-
-
-def _restore_session_metadata(session: Session, metadata: dict) -> None:
-    stored_revision_seq = metadata.get("local_revision_seq", 0)
-    session.local_revision_seq = (
-        stored_revision_seq
-        if isinstance(stored_revision_seq, int)
-        and not isinstance(stored_revision_seq, bool)
-        and stored_revision_seq >= 0
-        else 0
-    )
-    session.active_topic_uuids = {
-        uuid for uuid in metadata.get("active_topic_uuids", [])
-        if session.has_node(uuid)
-    }
-    session.peer_topics.clear()
-    session.peer_topic_sets.clear()
-    session.peer_status.clear()
-    session.peer_sync_state.clear()
-    session.peer_topic_channel.clear()
-    session.app_metadata = dict(metadata.get("app_metadata") or {})
-    session.observed_topics = {
-        addr: set(topics)
-        for addr, topics in (metadata.get("observed_topics") or {}).items()
-        if isinstance(topics, list)
-    }
-    # Restored verbatim, deliberately NOT filtered by membership: the
-    # registry is knowledge about an address, not registration state. A
-    # relay pseudo-address suppressed as redundant lives in no other
-    # restored structure - its registry entry is exactly what keeps it
-    # suppressed after a restart (relay's own "applied" hash bookkeeping
-    # persists too, so an unchanged identity topic never re-applies, and
-    # a lost mapping could never be re-learned from content).
-    session.peer_identity_key = {
-        addr: key
-        for addr, key in (metadata.get("peer_identity_key") or {}).items()
-        if isinstance(addr, str) and isinstance(key, str) and addr and key
-    }
-    session.members = {session.address}
-    peer_topic_sets = metadata.get("peer_topic_sets") or {}
-    peer_fetch_topic_sets = metadata.get("peer_fetch_topic_sets") or {}
-    session.peer_topic_channel = {
-        addr: {
-            topic_uuid: channel_kind
-            for topic_uuid, channel_kind in bindings.items()
-            if (
-                isinstance(topic_uuid, str)
-                and topic_uuid
-                and isinstance(channel_kind, str)
-                and channel_kind
-            )
-        }
-        for addr, bindings in (
-            metadata.get("peer_topic_channel") or {}
-        ).items()
-        if isinstance(addr, str) and addr and isinstance(bindings, dict)
-    }
-    # Only peers that were actually real members before persisting (i.e.
-    # went through add_peer, not e.g. Session.note_indirect_peer_topic) get
-    # restored via add_peer_topics/set_peer_fetch_topics - those calls are
-    # what repopulate session.members. A relay pseudo-address legitimately
-    # has its own peer_topic_sets entry (by design - application eligibility
-    # checks need it) without ever having been a real member; restoring it
-    # through the member-registering path would re-leak it into
-    # session.members on every single restart, independent of whatever
-    # caused it to end up in peer_topic_sets in the first place.
-    saved_members = set(metadata.get("members", []))
-    for peer in sorted(saved_members | set(peer_topic_sets) | set(peer_fetch_topic_sets)):
-        topics = [
-            topic for topic in peer_topic_sets.get(peer, [])
-            if (
-                session.has_node(topic)
-                or session.peer_channel_for_topic(peer, topic)
-            )
-        ]
-        fetch_topics = [
-            topic for topic in peer_fetch_topic_sets.get(peer, [])
-            if (
-                session.has_node(topic)
-                or session.peer_channel_for_topic(peer, topic)
-            )
-        ]
-        if peer in saved_members:
-            if topics:
-                session.add_peer_topics(peer, set(topics))
-            if fetch_topics:
-                session.set_peer_fetch_topics(peer, set(fetch_topics))
-        else:
-            if topics:
-                session.peer_topic_sets[peer] = set(topics)
-            if fetch_topics:
-                session.peer_fetch_topic_sets[peer] = set(fetch_topics)
-    for peer, topic in (metadata.get("peer_topics") or {}).items():
-        if peer in session.members and topic in session.peer_topic_sets.get(peer, set()):
-            session.peer_topics[peer] = topic
-    for peer, status in (metadata.get("peer_status") or {}).items():
-        if peer in session.members and isinstance(status, dict):
-            session.peer_status[peer] = {
-                "state": status.get("state", "online"),
-                "failures": int(status.get("failures", 0) or 0),
-                "last_seen": status.get("last_seen"),
-                "last_error": status.get("last_error"),
-            }
-    known_peers = set(session.peer_topic_sets) | (session.members - {session.address})
-    session.peer_topic_channel = {
-        addr: bindings
-        for addr, bindings in session.peer_topic_channel.items()
-        if addr in known_peers and bindings
-    }
-    # peer_sync_state is deliberately not persisted/restored: it exists only
-    # to avoid re-sending a sync_status peers already have. peer_perspectives
-    # (the actual cache it's tracking) isn't persisted either, so restoring a
-    # stale "already delivered" hash across a restart would make a session
-    # believe it's fully synced with a peer while holding an empty cache -
-    # permanently skipping the very sync that would repopulate it.
-
-
 def create_runtime(port: int, config: dict) -> AppRuntime:
     config = dict(config)
     if config.get("applications") is None:
@@ -499,26 +228,9 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         blob_root,
         grace_seconds=float(config.get("blob_gc_grace_seconds", 60)),
     )
-    if config.get("relay_only", False):
-        # A policy change must not revive persisted direct peers or observers.
-        # Relay pseudo-peers are not members and therefore survive this cleanup.
-        for peer_addr in sorted(session.members - {session.address}):
-            session.remove_peer(peer_addr)
-        session.observed_topics.clear()
-    adapter = HttpTransportAdapter(session, trace=trace)
     relay_manager = RelayManager(session, config, blob_store=blob_store)
     channel_manager = ChannelManager(session)
-    http_channel = DirectHttpChannel(
-        address,
-        adapter,
-        offer_enabled=(
-            not config.get("relay_only", False)
-            and config.get("offer_http_channel", True)
-        ),
-        accept_enabled=not config.get("relay_only", False),
-    )
     mailbox_channel = MailboxChannel(relay_manager)
-    channel_manager.register(http_channel)
     channel_manager.register(mailbox_channel)
     collaboration = CollaborationService(session, channel_manager)
     runtime = AppRuntime(
@@ -526,13 +238,11 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         address=address,
         config=config,
         session=session,
-        adapter=adapter,
         blob_store=blob_store,
         profile=CoreProfileService(session),
         relay_manager=relay_manager,
         channel_manager=channel_manager,
         collaboration=collaboration,
-        http_channel=http_channel,
         mailbox_channel=mailbox_channel,
     )
     services = ApplicationServices(
@@ -555,26 +265,7 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
     return runtime
 
 
-def _dispatch_join_discussion(runtime: AppRuntime, address: str,
-                              topic_uuid: str | None,
-                              topic_uuids: list[str] | None) -> dict:
-    # Core owns invitation dispatch. Applications contribute only their
-    # registered validation/mounting callback through Session.shared_topics.
-    return runtime.adapter.join_discussion(address, topic_uuid, topic_uuids)
-
-
 def build_core_routes(runtime: AppRuntime) -> list[Route]:
-    def direct_http_disabled() -> JSONResponse | None:
-        if runtime.http_channel.accept_enabled:
-            return None
-        return JSONResponse(
-            {
-                "status": "error",
-                "reason": "direct HTTP transport disabled by relay-only policy",
-            },
-            status_code=403,
-        )
-
     async def serve_ui(request: Request):
         return HTMLResponse(runtime.host.read_primary_asset("ui") if runtime.host else "")
 
@@ -590,8 +281,17 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         return Response(files("sovereign.assets").joinpath("shared.js").read_text(encoding="utf-8"),
                         media_type="application/javascript")
 
+    async def serve_shared_api_js(request: Request):
+        return Response(
+            files("sovereign.assets").joinpath("shared-api.js").read_text(
+                encoding="utf-8",
+            ),
+            media_type="application/javascript",
+        )
+
     async def api_protocol(request: Request):
-        await refresh_shared_peer_topics(runtime)
+        # No pull here any more. What a peer is publishing arrives on the
+        # channel's own poll; this route reports what has already arrived.
         await drain_peer_update_hook(runtime)
         return JSONResponse(runtime.session.export_protocol_root())
 
@@ -606,22 +306,13 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             return JSONResponse(
                 {"status": "error", "reason": result.reason}, status_code=409,
             )
-        deliveries = await asyncio.to_thread(
-            runtime.channel_manager.execute_effects, result.effects,
+        await asyncio.to_thread(
+            runtime.collaboration.execute_effects, result.effects,
         )
+        # The edit is saved and the next poll publishes it. Nothing is
+        # delivered on this request, so nothing about delivery is reported.
         runtime.notify_change("profile")
-        payload = {"status": "ok", **runtime.profile.view()}
-        errors = [item for item in deliveries if not item.ok]
-        if errors:
-            payload["delivery_errors"] = [
-                {
-                    "effect_type": item.effect_type,
-                    "target": item.target,
-                    "reason": item.reason,
-                }
-                for item in errors
-            ]
-        return JSONResponse(payload)
+        return JSONResponse({"status": "ok", **runtime.profile.view()})
 
     async def api_core_applications(request: Request):
         return JSONResponse({
@@ -666,162 +357,6 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             runtime.collect_local_blobs()
         return response
 
-    async def api_join_discussion(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        try:
-            data = await request.json()
-            result = await asyncio.to_thread(
-                runtime.channel_manager.join_discussion,
-                data["address"].strip().rstrip("/"),
-                data.get("topic_uuid"),
-                data.get("topic_uuids"),
-            )
-            if result.get("status") == "ok":
-                runtime.notify_change()
-                return JSONResponse(result)
-            return JSONResponse(result, status_code=409)
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "error", "reason": str(exc)},
-                status_code=500,
-            )
-
-    async def api_observe_topic(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        # Read-only counterpart of /api/join_discussion: caches the target's
-        # perspective for repeated viewing without ever registering as a
-        # peer of theirs. Generic across apps - never merges into the
-        # caller's own protocol tree, so there's nothing for any app to
-        # gatekeep here.
-        try:
-            data = await request.json()
-            result = await asyncio.to_thread(
-                runtime.channel_manager.observe_topic,
-                data["address"].strip().rstrip("/"),
-                data.get("topic_uuid"),
-                data.get("topic_uuids"),
-            )
-            if result.get("status") == "ok":
-                runtime.notify_change()
-                return JSONResponse(result)
-            return JSONResponse(result, status_code=409)
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "error", "reason": str(exc)},
-                status_code=500,
-            )
-
-    async def api_unwatch_topic(request: Request):
-        # Purely local bookkeeping - the observed peer never knew we were
-        # watching, so there's nothing to tell them when we stop.
-        try:
-            data = await request.json()
-            removed = runtime.session.unwatch_topic(
-                data["address"].strip().rstrip("/"),
-                data["topic_uuid"],
-            )
-            if removed:
-                runtime.notify_change()
-            return JSONResponse({"status": "ok", "removed": removed})
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "error", "reason": str(exc)},
-                status_code=500,
-            )
-
-    async def api_invite_discuss(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        try:
-            data = await request.json()
-            result = await asyncio.to_thread(
-                runtime.channel_manager.invite_to_discuss,
-                data["address"].strip().rstrip("/"),
-                data.get("topic_uuid"),
-                data.get("topic_uuids"),
-            )
-            if result.get("status") == "ok":
-                runtime.notify_change()
-                return JSONResponse(result)
-            return JSONResponse(result, status_code=409)
-        except Exception as exc:
-            return JSONResponse(
-                {"status": "error", "reason": str(exc)},
-                status_code=500,
-            )
-
-    async def api_leave(request: Request):
-        try:
-            data = await request.json()
-        except Exception:
-            data = {}
-        topic_uuid = data.get("topic_uuid")
-        if topic_uuid:
-            await asyncio.to_thread(runtime.channel_manager.leave_topic, topic_uuid)
-        else:
-            await asyncio.to_thread(runtime.channel_manager.leave)
-        runtime.notify_change()
-        return JSONResponse({"status": "ok"})
-
-    async def p2p_sync_status(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        payload = await request.json()
-        response, status = await asyncio.to_thread(
-            runtime.http_channel.adapter.p2p_sync_status,
-            payload,
-        )
-        if status == 200:
-            await drain_peer_update_hook(runtime)
-            runtime.notify_change()
-        return JSONResponse(response, status_code=status)
-
-    async def p2p_join(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        payload = await request.json()
-        response, status = await asyncio.to_thread(
-            runtime.http_channel.adapter.p2p_join,
-            payload,
-        )
-        if status == 200:
-            await drain_peer_update_hook(runtime)
-            runtime.notify_change()
-        return JSONResponse(response, status_code=status)
-
-    async def p2p_announce(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        payload = await request.json()
-        response, status = await asyncio.to_thread(
-            runtime.http_channel.adapter.p2p_announce,
-            payload,
-        )
-        if status == 200:
-            await drain_peer_update_hook(runtime)
-            runtime.notify_change()
-        return JSONResponse(response, status_code=status)
-
-    async def p2p_leave(request: Request):
-        payload = await request.json()
-        response, status = await asyncio.to_thread(
-            runtime.http_channel.adapter.p2p_leave,
-            payload,
-        )
-        if status == 200:
-            runtime.notify_change()
-        return JSONResponse(response, status_code=status)
-
-    async def p2p_subtree(request: Request):
-        if denied := direct_http_disabled():
-            return denied
-        response, status = runtime.http_channel.adapter.p2p_subtree(
-            request.path_params["uuid"]
-        )
-        return JSONResponse(response, status_code=status)
-
     async def api_blob_upload(request: Request):
         limit = int(runtime.config.get("max_blob_size_bytes", 20 * 1024 * 1024))
         content_length = int(request.headers.get("content-length") or 0)
@@ -860,7 +395,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         with runtime.session.lock:
             roots = [
                 (None, runtime.session.protocol.root),
-                *runtime.session.peer_perspectives.items(),
+                *runtime.session.peer_perspectives_for_topic().items(),
             ]
             for peer_addr, root in roots:
                 stack = [root]
@@ -938,6 +473,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         Route("/", serve_ui),
         Route("/styles.css", serve_css),
         Route("/shared.css", serve_shared_css),
+        Route("/shared-api.js", serve_shared_api_js),
         Route("/shared.js", serve_shared_js),
         Route("/api/protocol", api_protocol),
         Route("/api/network", api_network),
@@ -948,19 +484,9 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             api_core_profile_avatar,
             methods=["POST"],
         ),
-        Route("/api/join_discussion", api_join_discussion, methods=["POST"]),
-        Route("/api/observe_topic", api_observe_topic, methods=["POST"]),
-        Route("/api/unwatch_topic", api_unwatch_topic, methods=["POST"]),
-        Route("/api/invite_discuss", api_invite_discuss, methods=["POST"]),
-        Route("/api/leave", api_leave, methods=["POST"]),
         Route("/api/blob", api_blob_upload, methods=["POST"]),
         Route("/api/blob/gc", api_blob_gc, methods=["POST"]),
         Route("/api/blob/{blob_id}", api_blob_get),
-        Route("/p2p/sync_status", p2p_sync_status, methods=["POST"]),
-        Route("/p2p/join", p2p_join, methods=["POST"]),
-        Route("/p2p/announce", p2p_announce, methods=["POST"]),
-        Route("/p2p/leave", p2p_leave, methods=["POST"]),
-        Route("/p2p/subtree/{uuid}", p2p_subtree),
     ]
 
 
@@ -978,45 +504,17 @@ async def drain_peer_update_hook(runtime: AppRuntime, passes: int = 4) -> None:
             break
 
 
-async def refresh_shared_peer_topics(runtime: AppRuntime) -> None:
-    effects = []
-    for peer, topic_uuids in sorted(runtime.session.peer_topic_sets.items()):
-        if (
-            peer == runtime.session.address
-            or peer not in runtime.session.members
-        ):
-            continue
-        for topic_uuid in sorted(topic_uuids):
-            channel_kind = runtime.session.peer_channel_for_topic(
-                peer, topic_uuid,
-            )
-            if not channel_kind:
-                continue
-            effects.append(SessionEffect(
-                "pull_subtree",
-                peer,
-                {"node_uuid": topic_uuid, "topic_uuid": topic_uuid},
-                channel_kind=channel_kind,
-            ))
-    if effects:
-        await asyncio.to_thread(runtime.channel_manager.execute_effects, effects)
-
-
 def build_app(runtime: AppRuntime) -> Starlette:
     @asynccontextmanager
     async def lifespan(app: Starlette):
-        sync_task = asyncio.create_task(peer_sync_loop(runtime))
-        observer_task = asyncio.create_task(observer_sync_loop(runtime))
         channel_task = asyncio.create_task(channel_poll_loop(runtime))
         blob_gc_task = asyncio.create_task(local_blob_gc_loop(runtime))
         try:
             yield
         finally:
-            sync_task.cancel()
-            observer_task.cancel()
             channel_task.cancel()
             blob_gc_task.cancel()
-            for task in (sync_task, observer_task, channel_task, blob_gc_task):
+            for task in (channel_task, blob_gc_task):
                 try:
                     await task
                 except asyncio.CancelledError:
@@ -1039,46 +537,12 @@ def build_app(runtime: AppRuntime) -> Starlette:
     return app
 
 
-async def peer_sync_loop(runtime: AppRuntime) -> None:
-    interval = float(runtime.config.get("peer_sync_interval_seconds", 2))
-    while True:
-        await asyncio.sleep(max(1.0, interval))
-        effects = runtime.session.pending_sync_effects()
-        if not effects:
-            continue
-        deliveries = await asyncio.to_thread(
-            runtime.channel_manager.execute_effects, effects,
-        )
-        if any(delivery.ok for delivery in deliveries):
-            await drain_peer_update_hook(runtime)
-            runtime.notify_change("network")
-
-
 async def local_blob_gc_loop(runtime: AppRuntime) -> None:
     grace = float(runtime.config.get("blob_gc_grace_seconds", 60))
     interval = float(runtime.config.get("blob_gc_interval_seconds", max(60, grace)))
     while True:
         await asyncio.sleep(max(10.0, interval))
         await asyncio.to_thread(runtime.collect_local_blobs)
-
-
-async def observer_sync_loop(runtime: AppRuntime) -> None:
-    # Re-polls read-only observed topics on our own schedule, since an
-    # observed peer never learns we exist and so never pings/pushes to us.
-    interval = float(runtime.config.get("observer_sync_interval_seconds", 5))
-    while True:
-        await asyncio.sleep(max(1.0, interval))
-        pairs = runtime.session.observed_topic_pairs()
-        if not pairs:
-            continue
-        changed = False
-        for peer_addr, topic_uuid in pairs:
-            result = await asyncio.to_thread(
-                runtime.channel_manager.observe_topic, peer_addr, topic_uuid,
-            )
-            changed = changed or result.get("status") == "ok"
-        if changed:
-            runtime.notify_change("network")
 
 
 def _advance_poll_deadline(scheduled_for: float | None,
@@ -1097,264 +561,56 @@ def _advance_poll_deadline(scheduled_for: float | None,
 
 
 async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
-    # One polling-channel cycle: presence + publish + poll, then - crucially - the
-    # app's adoption hook. Without that drain, relay-applied peer content
-    # only ever reached the cache; adoption ran solely from UI polls and
-    # http p2p endpoints, so a headless relay-only session synced content
-    # it never adopted (and never republished merged). Factored out of the
-    # loop so this behavior is testable without spinning the loop.
+    """Schedule one cycle on every due endpoint.
+
+    Transport ordering, response publication, timing calibration, and
+    diagnostics belong to ``PollingEndpoint.poll_once``. The host supplies
+    only the application-reconciliation callback that must run after remote
+    state is applied and before an endpoint publishes its response.
+    """
     endpoints = runtime.channel_manager.polling_endpoints()
-    changed = False
-    # A client can run several relay connections at once. Their network I/O
-    # is independent and must be concurrent: one old or slow target must not
-    # postpone every other target. RelayManager gives the connections a
-    # shared lock around the brief Session mutation sections.
     now = time.monotonic()
     next_due = runtime.config.setdefault("_channel_next_due", {})
-    due_connections = []
-    for relay in endpoints:
-        connection_key = id(relay)
+    due_endpoints = []
+    for endpoint in endpoints:
+        connection_key = id(endpoint)
         scheduled_for = next_due.get(connection_key)
         was_due = scheduled_for is None or now >= scheduled_for
         if due_only and not was_due:
             continue
-        if not relay.has_active_relationship():
-            # No relay token issued or accepted on this connection, and no
-            # relay peer yet - stay fully idle (no files written for no one).
+        if not endpoint.has_active_relationship():
             continue
-        due_connections.append((relay, scheduled_for, was_due))
+        due_endpoints.append((endpoint, scheduled_for, was_due))
 
-    def trace_relay(relay, kind: str, *,
-                    trace_level: str = "events", **fields) -> None:
-        trace_event = getattr(
-            getattr(runtime, "session", None), "trace_event", None,
-        )
-        if not trace_event:
+    adoption_lock = threading.Lock()
+
+    def after_apply() -> None:
+        host = getattr(runtime, "host", None)
+        if not host:
             return
-        storage = getattr(relay, "storage", None)
-        state_path = getattr(relay, "_state_path", None)
-        trace_event(
-            kind,
-            trace_level=trace_level,
-            relay_identity=getattr(relay, "identity", None),
-            relay_backend=type(storage).__name__ if storage else None,
-            relay_state_file=Path(state_path).name if state_path else None,
-            poll_interval_seconds=getattr(
-                relay, "poll_interval_seconds", None,
-            ),
-            **fields,
-        )
+        with adoption_lock:
+            for _ in range(4):
+                if not host.notify_peer_update():
+                    break
 
-    async def relay_phase(relay, cycle_id: str, phase: str, operation):
+    async def run_endpoint(endpoint, scheduled_for, was_due):
         started = time.monotonic()
         try:
-            value = await asyncio.to_thread(operation)
-        except Exception as exc:
-            trace_relay(
-                relay,
-                "relay.phase",
-                cycle_id=cycle_id,
-                phase=phase,
-                duration_ms=round((time.monotonic() - started) * 1000, 1),
-                ok=False,
-                error_type=type(exc).__name__,
-                error=str(exc),
-            )
-            raise
-        details = {}
-        if phase.startswith("publish"):
-            details = {
-                "published_count": len(value or []),
-                "published_topics": list(value or []),
-            }
-        elif phase == "poll_and_apply":
-            details = {
-                "applied_count": len(value or []),
-                "applied_topics": list(value or []),
-            }
-        trace_relay(
-            relay,
-            "relay.phase",
-            trace_level="timing",
-            cycle_id=cycle_id,
-            phase=phase,
-            duration_ms=round((time.monotonic() - started) * 1000, 1),
-            ok=True,
-            **details,
-        )
-        return value
-
-    async def first_pass(relay, scheduled_for, was_due):
-        total_started = time.monotonic()
-        cycle_id = uuid.uuid4().hex[:12]
-        trace_relay(
-            relay,
-            "relay.cycle_start",
-            trace_level="timing",
-            cycle_id=cycle_id,
-            due_only=due_only,
-            was_due=was_due,
-            scheduled_in_ms=(
-                round((scheduled_for - total_started) * 1000, 1)
-                if scheduled_for is not None else None
-            ),
-        )
-        cycle_started = total_started
-        try:
-            calibrate = getattr(relay, "calibrate_timing_if_due", None)
-            if calibrate:
-                await relay_phase(
-                    relay, cycle_id, "calibrate_timing", calibrate,
-                )
-            cycle_started = time.monotonic()
-            await relay_phase(
-                relay, cycle_id, "write_presence", relay.write_presence,
-            )
-            # Poll first, always. With one publication identity per user
-            # rather than per client, publishing before looking would write
-            # this client's state over a sibling's without ever comparing
-            # the two - and the sibling, having published everything it had,
-            # would then correctly conclude the result was safe to adopt.
-            # Both clients follow the rule and the work is gone. See
-            # DESIGN_MULTI_CLIENT_PAIRING.md 4.1.
-            applied = await relay_phase(
-                relay, cycle_id, "poll_and_apply", relay.poll_and_apply,
-            )
-            # Still "before" in the sense the trace field means: before the
-            # adoption drain and its publish_response pass below.
-            published_before = await relay_phase(
-                relay, cycle_id, "publish_after_poll",
-                relay.publish_due_topics,
+            result = await asyncio.to_thread(
+                endpoint.poll_once, after_apply,
             )
         except Exception as exc:
-            print(f"[channel] sync failed: {exc}", flush=True)
-            return (
-                relay, [], [], False, time.monotonic() - cycle_started,
-                cycle_id, total_started,
-            )
-        duration = time.monotonic() - cycle_started
-        return (
-            relay, published_before, applied, True, duration,
-            cycle_id, total_started,
-        )
+            print(f"[channel] poll failed: {exc}", flush=True)
+            result = None
+        return endpoint, scheduled_for, was_due, started, result
 
-    first_results = await asyncio.gather(
-        *(
-            first_pass(relay, scheduled_for, was_due)
-            for relay, scheduled_for, was_due in due_connections
-        ),
-    )
-    adoption_started = time.monotonic()
-    had_applied = any(
-        applied
-        for (
-            _relay, _published, applied, ok, _duration,
-            _cycle_id, _total_started,
-        ) in first_results
-        if ok
-    )
-    if had_applied:
-        await drain_peer_update_hook(runtime)
-    adoption_duration = time.monotonic() - adoption_started if had_applied else 0.0
-    for (
-        relay, _published, applied, ok, _duration,
-        cycle_id, _total_started,
-    ) in first_results:
-        if ok and applied:
-            trace_relay(
-                relay,
-                "relay.phase",
-                trace_level="timing",
-                cycle_id=cycle_id,
-                phase="adopt_peer_updates",
-                duration_ms=round(adoption_duration * 1000, 1),
-                ok=True,
-                applied_count=len(applied),
-            )
-
-    async def response_pass(relay, applied, cycle_id):
-        # Publish the reaction/acknowledgement in this same relay cycle. This
-        # is essential when auto-adopt is off too: the unchanged local
-        # snapshot's head still needs to say "I have seen your revision."
-        started = time.monotonic()
-        try:
-            published = (
-                await relay_phase(
-                    relay, cycle_id, "publish_response",
-                    relay.publish_due_topics,
-                )
-                if applied else []
-            )
-            return published, time.monotonic() - started, True
-        except Exception as exc:
-            print(f"[channel] response publish failed: {exc}", flush=True)
-            return [], time.monotonic() - started, False
-
-    response_results = await asyncio.gather(*(
-        response_pass(relay, applied, cycle_id)
-        for (
-            relay, _published, applied, ok, _duration,
-            cycle_id, _total_started,
-        ) in first_results
-        if ok
+    results = await asyncio.gather(*(
+        run_endpoint(endpoint, scheduled_for, was_due)
+        for endpoint, scheduled_for, was_due in due_endpoints
     ))
-    response_index = 0
-    schedule_by_relay = {
-        id(relay): (scheduled_for, was_due)
-        for relay, scheduled_for, was_due in due_connections
-    }
-    for (
-        relay, published_before, applied, ok, _duration,
-        cycle_id, total_started,
-    ) in first_results:
-        connection_key = id(relay)
-        scheduled_for, was_due = schedule_by_relay[connection_key]
-        stable_interval = float(getattr(relay, "poll_interval_seconds", 3))
-        if not ok:
-            finished_at = time.monotonic()
-            if (
-                was_due
-                or scheduled_for is None
-                or finished_at >= scheduled_for
-            ):
-                next_due[connection_key] = _advance_poll_deadline(
-                    scheduled_for, total_started, stable_interval, finished_at,
-                )
-            trace_relay(
-                relay,
-                "relay.cycle_done",
-                trace_level="events",
-                cycle_id=cycle_id,
-                duration_ms=round(
-                    (time.monotonic() - total_started) * 1000, 1,
-                ),
-                ok=False,
-                next_poll_ms=round(
-                    max(
-                        0.0,
-                        next_due[connection_key] - finished_at,
-                    ) * 1000,
-                    1,
-                ),
-            )
-            continue
-        published_after, response_duration, response_ok = (
-            response_results[response_index]
-        )
-        response_index += 1
-        record_duration = getattr(relay, "record_cycle_duration", None)
-        if record_duration:
-            record_duration(
-                _duration + response_duration
-                + (adoption_duration if applied else 0.0)
-            )
-        ack_wait_ms = None
-        if published_before or published_after:
-            calculate_delay = getattr(relay, "response_check_delay", None)
-            delay = calculate_delay() if calculate_delay else stable_interval
-            # This is an acknowledgement expectation only. It deliberately
-            # does not move the transport's regular polling deadline.
-            ack_wait_ms = round(max(0.05, float(delay)) * 1000, 1)
+    changed = False
+    for endpoint, scheduled_for, was_due, started, result in results:
+        connection_key = id(endpoint)
         finished_at = time.monotonic()
         if (
             was_due
@@ -1362,41 +618,20 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
             or finished_at >= scheduled_for
         ):
             next_due[connection_key] = _advance_poll_deadline(
-                scheduled_for, total_started, stable_interval, finished_at,
+                scheduled_for,
+                started,
+                endpoint.poll_interval_seconds,
+                finished_at,
             )
-        # A local edit can wake an early publication cycle. Keep the existing
-        # regular poll deadline so the configured cadence neither slips nor
-        # accelerates because of that extra work.
-        if published_before or published_after or applied:
-            changed = True
-        trace_relay(
-            relay,
-            "relay.cycle_done",
-            trace_level=(
-                "timing" if response_ok else "events"
-            ),
-            cycle_id=cycle_id,
-            duration_ms=round(
-                (time.monotonic() - total_started) * 1000, 1,
-            ),
-            work_duration_ms=round(
-                (
-                    _duration + response_duration
-                    + (adoption_duration if applied else 0.0)
-                ) * 1000,
-                1,
-            ),
-            ok=response_ok,
-            published_before=list(published_before),
-            published_after=list(published_after),
-            applied_topics=list(applied),
-            acknowledgement_wait_ms=ack_wait_ms,
-            next_poll_ms=round(
-                max(0.0, next_due[connection_key] - time.monotonic())
-                * 1000,
-                1,
-            ),
-        )
+        if result is None:
+            continue
+        changed = result.changed or changed
+        if not result.ok:
+            print(
+                f"[channel] poll failed: {result.error or 'unknown error'}",
+                flush=True,
+            )
+            continue
     if changed:
         runtime.notify_change("channel")
     return changed

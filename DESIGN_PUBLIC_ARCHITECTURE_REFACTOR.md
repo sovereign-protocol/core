@@ -1,6 +1,10 @@
 # Public architecture refactor
 
-Status: **APPROVED FOR IMPLEMENTATION — reviewed corrections incorporated**
+Status: **IMPLEMENTED**, and partly superseded on 2026-07-28: the direct HTTP
+channel was retired, so `DirectHttpChannel` and `EffectDeliveryChannel` are
+gone and `MailboxChannel` is the only implementation of the channel contract.
+The boundary decisions this document settled all held — which is why removing
+one channel touched no application. See `DESIGN_TOPIC_HOME_CHANNELS.md` §3.
 
 This document defines the bounded architectural refactor to complete before
 publishing Sovereign Core and S-Kanban. It is intentionally driven by two real

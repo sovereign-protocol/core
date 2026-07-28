@@ -2,16 +2,15 @@
 
 from __future__ import annotations
 
-import asyncio
 from typing import Any
 
-from .application import application_result_view, json_value
+from .application import application_json_response, json_value
 from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 
-def build_routes(logic, runtime, config: dict) -> list[Route]:
+def build_routes(logic, runtime) -> list[Route]:
     async def api_state(request: Request):
         return JSONResponse(json_value(logic.state()))
 
@@ -85,14 +84,7 @@ def build_routes(logic, runtime, config: dict) -> list[Route]:
 
 
 async def _json_result(runtime, result) -> JSONResponse:
-    deliveries = []
-    if result.status == "ok":
-        deliveries = await asyncio.to_thread(
-            runtime.deliver_effects, result.effects,
-        )
-        runtime.notify_change()
-    view = application_result_view(result, deliveries)
-    return JSONResponse(view.payload, status_code=200 if view.ok else 409)
+    return await application_json_response(runtime, result)
 
 
 def _object(value: Any) -> dict:

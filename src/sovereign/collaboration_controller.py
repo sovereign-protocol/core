@@ -67,7 +67,7 @@ def build_routes(runtime) -> list[Route]:
         return response(await asyncio.to_thread(
             service.compose_invitation,
             values.get("topic_uuid", ""),
-            values.get("channel_ref", "http"),
+            values.get("channel_ref", ""),
         ))
 
     async def api_accept_invitation(request: Request):

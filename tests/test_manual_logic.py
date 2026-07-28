@@ -3,67 +3,28 @@ import unittest
 from pathlib import Path
 
 from sovereign import app_server
-from sovereign.protocol_explorer import ManualLogic, create_logic
+from sovereign.protocol_explorer import ManualLogic
 from sovereign.protocol import ProtocolNode
 from sovereign.session import Session
 
 
-class MemoryHttpClient:
-    def __init__(self, runtimes):
-        self.runtimes = runtimes
-
-    def get_json(self, url: str, timeout: float = 5) -> dict:
-        runtime, path = self._split_url(url)
-        if path.startswith("/p2p/subtree/"):
-            payload, status = runtime.adapter.p2p_subtree(path.rsplit("/", 1)[1])
-            if status != 200:
-                raise RuntimeError(payload.get("reason", "not found"))
-            return payload
-        raise RuntimeError(f"unexpected GET {path}")
-
-    def post_json(self, url: str, payload: dict,
-                  timeout: float = 5) -> dict:
-        runtime, path = self._split_url(url)
-        if path == "/api/join_discussion":
-            return runtime.channel_manager.join_discussion(
-                payload["address"],
-                payload.get("topic_uuid"),
-                payload.get("topic_uuids"),
-            )
-        if path == "/p2p/join":
-            response, status = runtime.adapter.p2p_join(payload)
-            if status != 200:
-                raise RuntimeError(response.get("reason", "join failed"))
-            return response
-        if path == "/p2p/sync_status":
-            response, status = runtime.adapter.p2p_sync_status(payload)
-            if status != 200:
-                raise RuntimeError(response.get("reason", "sync failed"))
-            return response
-        if path == "/p2p/announce":
-            response, status = runtime.adapter.p2p_announce(payload)
-            if status != 200:
-                raise RuntimeError(response.get("reason", "announce failed"))
-            return response
-        if path == "/p2p/leave":
-            response, status = runtime.adapter.p2p_leave(payload)
-            if status != 200:
-                raise RuntimeError(response.get("reason", "leave failed"))
-            return response
-        raise RuntimeError(f"unexpected POST {path}")
-
-    def _split_url(self, url: str):
-        for address in sorted(self.runtimes, key=len, reverse=True):
-            if url.startswith(address):
-                return self.runtimes[address], url[len(address):]
-        raise RuntimeError(f"unknown address in {url}")
+def sync(*runtimes) -> None:
+    """Move work between clients the only way a relay can: each publishes
+    what changed, then each reads what the others left. Twice, because a
+    client given a topic in the first round has nothing of its own to
+    publish until it has grafted it."""
+    for _ in range(2):
+        for runtime in runtimes:
+            runtime.relay.write_presence()
+            runtime.relay.publish_due_topics()
+        for runtime in runtimes:
+            runtime.relay.poll_and_apply()
 
 
 class ManualLogicTests(unittest.TestCase):
-    def test_create_logic_returns_manual_logic(self):
+    def test_manual_logic_uses_supplied_session(self):
         session = Session("http://a")
-
-        logic = create_logic(session, {})
+        logic = ManualLogic(session, {})
 
         self.assertIsInstance(logic, ManualLogic)
         self.assertIs(logic.session, session)
@@ -124,49 +85,47 @@ class ManualLogicTests(unittest.TestCase):
         paths = {route.path for route in app.routes}
         self.assertIn("/api/protocol-explorer/state", paths)
 
-    def test_two_clients_invite_and_sync_child_change(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            left = self._manual_runtime(8141, tmp)
-            right = self._manual_runtime(8142, tmp)
-            client = MemoryHttpClient({
-                left.address: left,
-                right.address: right,
-            })
-            left.adapter.http = client
-            right.adapter.http = client
-
+    def test_the_explorer_caches_an_invited_topic_without_claiming_it(self):
+        # The Explorer registers no topic handler, so an invited topic must
+        # arrive as a cached peer perspective and a pending invitation, and
+        # keep arriving as its author changes it. The inviter here is a stub
+        # application, not a real one: Core must not depend on any.
+        with tempfile.TemporaryDirectory() as tmp, \
+                tempfile.TemporaryDirectory() as relay_root:
+            left = self._manual_runtime(8141, tmp, relay_root)
+            right = self._manual_runtime(8142, tmp, relay_root)
             topic = left.logic.create_child(
                 left.session.protocol.root.uuid,
-                {"name": "topic"},
+                {"type": "notes", "name": "topic"},
                 {},
             ).value
+            left.session.shared_topics.register(
+                "test-notes", {"notes"}, lambda: [topic.uuid],
+                left.session.accept_topic_invitation,
+            )
             left.logic.start_discussion(topic.uuid)
 
-            invite = left.adapter.invite_to_discuss(right.address, topic.uuid)
+            invite = self._connect(left, right, topic.uuid)
 
             self.assertEqual(invite["status"], "ok")
-            self.assertEqual(left.session.active_topic_uuid, topic.uuid)
+            self.assertIn(topic.uuid, left.session.active_topic_uuids)
             self.assertNotIn(topic.uuid, right.session.active_topic_uuids)
-            self.assertIn(right.session.identity.uuid, right.session.active_topic_uuids)
             self.assertNotIn(topic.uuid, right.session.protocol.index)
             self.assertIn(topic.uuid, right.session.pending_topic_invitations)
             self.assertIsNotNone(right.session.get_cached_peer_subtree(
-                left.address, topic.uuid,
+                left.peer_addr, topic.uuid,
             ))
-            self.assertIn(right.address, left.session.members)
-            self.assertIn(left.address, right.session.members)
 
             child_result = left.logic.create_child(
                 topic.uuid,
                 {"name": "child"},
                 {},
             )
-            deliveries = left.adapter.execute_effects(child_result.effects)
+            sync(left, right)
 
             self.assertEqual(child_result.status, "ok")
-            self.assertTrue(all(delivery.ok for delivery in deliveries))
             cached = right.session.get_cached_peer_subtree(
-                left.address,
+                left.peer_addr,
                 child_result.value.uuid,
             )
             self.assertIsNotNone(cached)
@@ -214,10 +173,50 @@ class ManualLogicTests(unittest.TestCase):
 
 
     @staticmethod
-    def _manual_runtime(port: int, directory: str):
+    def _manual_runtime(port: int, directory: str, relay_root: str | None = None):
         config = app_server.load_config(None, "manual")
         config["storage_file"] = str(Path(directory) / f"{port}.json")
-        return app_server.create_runtime(port, config)
+        if relay_root is None:
+            return app_server.create_runtime(port, config)
+        config["relay_state_directory"] = str(Path(directory) / f"relay-{port}")
+        runtime = app_server.create_runtime(port, config)
+        created = runtime.relay_manager.create_target({
+            "name": f"relay {port}", "backend": "local", "root": relay_root,
+        })
+        if created.status != "ok":
+            raise RuntimeError(created.reason)
+        runtime.relay_target = created.value
+        runtime.relay = runtime.relay_manager.connection_for_target(created.value)
+        # How the other client's registries name this one: a relay peer is a
+        # publication identity, not an address anybody can reach.
+        runtime.peer_addr = f"relay:{runtime.relay.identity}"
+        return runtime
+
+    @staticmethod
+    def _connect(host, guest, topic_uuid: str) -> dict:
+        attached = host.mailbox_channel.attach_topics(
+            [topic_uuid], {"target_id": host.relay_target},
+        )
+        if not attached.ok:
+            return {"status": "error", "reason": attached.reason}
+        identity_uuid = host.session.identity.uuid
+        token = host.channel_manager.compose_token(
+            [topic_uuid], {
+                topic_uuid: {
+                    "kind": "mailbox", "target_id": host.relay_target,
+                },
+                identity_uuid: {
+                    "kind": "mailbox", "target_id": host.relay_target,
+                },
+            },
+        )
+        if not token.ok:
+            return {"status": "error", "reason": token.reason}
+        result = guest.channel_manager.accept_token(token.value)
+        if not result.ok:
+            return {"status": "error", "reason": result.reason}
+        sync(host, guest)
+        return result.value
 
 
 if __name__ == "__main__":

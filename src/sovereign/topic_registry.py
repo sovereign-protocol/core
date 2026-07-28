@@ -115,12 +115,7 @@ class SharedTopicRegistry:
         self,
         assigned_topic_uuids: Iterable[str] | None = None,
     ) -> list[str]:
-        """Return publishable topics, applying assignment scope in one place.
-
-        Application topics are normally scoped by a channel target assignment.
-        Core topics such as the local public profile opt out and therefore ride
-        every active relationship without channel-specific special cases.
-        """
+        """Return publishable topics, applying home-channel scope in one place."""
         with self._lock:
             handlers = list(self._handlers_by_owner.values())
         assigned = (

@@ -26,10 +26,6 @@ class TraceLogger:
     def enabled(self) -> bool:
         return bool(self.path)
 
-    @property
-    def timing_enabled(self) -> bool:
-        return self.enabled and self.level == "timing"
-
     def event(self, kind: str, *, required_level: str = "events",
               **fields: Any) -> None:
         required = self.normalize_level(required_level)

@@ -95,8 +95,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_session_does_not_depend_on_host_channels_or_storage(self):
         imports = imported_modules(CORE / "session.py")
         forbidden = {
-            "application", "app_server", "channel", "host", "http_channel",
-            "mailbox_channel", "relay_logic", "relay_storage", "transport",
+            "application", "app_server", "channel", "host",
+            "mailbox_channel", "relay_logic", "relay_storage",
             "starlette", "requests", "paramiko",
         }
         for name in imports:
@@ -112,6 +112,25 @@ class ArchitectureBoundaryTests(unittest.TestCase):
             "personal_cockpit",
         }
         self.assertTrue(imports.isdisjoint(forbidden))
+
+    def test_host_schedules_the_public_poll_cycle_without_relay_internals(self):
+        source = (CORE / "app_server.py").read_text(encoding="utf-8")
+        cycle = source.split("async def channel_poll_tick", 1)[1].split(
+            "async def channel_poll_loop", 1,
+        )[0]
+
+        self.assertIn("endpoint.poll_once", cycle)
+        for private_detail in (
+            "._state_path",
+            ".storage",
+            ".write_presence",
+            ".poll_and_apply",
+            ".publish_due_topics",
+            ".calibrate_timing_if_due",
+            ".record_cycle_duration",
+            ".response_check_delay",
+        ):
+            self.assertNotIn(private_detail, cycle)
 
     def test_public_root_exports_only_documented_contracts(self):
         documentation = (ROOT / "PUBLIC_API.md").read_text(encoding="utf-8")

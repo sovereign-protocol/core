@@ -2,14 +2,14 @@
 
 # Keep these domains separate. A change in one format must not accidentally
 # force every other consumer to upgrade.
-PACKAGE_VERSION = "0.1.2"
+PACKAGE_VERSION = "0.1.4"
 
 PROTOCOL_SCHEMA_VERSION = 2
 
 SESSION_ENVELOPE_FORMAT = "sovereign-session"
 SESSION_ENVELOPE_VERSION = 1
 
-CONNECT_TOKEN_VERSION = 1
+CONNECT_TOKEN_VERSION = 2
 CHANNEL_DESCRIPTOR_VERSION = 1
 
 # Core-owned data layered on the generic protocol tree. This is not an

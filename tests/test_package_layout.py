@@ -37,6 +37,9 @@ class PackageLayoutTests(unittest.TestCase):
 
     def test_installed_browser_assets_are_available(self):
         self.assertTrue(files("sovereign.assets").joinpath("shared.js").is_file())
+        self.assertTrue(
+            files("sovereign.assets").joinpath("shared-api.js").is_file(),
+        )
         self.assertTrue(files("sovereign.assets").joinpath("manual.html").is_file())
 
     def test_package_sources_live_under_the_declared_src_root(self):

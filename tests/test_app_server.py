@@ -9,10 +9,10 @@ from unittest.mock import patch
 
 from sovereign import app_server
 from sovereign.application import ApplicationInstance, ApplicationManifest
-from sovereign.channel import ChannelManager
-from sovereign.http_channel import DirectHttpChannel
+from sovereign.channel import ChannelManager, PollCycleResult
 from sovereign.mailbox_channel import MailboxChannel
 from sovereign.protocol import ProtocolNode
+from sovereign.relay_logic import RelayLogic
 from sovereign.session import Session
 from sovereign.topic_registry import ApplicationRegistration
 from sovereign.trace_log import TraceLogger
@@ -110,28 +110,31 @@ class _FakeRelayManager:
 
 class AppServerTests(unittest.TestCase):
     def _accept_connect_token(
-        self, runtime, identity, topic_uuids, channels,
+        self, runtime, identity, topic_uuids, channels, topic_channels=None,
     ):
         manager = getattr(runtime, "channel_manager", None)
         if manager is None:
             manager = ChannelManager(runtime.session)
-            direct_adapter = types.SimpleNamespace(
-                join_discussion=lambda address, topic_uuid, topics: (
-                    app_server._dispatch_join_discussion(
-                        runtime, address, topic_uuid, topics,
-                    )
-                ),
-            )
-            manager.register(DirectHttpChannel(
-                runtime.address,
-                direct_adapter,
-                offer_enabled=not runtime.config.get("relay_only", False),
-                accept_enabled=not runtime.config.get("relay_only", False),
-            ))
             relay_manager = getattr(runtime, "relay_manager", None)
             if relay_manager is not None:
                 manager.register(MailboxChannel(relay_manager))
-        result = manager.accept_invitation(identity, topic_uuids, channels)
+        topic_uuids = list(topic_uuids)
+        inviter_uuid = (
+            str(identity.get("uuid") or "")
+            if isinstance(identity, dict) else ""
+        )
+        if inviter_uuid and inviter_uuid not in topic_uuids:
+            topic_uuids.append(inviter_uuid)
+        for index, channel in enumerate(channels, start=1):
+            channel.setdefault("channel_id", f"channel-{index}")
+        if topic_channels is None and len(channels) == 1:
+            topic_channels = {
+                topic_uuid: channels[0]["channel_id"]
+                for topic_uuid in topic_uuids
+            }
+        result = manager.accept_invitation(
+            identity, topic_uuids, channels, topic_channels,
+        )
         if result.ok:
             return result.value
         payload = {"status": "error", "reason": result.reason}
@@ -205,23 +208,6 @@ class AppServerTests(unittest.TestCase):
         )
         self.assertEqual(config["primary_application_id"], "first")
 
-    def test_relay_only_runtime_drops_restored_direct_transport_state(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
-            saved = Session("http://127.0.0.1:8126")
-            saved.add_peer("http://peer", "topic-1")
-            saved.observed_topics["http://observer"] = {"topic-2"}
-            app_server.save_session_to_file(saved, str(path))
-
-            runtime = app_server.create_runtime(8126, {
-                "app_module": None,
-                "storage_file": str(path),
-                "relay_only": True,
-            })
-
-        self.assertEqual(runtime.session.members, {runtime.address})
-        self.assertNotIn("http://peer", runtime.session.peer_topic_sets)
-        self.assertEqual(runtime.session.observed_topics, {})
 
     def test_persistence_roundtrip_uses_session_protocol_root(self):
         session = Session("http://a")
@@ -293,44 +279,9 @@ class AppServerTests(unittest.TestCase):
             {},
         ).value
         session.start_discussion(topic.uuid)
-        session.add_peer("http://b", topic.uuid)
-        session.bind_peer_topic_channel("http://b", topic.uuid, "http")
-        session.mark_peer_unreachable("http://b", "timeout")
-        session.app_metadata["kanban"] = {"selected_board_uuid": "board-1"}
-        session.watch_topic("http://c", "topic-99")
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
-            app_server.save_session_to_file(session, str(path))
-
-            loaded = Session("http://a")
-            self.assertTrue(app_server.load_session_from_file(loaded, str(path)))
-
-        self.assertEqual(loaded.members, {"http://a", "http://b"})
-        self.assertEqual(loaded.active_topic_uuids, {topic.uuid})
-        self.assertEqual(loaded.peer_topic_sets["http://b"], {topic.uuid})
-        self.assertEqual(loaded.peer_status["http://b"]["state"], "offline")
-        self.assertEqual(
-            loaded.peer_channel_for_topic("http://b", topic.uuid), "http",
-        )
-        self.assertEqual(loaded.app_metadata["kanban"]["selected_board_uuid"], "board-1")
-        self.assertEqual(loaded.observed_topics, {"http://c": {"topic-99"}})
-
-    def test_persistence_roundtrip_does_not_promote_relay_peer_to_a_member(self):
-        # Regression, found live: a relay pseudo-address (e.g. "relay:B")
-        # has its own peer_topic_sets entry by design (Session.
-        # note_indirect_peer_topic) without ever having been a real member.
-        # The restore path used to treat every peer_topic_sets key as
-        # membership-worthy, re-adding it to session.members (and from
-        # there, pending_sync_effects would try - and fail - to push a real
-        # HTTP effect to it) on every single restart.
-        session = Session("http://a")
-        topic = session.create_child(
-            session.protocol.root.uuid, {"name": "topic"}, {},
-        ).value
-        session.start_discussion(topic.uuid)
         session.note_indirect_peer_topic("relay:B", topic.uuid)
         session.bind_peer_topic_channel("relay:B", topic.uuid, "mailbox")
+        session.application_metadata("kanban")["selected_board_uuid"] = "board-1"
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -339,12 +290,16 @@ class AppServerTests(unittest.TestCase):
             loaded = Session("http://a")
             self.assertTrue(app_server.load_session_from_file(loaded, str(path)))
 
-        self.assertEqual(loaded.members, {"http://a"})
-        self.assertNotIn("relay:B", loaded.members)
-        self.assertEqual(loaded.peer_topic_sets.get("relay:B"), {topic.uuid})
+        self.assertEqual(loaded.active_topic_uuids, {topic.uuid})
+        self.assertEqual(loaded.peer_topic_sets["relay:B"], {topic.uuid})
         self.assertEqual(
             loaded.peer_channel_for_topic("relay:B", topic.uuid), "mailbox",
         )
+        self.assertEqual(
+            loaded.application_metadata("kanban")["selected_board_uuid"],
+            "board-1",
+        )
+
 
     def test_restore_keeps_routed_remote_profile_topic_for_refetch(self):
         session = Session("http://a")
@@ -373,20 +328,18 @@ class AppServerTests(unittest.TestCase):
         )
 
     def test_persistence_roundtrip_restores_peer_identity_registry(self):
-        # The registry must survive restarts even for addresses that live
-        # in no other restored structure: a relay pseudo-address suppressed
-        # as redundant has been fully removed as a peer, and its registry
-        # entry is the only thing keeping it suppressed after a restart
-        # (relay's own "applied" hash bookkeeping persists too, so its
-        # unchanged identity topic never re-applies to re-teach the fact).
+        # The registry must survive restarts even for an address that lives
+        # in no other restored structure. It is knowledge - "this address
+        # belongs to this identity" - and a lost mapping could never be
+        # re-learned from content.
         session = Session("http://a")
         topic = session.create_child(
             session.protocol.root.uuid, {"name": "topic"}, {},
         ).value
         session.start_discussion(topic.uuid)
-        session.add_peer("http://b", topic.uuid)
-        session.set_peer_identity_key("http://b", "key-bob")
-        session.set_peer_identity_key("relay:B", "key-bob")  # suppressed, no peer state
+        session.note_indirect_peer_topic("relay:B", topic.uuid)
+        session.set_peer_identity_key("relay:B", "key-bob")
+        session.set_peer_identity_key("relay:gone", "key-bob")  # no peer state
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -395,44 +348,9 @@ class AppServerTests(unittest.TestCase):
             loaded = Session("http://a")
             self.assertTrue(app_server.load_session_from_file(loaded, str(path)))
 
-        self.assertEqual(loaded.peer_identity_key.get("http://b"), "key-bob")
         self.assertEqual(loaded.peer_identity_key.get("relay:B"), "key-bob")
-        self.assertNotIn("relay:B", loaded.members)
-
-    def test_persistence_does_not_restore_peer_sync_state(self):
-        # peer_perspectives (the peer cache) is never persisted, so it's
-        # empty again after every restart. If last_delivered_sync_hash
-        # survived a restart while the cache didn't, a session with an
-        # unchanged board would never re-send a sync_status to a peer whose
-        # data it no longer has cached - permanently stuck with no way to
-        # repopulate the cache. peer_sync_state must come back fresh so a
-        # sync is always attempted at least once after restart.
-        session = Session("http://a")
-        topic = session.create_child(
-            session.protocol.root.uuid,
-            {"name": "topic"},
-            {},
-        ).value
-        session.start_discussion(topic.uuid)
-        session.add_peer("http://b", topic.uuid)
-        session.peer_sync_state["http://b"]["last_delivered_sync_hash"] = "stale-hash"
-        session.peer_sync_state["http://b"]["retry_after"] = 9999999999.0
-
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "state.json"
-            app_server.save_session_to_file(session, str(path))
-
-            loaded = Session("http://a")
-            self.assertTrue(app_server.load_session_from_file(loaded, str(path)))
-
-        self.assertEqual(
-            loaded.peer_sync_state.get("http://b", {}).get("last_delivered_sync_hash"),
-            None,
-        )
-        self.assertEqual(
-            loaded.peer_sync_state.get("http://b", {}).get("retry_after"),
-            None,
-        )
+        self.assertEqual(loaded.peer_identity_key.get("relay:gone"), "key-bob")
+        self.assertNotIn("relay:gone", loaded.peer_topic_sets)
 
     def test_load_rejects_legacy_root_only_files(self):
         session = Session("http://a")
@@ -567,7 +485,7 @@ class AppServerTests(unittest.TestCase):
             self.assertTrue(path.exists())
             self.assertIn("save replace blocked", logs[0])
 
-    def test_create_runtime_builds_session_adapter_and_loads_logic(self):
+    def test_create_runtime_builds_session_and_loads_logic(self):
         module = _fake_application_module(
             logic_factory=lambda services: {
                 "address": services.session.address,
@@ -587,7 +505,7 @@ class AppServerTests(unittest.TestCase):
 
         self.assertEqual(runtime.address, "http://127.0.0.1:8123")
         self.assertEqual(runtime.logic["name"], "demo")
-        self.assertIs(runtime.adapter.session, runtime.session)
+        self.assertIs(runtime.channel_manager.session, runtime.session)
 
     def test_create_runtime_advertises_configured_host(self):
         module = _fake_application_module()
@@ -618,8 +536,8 @@ class AppServerTests(unittest.TestCase):
 
         paths = {route.path for route in app.routes}
         self.assertIn("/api/protocol", paths)
-        self.assertIn("/p2p/sync_status", paths)
-        self.assertIn("/p2p/subtree/{uuid}", paths)
+        self.assertIn("/api/network", paths)
+        self.assertIn("/api/core/invitations", paths)
 
     def test_build_app_mounts_explicit_applications_alongside_primary(self):
         primary = _fake_application_module("primary")
@@ -660,7 +578,6 @@ class AppServerTests(unittest.TestCase):
             return False
         runtime = types.SimpleNamespace(
             host=types.SimpleNamespace(notify_peer_update=notify_peer_update),
-            adapter=None,
         )
 
         asyncio.run(app_server.drain_peer_update_hook(runtime, passes=4))
@@ -674,21 +591,23 @@ class AppServerTests(unittest.TestCase):
         # synced. The tick must drain the app's on_peer_update hook.
         hook_calls = {"count": 0}
         notifications = []
-        publish_calls = {"count": 0}
 
         class FakeRelay:
+            poll_interval_seconds = 3
+
             def has_active_relationship(self):
                 return True
 
-            def write_presence(self):
-                pass
+            def poll_once(self, after_apply=None):
+                after_apply()
+                return PollCycleResult(
+                    ok=True,
+                    changed=True,
+                    applied=(("topic-1", "A"),),
+                )
 
-            def publish_due_topics(self):
-                publish_calls["count"] += 1
-                return []
-
-            def poll_and_apply(self):
-                return [("topic-1", "A")]
+            def polling_diagnostics(self):
+                return {"identity": "fake"}
 
         class Logic:
             def on_peer_update(self):
@@ -704,7 +623,6 @@ class AppServerTests(unittest.TestCase):
             config={},
             channel_manager=_FakeRelayManager([FakeRelay()]),
             host=types.SimpleNamespace(notify_peer_update=notify_peer_update),
-            adapter=None,
             notify_change=lambda kind=None: notifications.append(kind),
         )
 
@@ -712,35 +630,9 @@ class AppServerTests(unittest.TestCase):
 
         self.assertTrue(changed)
         self.assertEqual(hook_calls["count"], 1)
-        self.assertEqual(publish_calls["count"], 2)
         self.assertEqual(notifications, ["channel"])
 
-    def test_channel_poll_tick_traces_each_relay_phase(self):
-        class FakeRelay:
-            identity = "relay-a"
-            poll_interval_seconds = 3
-
-            def has_active_relationship(self):
-                return True
-
-            def calibrate_timing_if_due(self):
-                pass
-
-            def write_presence(self):
-                pass
-
-            def publish_due_topics(self):
-                return ["topic-1"]
-
-            def poll_and_apply(self):
-                return [("topic-1", "peer-b")]
-
-        class Logic:
-            def on_peer_update(self):
-                return types.SimpleNamespace(
-                    status="ok", value=False, effects=[],
-                )
-
+    def test_polling_endpoint_traces_its_complete_cycle(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "relay-trace.jsonl"
             session = Session(
@@ -749,24 +641,20 @@ class AppServerTests(unittest.TestCase):
                     str(trace_path), node="http://a", level="timing",
                 ),
             )
-            logic = Logic()
-            runtime = types.SimpleNamespace(
-                session=session,
-                config={},
-                channel_manager=_FakeRelayManager([FakeRelay()]),
-                host=types.SimpleNamespace(
-                    notify_peer_update=lambda: logic.on_peer_update(),
-                ),
-                adapter=None,
-                notify_change=lambda kind=None: None,
-            )
+            relay = RelayLogic(session, {})
+            relay.calibrate_timing_if_due = lambda: None
+            relay.write_presence = lambda: None
+            relay.poll_and_apply = lambda: [("topic-1", "peer-b")]
+            relay.publish_due_topics = lambda: ["topic-1"]
 
-            asyncio.run(app_server.channel_poll_tick(runtime))
+            result = relay.poll_once(lambda: None)
             records = [
-                json.loads(line)
+                record
                 for line in trace_path.read_text(encoding="utf-8").splitlines()
+                if (record := json.loads(line))["kind"].startswith("relay.")
             ]
 
+        self.assertTrue(result.ok, result.error)
         starts = [
             record for record in records
             if record["kind"] == "relay.cycle_start"
@@ -811,23 +699,7 @@ class AppServerTests(unittest.TestCase):
             1,
         )
 
-    def test_events_trace_omits_timing_but_keeps_relay_failures(self):
-        class FakeRelay:
-            identity = "relay-a"
-            poll_interval_seconds = 3
-
-            def has_active_relationship(self):
-                return True
-
-            def write_presence(self):
-                raise RuntimeError("relay unavailable")
-
-            def publish_due_topics(self):
-                raise AssertionError("must stop after failure")
-
-            def poll_and_apply(self):
-                raise AssertionError("must stop after failure")
-
+    def test_endpoint_events_trace_omits_timing_but_keeps_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
             trace_path = Path(tmp) / "relay-trace.jsonl"
             session = Session(
@@ -836,21 +708,20 @@ class AppServerTests(unittest.TestCase):
                     str(trace_path), node="http://a", level="events",
                 ),
             )
-            runtime = types.SimpleNamespace(
-                session=session,
-                config={},
-                channel_manager=_FakeRelayManager([FakeRelay()]),
-                host=types.SimpleNamespace(notify_peer_update=lambda: False),
-                adapter=None,
-                notify_change=lambda kind=None: None,
+            relay = RelayLogic(session, {})
+            relay.calibrate_timing_if_due = lambda: None
+            relay.write_presence = lambda: (
+                (_ for _ in ()).throw(RuntimeError("relay unavailable"))
             )
 
-            asyncio.run(app_server.channel_poll_tick(runtime))
+            result = relay.poll_once()
             records = [
-                json.loads(line)
+                record
                 for line in trace_path.read_text(encoding="utf-8").splitlines()
+                if (record := json.loads(line))["kind"].startswith("relay.")
             ]
 
+        self.assertFalse(result.ok)
         self.assertEqual(
             [record["kind"] for record in records],
             ["relay.phase", "relay.cycle_done"],
@@ -867,7 +738,7 @@ class AppServerTests(unittest.TestCase):
 
         runtime = types.SimpleNamespace(
             config={}, channel_manager=_FakeRelayManager([FakeRelay()]),
-            host=types.SimpleNamespace(notify_peer_update=lambda: False), adapter=None,
+            host=types.SimpleNamespace(notify_peer_update=lambda: False),
             notify_change=lambda kind=None: None,
         )
 
@@ -888,21 +759,19 @@ class AppServerTests(unittest.TestCase):
             def has_active_relationship(self):
                 return True
 
-            def write_presence(self):
+            def poll_once(self, after_apply=None):
                 self.mine.set()
                 overlapped.append(self.other.wait(timeout=0.5))
+                return PollCycleResult(ok=True)
 
-            def publish_due_topics(self):
-                return []
-
-            def poll_and_apply(self):
-                return []
+            def polling_diagnostics(self):
+                return {"identity": "fake"}
 
         runtime = types.SimpleNamespace(
             config={}, channel_manager=_FakeRelayManager([
                 FakeRelay(first_started, second_started),
                 FakeRelay(second_started, first_started),
-            ]), host=types.SimpleNamespace(notify_peer_update=lambda: False), adapter=None,
+            ]), host=types.SimpleNamespace(notify_peer_update=lambda: False),
             notify_change=lambda kind=None: None,
         )
 
@@ -910,32 +779,28 @@ class AppServerTests(unittest.TestCase):
 
         self.assertEqual(overlapped, [True, True])
 
-    def test_channel_poll_tick_keeps_poll_cadence_after_publish(self):
-        response_delay_calls = {"count": 0}
-
+    def test_channel_poll_tick_keeps_poll_cadence_after_endpoint_publish(self):
         class FakeRelay:
             poll_interval_seconds = 3
 
             def has_active_relationship(self):
                 return True
 
-            def write_presence(self):
-                pass
+            def poll_once(self, after_apply=None):
+                return PollCycleResult(
+                    ok=True,
+                    changed=True,
+                    published_before=("topic-1",),
+                    acknowledgement_wait_seconds=0.4,
+                )
 
-            def publish_due_topics(self):
-                return ["topic-1"]
-
-            def poll_and_apply(self):
-                return []
-
-            def response_check_delay(self):
-                response_delay_calls["count"] += 1
-                return 0.4
+            def polling_diagnostics(self):
+                return {"identity": "fake"}
 
         relay = FakeRelay()
         runtime = types.SimpleNamespace(
             config={}, channel_manager=_FakeRelayManager([relay]),
-            host=types.SimpleNamespace(notify_peer_update=lambda: False), adapter=None,
+            host=types.SimpleNamespace(notify_peer_update=lambda: False),
             notify_change=lambda kind=None: None,
         )
         started = app_server.time.monotonic()
@@ -943,7 +808,6 @@ class AppServerTests(unittest.TestCase):
         asyncio.run(app_server.channel_poll_tick(runtime))
 
         scheduled = runtime.config["_channel_next_due"][id(relay)]
-        self.assertEqual(response_delay_calls["count"], 1)
         self.assertGreaterEqual(scheduled, started + 2.9)
         self.assertLessEqual(scheduled, started + 3.1)
 
@@ -972,14 +836,11 @@ class AppServerTests(unittest.TestCase):
             def has_active_relationship(self):
                 return True
 
-            def write_presence(self):
-                pass
+            def poll_once(self, after_apply=None):
+                return PollCycleResult(ok=True)
 
-            def publish_due_topics(self):
-                return []
-
-            def poll_and_apply(self):
-                return []
+            def polling_diagnostics(self):
+                return {"identity": "fake"}
 
         relay = FakeRelay()
         existing_due = app_server.time.monotonic() + 10
@@ -988,7 +849,7 @@ class AppServerTests(unittest.TestCase):
                 "_channel_next_due": {id(relay): existing_due},
             },
             channel_manager=_FakeRelayManager([relay]),
-            host=types.SimpleNamespace(notify_peer_update=lambda: False), adapter=None,
+            host=types.SimpleNamespace(notify_peer_update=lambda: False),
             notify_change=lambda kind=None: None,
         )
 
@@ -1087,19 +948,69 @@ class AppServerTests(unittest.TestCase):
             )))
             payload = json.loads(response.body)
 
-            self.assertEqual(payload["token_version"], 1)
+            self.assertEqual(payload["token_version"], 2)
             self.assertEqual(payload["topic_uuids"], sorted([board.uuid, runtime.session.identity.uuid]))
             self.assertEqual([channel["type"] for channel in payload["channels"]], ["relay"])
+            self.assertEqual(
+                set(payload["topic_channels"]),
+                {board.uuid, runtime.session.identity.uuid},
+            )
             self.assertEqual(payload["channels"][0]["target_id"], target_id)
-            # The identity topic is not a board and is never "used for"
-            # anything; it follows the invitation's route so the invitee can
-            # see who invited them.
+            # The first channel became the identity's visible home.
             self.assertEqual(
                 manager.target_for_topic(runtime.session.identity.uuid), target_id,
             )
             shared = manager.connection_for_target(target_id)._state["shared"]
             self.assertIn(board.uuid, shared)
             self.assertIn(runtime.session.identity.uuid, shared)
+
+    def test_post_connect_token_carries_identity_and_board_home_channels(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as identity_root,
+            tempfile.TemporaryDirectory() as board_root,
+        ):
+            runtime, board = _runtime_with_topic(8213, {
+                "storage_file": str(Path(tmp) / "state.json"),
+                "relay_state_directory": tmp,
+            })
+            endpoint = self._connect_token_endpoint(runtime)
+            manager = runtime.relay_manager
+            identity_target = manager.create_target({
+                "name": "Identity", "backend": "local", "root": identity_root,
+            }).value
+            board_target = manager.create_target({
+                "name": "Board", "backend": "local", "root": board_root,
+            }).value
+            manager.assign_topic_target(board.uuid, board_target)
+
+            response = asyncio.run(endpoint(self._post_request(
+                "/api/core/invitations",
+                {
+                    "channel_ref": f"mailbox:{board_target}",
+                    "topic_uuid": board.uuid,
+                },
+            )))
+            payload = json.loads(response.body)
+            descriptors = {
+                item["channel_id"]: item["target_id"]
+                for item in payload["channels"]
+            }
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(len(descriptors), 2)
+            self.assertEqual(
+                descriptors[payload["topic_channels"][runtime.session.identity.uuid]],
+                identity_target,
+            )
+            self.assertEqual(
+                descriptors[payload["topic_channels"][board.uuid]],
+                board_target,
+            )
+            self.assertEqual(
+                manager.target_for_topic(runtime.session.identity.uuid),
+                identity_target,
+            )
 
     def test_post_connect_token_invalid_board_does_not_partially_assign(self):
         with tempfile.TemporaryDirectory() as tmp, tempfile.TemporaryDirectory() as relay_root:
@@ -1170,6 +1081,53 @@ class AppServerTests(unittest.TestCase):
             self.assertEqual(target["poll_interval_seconds"], 9)
             self.assertTrue(Path(storage_file).exists())
 
+    def test_manage_channels_reports_and_moves_the_identity_home(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as root_a,
+            tempfile.TemporaryDirectory() as root_b,
+        ):
+            runtime, _board = _runtime_with_topic(8214, {
+                "storage_file": str(Path(tmp) / "state.json"),
+                "relay_state_directory": tmp,
+            })
+            first = runtime.relay_manager.create_target({
+                "name": "First", "backend": "local", "root": root_a,
+            }).value
+            second = runtime.relay_manager.create_target({
+                "name": "Second", "backend": "local", "root": root_b,
+            }).value
+
+            initial = runtime.collaboration.channels_payload()
+            self.assertEqual(
+                initial["identity_channel_ref"], f"mailbox:{first}",
+            )
+            moved = runtime.collaboration.set_topic_channel(
+                runtime.session.identity.uuid,
+                f"mailbox:{second}",
+                True,
+            )
+            after = runtime.collaboration.channels_payload()
+
+            self.assertTrue(moved.ok, moved.reason)
+            self.assertEqual(
+                after["identity_channel_ref"], f"mailbox:{second}",
+            )
+            self.assertEqual(
+                [
+                    item["id"] for item in after["channels"]
+                    if item["identity_home"]
+                ],
+                [second],
+            )
+            deleted = runtime.collaboration.delete_channel(
+                f"mailbox:{second}",
+            )
+            self.assertTrue(deleted.ok, deleted.reason)
+            self.assertIsNone(runtime.relay_manager.target_for_topic(
+                runtime.session.identity.uuid,
+            ))
+
     def test_accepting_two_relay_tokens_registers_two_coexisting_targets(self):
         from sovereign.relay_logic import RelayManager
 
@@ -1198,28 +1156,19 @@ class AppServerTests(unittest.TestCase):
             self.assertNotEqual(manager.target_for_topic("board-b"), manager.target_for_topic("board-c"))
             self.assertEqual(len([conn for conn in manager.all_connections() if conn.storage]), 2)
 
-    def test_connect_token_without_target_yields_http_only_token(self):
-        # A target-less POST is the direct-connection (e.g. LAN) token: no
-        # relay target chosen, so only the http channel is offered. This is
-        # the path the http integration flow uses.
+    def test_connect_token_without_a_channel_has_nothing_to_offer(self):
+        # Every channel is a place to publish, so an invitation naming none
+        # has no route to describe. There is no channel-less token left.
         with tempfile.TemporaryDirectory() as tmp:
             runtime, board = _runtime_with_topic(8203, {
                 "storage_file": str(Path(tmp) / "state.json"),
             })
             endpoint = self._connect_token_endpoint(runtime)
             response = asyncio.run(endpoint(self._post_request(
-                "/api/core/invitations",
-                {"topic_uuid": board.uuid, "channel_ref": "http"},
+                "/api/core/invitations", {"topic_uuid": board.uuid},
             )))
 
-        payload = json.loads(response.body)
-        self.assertEqual(
-            [channel["type"] for channel in payload["channels"]], ["http"],
-        )
-        self.assertEqual(
-            payload["topic_uuids"],
-            sorted([board.uuid, runtime.session.identity.uuid]),
-        )
+        self.assertGreaterEqual(response.status_code, 400)
 
     def test_connect_token_requires_at_least_one_board(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1253,35 +1202,6 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(response.status_code, 400)
         self.assertIn(b"unrecognized token version", response.body)
 
-    def test_accept_connect_token_uses_http_channel_and_records_it(self):
-        session = Session("http://a")
-        bob_session = Session("http://b")
-        bob_session.set_identity("Bob")
-        identity_payload = bob_session.identity.to_dict()
-        runtime = types.SimpleNamespace(
-            address="http://a", session=session, config={},
-        )
-        with patch.object(
-            app_server, "_dispatch_join_discussion",
-            return_value={"status": "ok", "members": ["http://b"]},
-        ) as dispatch:
-            result = self._accept_connect_token(
-                runtime,
-                identity=identity_payload,
-                topic_uuids=["topic-1"],
-                channels=[{"type": "http", "descriptor_version": 1, "address": "http://b"}],
-            )
-
-        dispatch.assert_called_once_with(runtime, "http://b", None, ["topic-1"])
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["channels_used"], ["http"])
-        self.assertEqual(
-            session.peer_channel_for_topic("http://b", "topic-1"), "http",
-        )
-        cached = session.find_peer_identity(identity_payload["data"]["identity_key"])
-        self.assertIsNotNone(cached)
-        self.assertEqual(cached.data["display_name"], "Bob")
-
     def test_accept_connect_token_uses_relay_channel_and_records_it(self):
         # accept_descriptor is the manager's single entry point: it verifies,
         # registers the target, provisions a connection from the token, and
@@ -1307,7 +1227,8 @@ class AppServerTests(unittest.TestCase):
         )
 
         self.assertEqual(manager.accept_calls, [(
-            channel, ["topic-1"], inviter.identity.uuid,
+            channel, sorted(["topic-1", inviter.identity.uuid]),
+            inviter.identity.uuid,
         )])
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["channels_used"], ["mailbox"])
@@ -1397,200 +1318,119 @@ class AppServerTests(unittest.TestCase):
             }],
         )
 
-        self.assertEqual([topics for _d, topics, _i in manager.accept_calls], [["topic-1"]])
+        self.assertEqual(
+            [topics for _d, topics, _i in manager.accept_calls],
+            [sorted(["topic-1", inviter.identity.uuid])],
+        )
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["channels_used"], ["mailbox"])
         self.assertEqual(
             session.peer_channel_for_topic("relay:B", "topic-1"), "mailbox",
         )
 
-    def test_accept_connect_token_rejects_multiple_channels(self):
+    def test_accept_connect_token_rejects_multiple_channels_without_mapping(self):
         session = Session("http://a")
+        inviter = Session("http://b")
         manager = _FakeRelayManager()
         runtime = types.SimpleNamespace(
             address="http://a", session=session,
             config={}, relay_manager=manager,
         )
-        with patch.object(
-            app_server, "_dispatch_join_discussion",
-            return_value={"status": "ok"},
-        ):
-            result = self._accept_connect_token(
-                runtime, identity=None, topic_uuids=["topic-1"],
-                channels=[
-                    {"type": "http", "descriptor_version": 1, "address": "http://b"},
-                    {"type": "relay", "descriptor_version": 1, "root": "x", "identity": "B"},
-                ],
-            )
+        result = self._accept_connect_token(
+            runtime, identity=inviter.identity.to_dict(),
+            topic_uuids=["topic-1"],
+            channels=[
+                {"type": "relay", "descriptor_version": 1, "root": "x", "identity": "B"},
+                {
+                    "type": "sftp", "descriptor_version": 1, "host": "h",
+                    "username": "u", "root": "/", "identity": "B",
+                },
+            ],
+        )
 
         self.assertEqual(result["status"], "error")
-        self.assertEqual(result["reason"], "token must select exactly one channel")
-        self.assertNotIn("http://b", session.peer_topic_channel)
+        self.assertEqual(
+            result["reason"],
+            "topic-to-channel mapping is missing or incomplete",
+        )
         self.assertNotIn("relay:B", session.peer_topic_channel)
         self.assertEqual(manager.accept_calls, [])
 
-    def test_accept_connect_token_does_not_fall_back_when_token_is_ambiguous(self):
+    def test_accept_connect_token_routes_each_topic_through_its_mapping(self):
         session = Session("http://a")
         inviter = Session("http://b")
+        manager = _FakeRelayManager()
         runtime = types.SimpleNamespace(
             address="http://a", session=session,
-            config={}, relay_manager=_FakeRelayManager(),
+            config={}, relay_manager=manager,
         )
-        with patch.object(
-            app_server, "_dispatch_join_discussion",
-            return_value={"status": "error", "reason": "unreachable"},
-        ):
-            result = self._accept_connect_token(
-                runtime, identity=inviter.identity.to_dict(), topic_uuids=["topic-1"],
-                channels=[
-                    {"type": "http", "descriptor_version": 1, "address": "http://b"},
-                    {"type": "relay", "descriptor_version": 1, "root": "x", "identity": "B"},
-                ],
-            )
+        board_channel = {
+            "channel_id": "board-channel",
+            "type": "relay", "descriptor_version": 1,
+            "root": "board", "identity": "B",
+        }
+        identity_channel = {
+            "channel_id": "identity-channel",
+            "type": "relay", "descriptor_version": 1,
+            "root": "identity", "identity": "B",
+        }
 
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["reason"], "token must select exactly one channel")
-        self.assertNotIn("relay:B", session.peer_topic_channel)
-        self.assertNotIn("http://b", session.peer_topic_channel)
-
-    def test_accept_connect_token_relay_only_still_rejects_ambiguous_token(self):
-        session = Session("http://a")
-        inviter = Session("http://b")
-        runtime = types.SimpleNamespace(
-            address="http://a", session=session,
-            config={"relay_only": True}, relay_manager=_FakeRelayManager(),
-        )
-        with patch.object(app_server, "_dispatch_join_discussion") as direct_join:
-            result = self._accept_connect_token(
-                runtime, identity=inviter.identity.to_dict(), topic_uuids=["topic-1"],
-                channels=[
-                    {"type": "http", "descriptor_version": 1, "address": "http://b"},
-                    {"type": "relay", "descriptor_version": 1, "root": "x", "identity": "B"},
-                ],
-            )
-
-        direct_join.assert_not_called()
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["reason"], "token must select exactly one channel")
-        self.assertNotIn("relay:B", session.peer_topic_channel)
-
-    def test_accept_connect_token_relay_only_rejects_http_only_token(self):
-        session = Session("http://a")
-        runtime = types.SimpleNamespace(
-            address="http://a", session=session, config={"relay_only": True},
+        result = self._accept_connect_token(
+            runtime,
+            identity=inviter.identity.to_dict(),
+            topic_uuids=["topic-1", inviter.identity.uuid],
+            channels=[identity_channel, board_channel],
+            topic_channels={
+                inviter.identity.uuid: "identity-channel",
+                "topic-1": "board-channel",
+            },
         )
 
-        with patch.object(app_server, "_dispatch_join_discussion") as direct_join:
-            result = self._accept_connect_token(
-                runtime, identity=None, topic_uuids=["topic-1"],
-                channels=[{"type": "http", "descriptor_version": 1, "address": "http://b"}],
-            )
-
-        direct_join.assert_not_called()
-        self.assertEqual(result["status"], "error")
-        self.assertEqual(result["errors"]["http"], "disabled by local relay-only policy")
-
-    def test_relay_only_rejects_inbound_p2p_join(self):
-        runtime = types.SimpleNamespace(
-            config={"relay_only": True},
-            http_channel=types.SimpleNamespace(accept_enabled=False),
-            adapter=types.SimpleNamespace(
-                p2p_join=lambda payload: (_ for _ in ()).throw(
-                    AssertionError("direct adapter must not be called")
-                ),
-            ),
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(
+            [call[1] for call in manager.accept_calls],
+            [[inviter.identity.uuid], ["topic-1"]],
         )
-        endpoint = next(
-            route.endpoint for route in app_server.build_core_routes(runtime)
-            if route.path == "/p2p/join"
-        )
-        request = self._get_request("")
-
-        response = asyncio.run(endpoint(request))
-
-        self.assertEqual(response.status_code, 403)
-        self.assertIn(b"relay-only policy", response.body)
 
     def test_accept_connect_token_reconnect_replaces_old_channel(self):
         session = Session("http://a")
         bob_session = Session("http://b-old")
         bob_session.set_identity("Bob")
         identity_payload = bob_session.identity.to_dict()
-        runtime = types.SimpleNamespace(address="http://a", session=session, config={})
+        runtime = types.SimpleNamespace(
+            address="http://a", session=session,
+            config={}, relay_manager=_FakeRelayManager(),
+        )
 
-        # Simulate an already-established peer registration under the old
-        # address, as a prior real join (accept_connect_token doesn't itself
-        # populate members/peer_topic_sets - that's join_discussion's job,
-        # mocked out below) would have produced.
-        session.add_peer("http://b-old", "topic-1")
-        session.apply_peer_identity_snapshot("http://b-old", identity_payload)
-        session.bind_peer_topic_channel("http://b-old", "topic-1", "http")
+        # Bob was already reachable under an earlier publication identity,
+        # as a prior accepted token would have left him.
+        session.note_indirect_peer_topic("relay:B-old", "topic-1")
+        session.apply_peer_identity_snapshot("relay:B-old", identity_payload)
+        session.bind_peer_topic_channel("relay:B-old", "topic-1", "mailbox")
 
-        with patch.object(
-            app_server, "_dispatch_join_discussion",
-            return_value={"status": "ok", "members": ["http://b-new"]},
-        ):
-            result = self._accept_connect_token(
-                runtime, identity=identity_payload, topic_uuids=["topic-1"],
-                channels=[{"type": "http", "descriptor_version": 1, "address": "http://b-new"}],
-            )
+        result = self._accept_connect_token(
+            runtime, identity=identity_payload, topic_uuids=["topic-1"],
+            channels=[{
+                "type": "relay", "descriptor_version": 1, "root": "x",
+                "identity": "B",
+            }],
+        )
 
         self.assertEqual(result["status"], "ok")
-        self.assertNotIn("http://b-old", session.members)
-        self.assertNotIn("http://b-old", session.peer_topic_sets)
-        self.assertNotIn("http://b-old", session.peer_perspectives)
-        self.assertNotIn("http://b-old", session.peer_status)
-        self.assertNotIn("http://b-old", session.peer_topic_channel)
+        self.assertNotIn("relay:B-old", session.peer_topic_sets)
+        self.assertNotIn("relay:B-old", session.peer_perspectives)
+        self.assertNotIn("relay:B-old", session.peer_topic_channel)
         self.assertEqual(
-            session.peer_channel_for_topic("http://b-new", "topic-1"), "http",
+            session.peer_channel_for_topic("relay:B", "topic-1"), "mailbox",
         )
         cached = session.find_peer_identity(identity_payload["data"]["identity_key"])
         self.assertIsNotNone(cached)
-        # Endpoint identity remains learned history, not an active route.
-        self.assertIn("http://b-old", session.peer_identity_key)
+        # The old address stays learned history, not an active route.
+        self.assertIn("relay:B-old", session.peer_identity_key)
         self.assertEqual(
-            session.peer_identity_key.get("http://b-new"),
+            session.peer_identity_key.get("relay:B"),
             identity_payload["data"]["identity_key"],
         )
-
-    def test_accept_connect_token_keeps_relay_identity_key_when_selecting_http(self):
-        # Regression, caught live: relay's poll loop can discover a peer
-        # (setting peer_identity_key["relay:B"]) *before* the http connect
-        # completes. When the http connect then runs, its reconnect-replace
-        # step must tear down the relay registration but NOT forget the
-        # relay address's identity_key - that entry is what relay's
-        # redundancy check reads to keep relay:B suppressed forever after.
-        # Forgetting it (as a genuinely dead http address is forgotten)
-        # left the relay duplicate reopened for good, since relay never
-        # re-applies the unchanged identity topic to re-teach the key.
-        session = Session("http://a")
-        bob_session = Session("http://b")
-        bob_session.set_identity("Bob")
-        identity_payload = bob_session.identity.to_dict()
-        identity_key = identity_payload["data"]["identity_key"]
-        runtime = types.SimpleNamespace(address="http://a", session=session, config={})
-
-        # Relay discovered Bob first, as its poll loop would have.
-        session.note_indirect_peer_topic("relay:B", "topic-1")
-        session.apply_peer_identity_snapshot("relay:B", identity_payload)
-        self.assertEqual(session.peer_identity_key.get("relay:B"), identity_key)
-
-        with patch.object(
-            app_server, "_dispatch_join_discussion",
-            return_value={"status": "ok", "members": ["http://b"]},
-        ):
-            result = self._accept_connect_token(
-                runtime, identity=identity_payload, topic_uuids=["topic-1"],
-                channels=[{"type": "http", "descriptor_version": 1, "address": "http://b"}],
-            )
-
-        self.assertEqual(result["status"], "ok")
-        # Relay registration torn down (no stale duplicate at connect)...
-        self.assertNotIn("relay:B", session.peer_topic_sets)
-        self.assertNotIn("relay:B", session.peer_perspectives)
-        # ...but its identity_key retained, so redundancy stays detectable.
-        self.assertEqual(session.peer_identity_key.get("relay:B"), identity_key)
-        self.assertEqual(session.peer_identity_key.get("http://b"), identity_key)
 
     def test_accept_connect_token_skips_unrecognized_channel_type_or_version(self):
         session = Session("http://a")
@@ -1600,7 +1440,7 @@ class AppServerTests(unittest.TestCase):
             runtime, identity=None, topic_uuids=["topic-1"],
             channels=[
                 {"type": "carrier_pigeon", "descriptor_version": 1},
-                {"type": "http", "descriptor_version": 99, "address": "http://b"},
+                {"type": "relay", "descriptor_version": 99, "root": "x"},
             ],
         )
 

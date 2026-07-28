@@ -13,13 +13,15 @@ details unless this document explicitly says otherwise.
 
 The current exports are: `ApplicationFacade`, `ApplicationFacadeLookup`,
 `ApplicationInstance`, `ApplicationManifest`, `ApplicationRegistration`,
-`ApplicationResultView`, `ApplicationServices`, `ApplicationSpec`, `Channel`,
-`ChannelAcceptance`, `ChannelResult`,
-`EffectDeliveryChannel`, `IncompatibleApplicationFacade`, `Invitation`,
+`ApplicationResultView`, `ApplicationServices`, `ApplicationSpec`,
+`BlobChannel`, `Channel`, `ChannelAcceptance`, `ChannelResult`,
+`IncompatibleApplicationFacade`, `Invitation`, `LivenessChannel`,
+`ManagedChannel`, `PairingChannel`, `PersistenceParticipant`, `PollCycleResult`,
 `PollingChannel`, `PollingEndpoint`, `ProtocolNode`, `ProtocolResult`,
-`ProtocolState`, `Session`, `SessionEffect`, `SessionResult`,
-`UnsupportedProtocolVersion`, `application_result_view`, `avatar_attachment`,
-`canonical_attachments`, `desktop_main`, `json_value`,
+`ProtocolState`, `RelayStorage`, `Session`, `SessionEffect`, `SessionResult`,
+`UnsupportedProtocolVersion`, `application_json_response`,
+`application_result_view`, `avatar_attachment`, `canonical_attachments`,
+`desktop_main`, `json_value`,
 `protocol_node_from_envelope`, `protocol_tree_envelope`, and `run_desktop`.
 
 An application module exports:
@@ -28,8 +30,10 @@ An application module exports:
 - `create_application(services: ApplicationServices) -> ApplicationInstance`
 
 Applications may register shared topic roots through `ApplicationRegistration`.
-They return domain mutations as `SessionResult` and `SessionEffect`; Core owns
-effect delivery.
+They return domain mutations as `SessionResult`. A `SessionEffect` is a
+lifecycle signal Core carries out - today only the release of a topic's
+channels when its sharing ends - and never a message to a peer: a channel
+publishes and polls on its own schedule, not on a caller's.
 
 `ApplicationServices` deliberately exposes no channel manager. Applications
 receive a read-only collaboration view and an effect-delivery callable; channel
@@ -81,17 +85,40 @@ import the producer's logic, controller, or persistence modules. In `0.x`, a
 producer exposes at most one facade version at a time; compatibility adapters
 belong on the consumer side.
 
-S-Kanban's current facade is `s_kanban.KanbanFacade`, API version `1`. It exposes
-read-only board, column, card, user, profile, and transition queries. Personal
-Cockpit consumes it without declaring S-Kanban as a package dependency.
+S-Kanban's current facade is `s_kanban.KanbanFacade`, API version `1`. It
+exposes detached query snapshots plus explicit board, card, agenda, reaction,
+and policy commands. Personal Cockpit consumes it without declaring S-Kanban
+as a package dependency.
 
 ## Channel extension API
 
-`Channel`, `EffectDeliveryChannel`, `PollingChannel`, and `PollingEndpoint` are
-the supported extension contracts. Core owns registration, descriptor
-negotiation, invitation composition, effect routing, and polling.
-Concrete HTTP, mailbox, relay-manager, storage, Starlette controller, and server
-modules are Core implementation details in `0.x`.
+`Channel` is the required extension contract. A channel opts into independent
+capabilities by also satisfying:
+
+- `ManagedChannel`: named instance configuration, topic bindings, and
+  instance-scoped detach;
+- `LivenessChannel`: routed peer reachability;
+- `BlobChannel`: remote blob reads through an explicit peer/topic route;
+- `PairingChannel`: sibling-client pairing and conflict resolution;
+- `PersistenceParticipant`: a context-manager lock Core enters while saving;
+- `PollingChannel`: discovery of independently scheduled `PollingEndpoint`
+  objects.
+
+A `PollingEndpoint` provides `poll_interval_seconds`,
+`has_active_relationship()`, `polling_diagnostics()`, and one complete
+`poll_once(after_apply)` operation. The endpoint owns transport ordering,
+timing calibration, response publication, failure handling, and diagnostic
+tracing. It calls `after_apply` after applying remote state and before
+publishing its response. `poll_once` returns `PollCycleResult`; Core schedules
+the endpoint and advances the fixed cadence but does not inspect transport
+implementation fields. Standard diagnostic keys are `identity`, `backend`,
+`state_file`, and `poll_interval_seconds`; extensions may add keys.
+
+Core owns registration, descriptor negotiation, invitation composition, and
+poll scheduling. Concrete mailbox, relay-manager, storage backend, Starlette
+controller, and server modules are Core implementation details in `0.x`.
+`RelayStorage` is the backend contract used by polling endpoints; it includes
+explicit connection closure.
 
 ## Protocol and session API
 
@@ -99,3 +126,5 @@ modules are Core implementation details in `0.x`.
 `SessionResult`, and `SessionEffect` are public. The hash and wire semantics are
 normative in `SPECIFICATION_S_PROTOCOL.md`; direct mutation of internal indexes,
 peer caches, locks, or application registries is unsupported.
+Session peer/topic properties are detached snapshots. Applications store local
+state only through `application_metadata(application_id)`.

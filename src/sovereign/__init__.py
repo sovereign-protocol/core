@@ -3,32 +3,37 @@
 from .application import (
     ApplicationFacade, ApplicationFacadeLookup, ApplicationInstance,
     ApplicationManifest, ApplicationResultView, ApplicationServices,
-    ApplicationSpec, IncompatibleApplicationFacade, application_result_view,
-    json_value,
+    ApplicationSpec, IncompatibleApplicationFacade, application_json_response,
+    application_result_view, json_value,
 )
 from .blob_store import avatar_attachment, canonical_attachments
 from .desktop import desktop_main, run_desktop
 from .channel import (
-    Channel, ChannelAcceptance, ChannelResult,
-    EffectDeliveryChannel, Invitation, PollingChannel, PollingEndpoint,
+    BlobChannel, Channel, ChannelAcceptance, ChannelResult, Invitation,
+    LivenessChannel, ManagedChannel, PersistenceParticipant, PollCycleResult,
+    PairingChannel, PollingChannel, PollingEndpoint,
 )
 from .protocol import (
     ProtocolNode, ProtocolResult, ProtocolState, UnsupportedProtocolVersion,
     protocol_node_from_envelope, protocol_tree_envelope,
 )
 from .session import Session, SessionEffect, SessionResult
+from .relay_storage import RelayStorage
 from .topic_registry import ApplicationRegistration
 from .versions import PACKAGE_VERSION as __version__
 
 __all__ = [
     "ApplicationFacade", "ApplicationFacadeLookup", "ApplicationInstance",
     "ApplicationManifest", "ApplicationRegistration", "ApplicationResultView",
-    "ApplicationServices", "ApplicationSpec", "Channel", "ChannelAcceptance",
-    "ChannelResult", "EffectDeliveryChannel",
-    "IncompatibleApplicationFacade", "Invitation", "PollingChannel",
-    "PollingEndpoint", "ProtocolNode", "ProtocolResult", "ProtocolState",
+    "ApplicationServices", "ApplicationSpec", "BlobChannel", "Channel",
+    "ChannelAcceptance", "ChannelResult", "IncompatibleApplicationFacade",
+    "Invitation", "LivenessChannel", "ManagedChannel",
+    "PairingChannel", "PersistenceParticipant", "PollCycleResult",
+    "PollingChannel", "PollingEndpoint", "ProtocolNode", "ProtocolResult",
+    "ProtocolState", "RelayStorage",
     "Session", "SessionEffect", "SessionResult", "UnsupportedProtocolVersion",
-    "__version__", "application_result_view", "avatar_attachment",
+    "__version__", "application_json_response", "application_result_view",
+    "avatar_attachment",
     "canonical_attachments", "desktop_main", "json_value",
     "protocol_node_from_envelope", "protocol_tree_envelope", "run_desktop",
 ]

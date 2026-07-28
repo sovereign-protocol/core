@@ -3,11 +3,8 @@ Manual app logic.
 
 Functionality:
   Human-operated generic perspective editor for the new stack. It exposes
-  atomic protocol operations through Session and returns transport effects to
-  its controller.
-
-Offered API:
-  create_logic(session, config)
+  atomic protocol operations through Session. The host executes lifecycle
+  effects returned by those operations.
 """
 
 from __future__ import annotations
@@ -26,11 +23,9 @@ class ManualLogic:
             "network": self.session.get_network_info(),
             "peers": {
                 addr: tree.to_dict()
-                for addr, tree in sorted(self.session.peer_perspectives.items())
-            },
-            "observed_topics": {
-                addr: sorted(topics)
-                for addr, topics in sorted(self.session.observed_topics.items())
+                for addr, tree in sorted(
+                    self.session.peer_perspectives_for_topic().items(),
+                )
             },
         }
 
@@ -70,7 +65,3 @@ class ManualLogic:
             return SessionResult("error", reason="local parent not found")
 
         return self.session.adopt_subtree(peer, parent_uuid)
-
-
-def create_logic(session: Session, config: dict) -> ManualLogic:
-    return ManualLogic(session, config)

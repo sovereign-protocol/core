@@ -5,19 +5,20 @@ import unittest
 from sovereign.protocol_explorer import ManualLogic
 from sovereign.protocol_explorer_controller import build_routes
 from sovereign.session import Session
-from sovereign.transport import TransportDelivery
 
 
-class FakeAdapter:
+class FakeCollaboration:
+    """Stands in for CollaborationService, whose one effect is a lifecycle
+    signal - releasing a topic's channels - and which returns nothing a
+    controller reads."""
+
     def __init__(self):
         self.effects = []
 
     def execute_effects(self, effects):
         self.effects.extend(effects)
-        return [
-            TransportDelivery(True, effect.type, effect.target)
-            for effect in effects
-        ]
+        return []
+
 
 class FakeRequest:
     def __init__(self, payload):
@@ -30,8 +31,8 @@ class FakeRequest:
 class FakeRuntime:
     def __init__(self, session):
         self.session = session
-        self.adapter = FakeAdapter()
-        self.deliver_effects = self.adapter.execute_effects
+        self.collaboration = FakeCollaboration()
+        self.deliver_effects = self.collaboration.execute_effects
         self.config = {}
         self.notified = False
 
@@ -42,7 +43,7 @@ class FakeRuntime:
 class ProtocolExplorerControllerTests(unittest.TestCase):
     def test_routes_are_registered_under_protocol_explorer_namespace(self):
         session = Session("http://a")
-        routes = build_routes(ManualLogic(session, {}), FakeRuntime(session), {})
+        routes = build_routes(ManualLogic(session, {}), FakeRuntime(session))
 
         paths = {route.path for route in routes}
         self.assertIn("/api/protocol-explorer/state", paths)
@@ -57,7 +58,7 @@ class ProtocolExplorerControllerTests(unittest.TestCase):
         ).value
         runtime = FakeRuntime(session)
         endpoint = self._endpoint(
-            build_routes(logic, runtime, {}), "/api/protocol-explorer/modify",
+            build_routes(logic, runtime), "/api/protocol-explorer/modify",
         )
 
         response = asyncio.run(endpoint(FakeRequest({

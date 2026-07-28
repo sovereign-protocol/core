@@ -5,7 +5,10 @@ from __future__ import annotations
 import threading
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
-from typing import Any, Iterable, Mapping, Protocol, runtime_checkable
+from typing import (
+    Any, Callable, ContextManager, Iterable, Mapping, Protocol,
+    runtime_checkable,
+)
 
 from .versions import CHANNEL_DESCRIPTOR_VERSION, CONNECT_TOKEN_VERSION
 
@@ -76,19 +79,101 @@ class Channel(Protocol):
 
 
 @runtime_checkable
-class EffectDeliveryChannel(Protocol):
-    def execute_effect(self, effect): ...
-    def execute_effects(self, effects): ...
+class ManagedChannel(Channel, Protocol):
+    """A channel whose named instances can be configured through Core."""
+
+    def management_descriptor(self) -> dict: ...
+
+    def topic_bindings(self, topic_uuid: str) -> list[dict]: ...
+
+    def create_instance(self, values: Mapping[str, Any]) -> ChannelResult: ...
+
+    def update_instance(self, values: Mapping[str, Any]) -> ChannelResult: ...
+
+    def test_instance(self, values: Mapping[str, Any]) -> ChannelResult: ...
+
+    def delete_instance(self, instance_id: str) -> ChannelResult: ...
+
+    def detach_instance_topics(
+        self, topic_uuids: Iterable[str], instance_id: str,
+    ) -> ChannelResult: ...
+
+
+@runtime_checkable
+class LivenessChannel(Channel, Protocol):
+    """A channel that can describe one routed peer's current reachability."""
+
+    def peer_liveness_for_address(
+        self, peer_addr: str, topic_uuid: str | None = None,
+    ) -> dict | None: ...
+
+
+@runtime_checkable
+class BlobChannel(Channel, Protocol):
+    """A channel that can retrieve a blob through an explicit topic route."""
+
+    def read_blob(
+        self, blob_id: str, allow_remote: bool = True, *,
+        peer_addr: str | None = None, topic_uuid: str | None = None,
+    ) -> bytes | None: ...
+
+
+@runtime_checkable
+class PairingChannel(Channel, Protocol):
+    """A channel that pairs sibling clients and reports sibling conflicts."""
+
+    def compose_pairing_token(self, target_id: str = "") -> ChannelResult: ...
+
+    def accept_pairing_token(self, token: dict) -> ChannelResult: ...
+
+    def sibling_alarms(self) -> list[dict]: ...
+
+    def resolve_sibling_alarm(
+        self, topic_uuid: str, decision: str,
+    ) -> ChannelResult: ...
+
+
+@runtime_checkable
+class PersistenceParticipant(Channel, Protocol):
+    """A channel whose state must be locked while Core persists Session."""
+
+    persistence_lock: ContextManager[Any]
+
+
+@dataclass(frozen=True)
+class PollCycleResult:
+    """Structured result of one complete endpoint-owned polling cycle."""
+
+    ok: bool
+    changed: bool = False
+    published_before: tuple[Any, ...] = ()
+    published_after: tuple[Any, ...] = ()
+    applied: tuple[Any, ...] = ()
+    duration_seconds: float = 0.0
+    work_duration_seconds: float = 0.0
+    acknowledgement_wait_seconds: float | None = None
+    error: str | None = None
 
 
 @runtime_checkable
 class PollingEndpoint(Protocol):
+    """One independently scheduled channel connection.
+
+    ``poll_once`` owns the complete transport cycle, diagnostics, and response
+    publication. ``after_apply`` lets Core drain application reconciliation
+    after remote state is applied and before the endpoint publishes its
+    acknowledgement.
+    """
+
     poll_interval_seconds: float
 
     def has_active_relationship(self) -> bool: ...
-    def write_presence(self) -> None: ...
-    def publish_due_topics(self) -> list[Any]: ...
-    def poll_and_apply(self) -> list[Any]: ...
+
+    def poll_once(
+        self, after_apply: Callable[[], Any] | None = None,
+    ) -> PollCycleResult: ...
+
+    def polling_diagnostics(self) -> Mapping[str, Any]: ...
 
 
 @runtime_checkable
@@ -138,48 +223,82 @@ class ChannelManager:
     def compose_token(
         self,
         topic_uuids: Iterable[Any],
-        channel_options: Mapping[str, Mapping[str, Any]] | None = None,
+        topic_channels: Mapping[str, Mapping[str, Any]] | None = None,
     ) -> ChannelResult:
         topics = self._topics(topic_uuids)
         if not topics:
             return ChannelResult.error("choose at least one topic", 400)
-        options_by_kind = (
-            {} if channel_options is None else channel_options
-        )
-        if not isinstance(options_by_kind, Mapping):
-            return ChannelResult.error("channel_options must be an object", 400)
-        channels = self.channels()
-        unknown = sorted(set(options_by_kind) - {item.kind for item in channels})
-        if unknown:
-            return ChannelResult.error(
-                f"unknown channel option: {unknown[0]}", 400,
-            )
-        if len(options_by_kind) != 1:
-            return ChannelResult.error(
-                "select exactly one channel for the invitation", 400,
-            )
-        offered_channels = tuple(
-            channel for channel in channels
-            if channel.kind in options_by_kind
-        )
         identity = self.session.identity
         invitation_topics = self._topics((*topics, identity.uuid))
-        descriptors = []
-        for channel in offered_channels:
-            options = options_by_kind.get(channel.kind) or {}
-            if not isinstance(options, Mapping):
+        if not isinstance(topic_channels, Mapping):
+            return ChannelResult.error(
+                "topic-to-channel mapping is missing or incomplete", 400,
+            )
+        routes = {
+            str(topic_uuid): route
+            for topic_uuid, route in topic_channels.items()
+        }
+        if set(routes) != set(invitation_topics):
+            return ChannelResult.error(
+                "topic-to-channel mapping is missing or incomplete", 400,
+            )
+        channels = self.channels()
+        channels_by_kind = {channel.kind: channel for channel in channels}
+        grouped_routes: list[dict[str, Any]] = []
+        ordered_topics = (
+            identity.uuid,
+            *(topic_uuid for topic_uuid in invitation_topics
+              if topic_uuid != identity.uuid),
+        )
+        for topic_uuid in ordered_topics:
+            route = routes[topic_uuid]
+            if not isinstance(route, Mapping):
                 return ChannelResult.error(
-                    f"options for channel {channel.kind!r} must be an object", 400,
+                    "topic-to-channel mapping is missing or incomplete", 400,
                 )
-            # The identity topic must travel over the selected route too. It
-            # is not an out-of-band HTTP fallback.
-            offered = channel.offer_descriptor(invitation_topics, options)
+            kind = str(route.get("kind") or "").strip()
+            channel = channels_by_kind.get(kind)
+            if channel is None:
+                return ChannelResult.error(
+                    f"unknown channel option: {kind or topic_uuid}", 400,
+                )
+            options = {
+                str(key): value
+                for key, value in route.items()
+                if key != "kind"
+            }
+            group = next((
+                item for item in grouped_routes
+                if item["channel"] is channel and item["options"] == options
+            ), None)
+            if group is None:
+                group = {
+                    "channel": channel,
+                    "options": options,
+                    "topics": [],
+                }
+                grouped_routes.append(group)
+            group["topics"].append(topic_uuid)
+
+        descriptors = []
+        topic_channel_ids = {}
+        for index, group in enumerate(grouped_routes, start=1):
+            channel = group["channel"]
+            route_topics = tuple(group["topics"])
+            offered = channel.offer_descriptor(
+                route_topics, group["options"],
+            )
             if not offered.ok:
-                if channel.kind in options_by_kind:
-                    return offered
-                continue
-            if offered.value:
-                descriptors.append(dict(offered.value))
+                return offered
+            if not offered.value:
+                return ChannelResult.error("no channel available", 409)
+            channel_id = f"channel-{index}"
+            descriptors.append({
+                **dict(offered.value),
+                "channel_id": channel_id,
+            })
+            for topic_uuid in route_topics:
+                topic_channel_ids[topic_uuid] = channel_id
         if not descriptors:
             return ChannelResult.error("no channel available", 409)
         return ChannelResult.success({
@@ -187,6 +306,7 @@ class ChannelManager:
             "identity": identity.to_dict(),
             "topic_uuids": list(invitation_topics),
             "channels": descriptors,
+            "topic_channels": topic_channel_ids,
         })
 
     def accept_token(self, token: dict) -> ChannelResult:
@@ -211,6 +331,7 @@ class ChannelManager:
             token.get("identity"),
             token.get("topic_uuids") or [],
             token.get("channels") or [],
+            token.get("topic_channels"),
         )
 
     def accept_invitation(
@@ -218,124 +339,136 @@ class ChannelManager:
         identity: dict | None,
         topic_uuids: Iterable[Any],
         descriptors: Iterable[Any],
+        topic_channels: Mapping[str, Any] | None = None,
     ) -> ChannelResult:
         invitation = Invitation(identity, self._topics(topic_uuids))
         offered = [item for item in descriptors if isinstance(item, dict)]
+        if (
+            not invitation.inviter_identity_uuid
+            or invitation.inviter_identity_uuid not in invitation.topic_uuids
+        ):
+            return ChannelResult.error("token missing identity topic", 400)
+        if not isinstance(topic_channels, Mapping):
+            return ChannelResult.error(
+                "topic-to-channel mapping is missing or incomplete", 400,
+            )
+        topic_channel_ids = {
+            str(topic_uuid): str(channel_id or "").strip()
+            for topic_uuid, channel_id in topic_channels.items()
+        }
+        if (
+            set(topic_channel_ids) != set(invitation.topic_uuids)
+            or not all(topic_channel_ids.values())
+        ):
+            return ChannelResult.error(
+                "topic-to-channel mapping is missing or incomplete", 400,
+            )
+
         results: dict[str, Any] = {}
         errors: dict[str, str] = {}
-        candidates = []
+        candidates: dict[str, tuple[Channel, dict]] = {}
         for descriptor in offered:
+            channel_id = str(descriptor.get("channel_id") or "").strip()
             owner = self._descriptor_owner.get(str(descriptor.get("type") or ""))
             if (
+                channel_id
+                and
                 owner
                 and descriptor.get("descriptor_version")
                 == CHANNEL_DESCRIPTOR_VERSION
             ):
-                candidates.append((self.channel(owner), descriptor))
-        if len(candidates) != 1:
-            reason = (
-                "token must select exactly one channel"
-                if candidates else "no supported channel in token"
-            )
-            self.session.trace_event(
-                "transport.connect_token_rejected",
-                offered_channel_types=[item.get("type") for item in offered],
-                errors=errors,
-            )
-            return ChannelResult.error(reason, 409).with_value({"errors": errors})
-        selected_channel, descriptor = candidates[0]
-        accepted = selected_channel.accept_descriptor(descriptor, invitation)
-        selected = accepted.value
-        if not accepted.ok or not isinstance(selected, ChannelAcceptance):
-            errors[selected_channel.kind] = (
-                accepted.reason or "channel unavailable"
-            )
+                if channel_id in candidates:
+                    return ChannelResult.error(
+                        "token contains duplicate channel identifiers", 400,
+                    )
+                candidates[channel_id] = (self.channel(owner), descriptor)
+        referenced_ids = set(topic_channel_ids.values())
+        if not referenced_ids or not referenced_ids.issubset(candidates):
             self.session.trace_event(
                 "transport.connect_token_rejected",
                 offered_channel_types=[item.get("type") for item in offered],
                 errors=errors,
             )
             return ChannelResult.error(
-                f"{selected_channel.kind}: {errors[selected_channel.kind]}",
-                409,
+                "topic-to-channel mapping is missing or incomplete", 400,
             ).with_value({"errors": errors})
-        results[selected_channel.kind] = dict(selected.details)
 
-        selected_addr = selected.peer_addr
+        accepted_routes = []
+        for channel_id, (selected_channel, descriptor) in candidates.items():
+            route_topics = self._topics(
+                topic_uuid
+                for topic_uuid, mapped_channel_id in topic_channel_ids.items()
+                if mapped_channel_id == channel_id
+            )
+            if not route_topics:
+                continue
+            route_invitation = Invitation(identity, route_topics)
+            accepted = selected_channel.accept_descriptor(
+                descriptor, route_invitation,
+            )
+            selected = accepted.value
+            if not accepted.ok or not isinstance(selected, ChannelAcceptance):
+                errors[channel_id] = accepted.reason or "channel unavailable"
+                self.session.trace_event(
+                    "transport.connect_token_rejected",
+                    offered_channel_types=[item.get("type") for item in offered],
+                    errors=errors,
+                )
+                return ChannelResult.error(
+                    f"{selected_channel.kind}: {errors[channel_id]}", 409,
+                ).with_value({"errors": errors})
+            results[channel_id] = dict(selected.details)
+            accepted_routes.append((
+                selected_channel, selected, route_topics,
+            ))
+
         identity_key = (
             identity.get("data", {}).get("identity_key")
             if isinstance(identity, dict) else None
         )
-        if identity_key:
-            for old_addr in self.session.addresses_for_identity(identity_key):
-                if old_addr == selected_addr:
-                    continue
-                # Selection is topic-scoped: a new direct route for one topic
-                # cannot erase an SFTP route for another (or vice versa).
-                self.session.remove_peer_topics(
-                    old_addr, invitation.topic_uuids,
-                )
+        for selected_channel, selected, route_topics in accepted_routes:
+            selected_addr = selected.peer_addr
+            if identity_key:
+                for old_addr in self.session.addresses_for_identity(identity_key):
+                    if old_addr != selected_addr:
+                        self.session.remove_peer_topics(
+                            old_addr, route_topics,
+                        )
+            if isinstance(identity, dict):
+                self.session.apply_peer_identity_snapshot(selected_addr, identity)
+            self.session.bind_peer_topics_channel(
+                selected_addr, route_topics, selected_channel.kind,
+            )
 
-        if isinstance(identity, dict):
-            self.session.apply_peer_identity_snapshot(selected_addr, identity)
-        self.session.bind_peer_topics_channel(
-            selected_addr, invitation.topic_uuids, selected_channel.kind,
-        )
+        channel_kinds = sorted({
+            channel.kind for channel, _selected, _topics in accepted_routes
+        })
         self.session.trace_event(
             "transport.connect_token_selected",
-            selected_type=selected_channel.kind,
-            selected_addr=selected_addr,
+            selected_types=channel_kinds,
+            selected_addrs=sorted({
+                selected.peer_addr
+                for _channel, selected, _topics in accepted_routes
+            }),
         )
         return ChannelResult.success({
             "status": "ok",
-            "channels_used": [selected_channel.kind],
+            "channels_used": channel_kinds,
             "results": results,
         })
 
-    def _effect_channel(self, effect):
-        selected_kind = str(
-            getattr(effect, "channel_kind", "") or ""
-        ).strip()
-        if not selected_kind:
-            raise RuntimeError("Session effect has no explicit channel")
-        selected = self.channel(selected_kind)
-        if isinstance(selected, EffectDeliveryChannel):
-            return selected
-        if selected is not None:
-            raise RuntimeError(
-                f"selected channel {selected.kind!r} cannot deliver Session effects"
-            )
-        raise RuntimeError(f"selected channel {selected_kind!r} is not registered")
-
-    def execute_effect(self, effect):
-        return self._effect_channel(effect).execute_effect(effect)
-
-    def execute_effects(self, effects):
-        effects = list(effects)
-        if not effects:
-            return []
-        grouped: dict[str, tuple[Any, list[tuple[int, Any]]]] = {}
-        for index, effect in enumerate(effects):
-            channel = self._effect_channel(effect)
-            grouped.setdefault(channel.kind, (channel, []))[1].append((index, effect))
-        deliveries = [None] * len(effects)
-        for channel, indexed_effects in grouped.values():
-            produced = list(channel.execute_effects([
-                effect for _index, effect in indexed_effects
-            ]))
-            if len(produced) != len(indexed_effects):
-                raise RuntimeError(
-                    f"channel {channel.kind!r} returned an invalid delivery count"
-                )
-            for (index, _effect), delivery in zip(indexed_effects, produced):
-                deliveries[index] = delivery
-        return deliveries
 
     def polling_endpoints(self) -> list[PollingEndpoint]:
         endpoints = []
         for channel in self.channels():
             if isinstance(channel, PollingChannel):
-                endpoints.extend(channel.polling_endpoints())
+                for endpoint in channel.polling_endpoints():
+                    if not isinstance(endpoint, PollingEndpoint):
+                        raise TypeError(
+                            f"channel {channel.kind!r} returned an invalid"
+                            " polling endpoint"
+                        )
+                    endpoints.append(endpoint)
         return endpoints
 
     def status(self) -> dict:
@@ -347,7 +480,12 @@ class ChannelManager:
     def network_info(
         self, topic_uuid: str | None = None, *, include_channel_status: bool = False,
     ) -> dict:
-        """Return Session network state enriched by channel capabilities."""
+        """Return Session network state enriched by channel capabilities.
+
+        Whether a peer is reachable is a question only the channel can
+        answer, and it answers it the only way a mailbox can: by how recent
+        the heartbeat beside their publications is.
+        """
         info = self.session.get_network_info()
         for addr, peer_info in (info.get("peers") or {}).items():
             channel_kind = (
@@ -361,23 +499,15 @@ class ChannelManager:
             if not channel_kind:
                 peer_info["status"] = {
                     "state": "offline",
-                    "failures": 0,
-                    "last_seen": None,
                     "last_error": "No channel is selected for this topic",
                 }
-            elif channel_kind == "mailbox":
+            else:
+                alive = (liveness or {}).get("state") == "alive"
                 peer_info["status"] = {
-                    "state": (
-                        "online"
-                        if (liveness or {}).get("state") == "alive"
-                        else "offline"
-                    ),
-                    "failures": 0,
-                    "last_seen": None,
+                    "state": "online" if alive else "offline",
                     "last_error": (
-                        None
-                        if (liveness or {}).get("state") == "alive"
-                        else "Mailbox peer is not currently reachable"
+                        None if alive
+                        else "This peer is not currently reachable"
                     ),
                 }
         if include_channel_status:
@@ -393,14 +523,10 @@ class ChannelManager:
         )
         if not kind:
             return {"state": "unrouted"}
-        channel = self.channel(kind) if kind else None
-        liveness = getattr(channel, "peer_liveness_for_address", None)
-        if liveness:
-            return liveness(peer_addr, topic_uuid)
-        status = self.session.peer_status.get(peer_addr) or {}
-        return {
-            "state": "alive" if status.get("state") == "online" else "stale",
-        }
+        channel = self.channel(kind)
+        if not isinstance(channel, LivenessChannel):
+            return None
+        return channel.peer_liveness_for_address(peer_addr, topic_uuid)
 
     def close(self) -> None:
         for channel in reversed(self.channels()):
@@ -410,9 +536,8 @@ class ChannelManager:
     def persistence_guard(self):
         with ExitStack() as stack:
             for channel in self.channels():
-                lock = getattr(channel, "persistence_lock", None)
-                if lock is not None:
-                    stack.enter_context(lock)
+                if isinstance(channel, PersistenceParticipant):
+                    stack.enter_context(channel.persistence_lock)
             yield
 
     def read_topic_blob(
@@ -427,80 +552,11 @@ class ChannelManager:
         if not channel_kind:
             return None
         channel = self.channel(channel_kind)
-        reader = getattr(channel, "read_blob", None)
-        if not reader:
+        if not isinstance(channel, BlobChannel):
             return None
-        return reader(
+        return channel.read_blob(
             blob_id,
             allow_remote=True,
             peer_addr=peer_addr,
             topic_uuid=topic_uuid,
-        )
-
-    # Named targets remain a concrete mailbox feature until a genuinely
-    # distinct second targeted channel exists. Apps use these manager-level
-    # operations without selecting or importing the mailbox implementation.
-    def _target_channel(self):
-        channel = self.channel("mailbox")
-        if channel is None:
-            raise RuntimeError("mailbox channel is not registered")
-        return channel
-
-    def list_targets(self):
-        return self._target_channel().list_targets()
-
-    def target_for_topic(self, topic_uuid: str):
-        return self._target_channel().target_for_topic(topic_uuid)
-
-    def assign_topic_target(self, topic_uuid: str, target_id: str | None):
-        return self._target_channel().assign_topic_target(topic_uuid, target_id)
-
-    def peer_liveness(self, peer_id: str, target_id: str | None = None):
-        return self._target_channel().peer_liveness(peer_id, target_id)
-
-    def leave_topic(self, topic_uuid: str):
-        deliveries = []
-        for channel in self.channels():
-            method = getattr(channel, "leave_topic", None)
-            if method:
-                deliveries.extend(method(topic_uuid) or [])
-        return deliveries
-
-    def disconnect(self):
-        deliveries = []
-        for channel in self.channels():
-            method = getattr(channel, "disconnect", None)
-            if method:
-                deliveries.extend(method() or [])
-        return deliveries
-
-    def leave(self):
-        deliveries = []
-        for channel in self.channels():
-            method = getattr(channel, "leave", None)
-            if method:
-                deliveries.extend(method() or [])
-        return deliveries
-
-    def _http_channel(self):
-        channel = self.channel("http")
-        if channel is None:
-            raise RuntimeError("direct HTTP channel is not registered")
-        return channel
-
-    def join_discussion(self, address, topic_uuid=None, topic_uuids=None):
-        return self._http_channel().join_discussion(
-            address, topic_uuid, topic_uuids,
-        )
-
-    def invite_to_discuss(
-        self, address, topic_uuid=None, topic_uuids=None, read_only=False,
-    ):
-        return self._http_channel().invite_to_discuss(
-            address, topic_uuid, topic_uuids, read_only=read_only,
-        )
-
-    def observe_topic(self, address, topic_uuid=None, topic_uuids=None):
-        return self._http_channel().observe_topic(
-            address, topic_uuid, topic_uuids,
         )
