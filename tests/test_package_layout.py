@@ -76,6 +76,15 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertIn("this._renderAgenda()", pane_refresh)
         self.assertIn("agenda.contains(document.activeElement)", pane_refresh)
 
+    def test_agenda_reordering_uses_one_mouse_drag_path(self):
+        agenda_row = SHARED_JS.split("_agendaRow(item) {", 1)[1].split(
+            "\n  _renderAgenda() {", 1,
+        )[0]
+        self.assertIn('document.addEventListener("mousemove", move)', agenda_row)
+        self.assertIn('document.addEventListener("mouseup", up)', agenda_row)
+        self.assertNotIn("row.draggable = true", agenda_row)
+        self.assertNotIn("row.ondrop", agenda_row)
+
     def test_domain_logic_modules_do_not_depend_on_host_or_http_controllers(self):
         paths = [
             ROOT / "src" / "sovereign" / "protocol_explorer.py",
@@ -184,6 +193,19 @@ class ThemeTests(unittest.TestCase):
         self.assertIn('getElementById("shellThemeSelect").onchange', SHARED_JS)
         save = SHARED_JS.split("async _saveProfile(", 1)[1].split("\n  },", 1)[0]
         self.assertNotIn("shellThemeSelect", save)
+
+
+class ShellLayoutTests(unittest.TestCase):
+    SHARED_CSS = files("sovereign.assets").joinpath("shared.css").read_text(
+        encoding="utf-8",
+    )
+
+    def test_short_topic_titles_do_not_pull_the_menu_offscreen(self):
+        menu = self.SHARED_CSS.split(".shell-topic-menu {", 1)[1].split(
+            "}", 1,
+        )[0]
+        self.assertIn("left: 0", menu)
+        self.assertNotIn("translateX", menu)
 
 
 class ShippedExampleAssetTests(unittest.TestCase):

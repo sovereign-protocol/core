@@ -251,7 +251,14 @@ class MailboxChannel:
 
     def close(self) -> None:
         for connection in self._manager.all_connections():
-            connection.storage.close()
+            storage = connection.storage
+            if storage is None:
+                continue
+            storage.close()
+            # Shutdown may be entered again after a partial lifespan failure.
+            # Mark the resource closed so a second pass remains a no-op.
+            if connection.storage is storage:
+                connection.storage = None
 
     def list_targets(self):
         return self._manager.list_targets()

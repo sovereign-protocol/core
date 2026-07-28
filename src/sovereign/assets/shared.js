@@ -1117,7 +1117,6 @@ Object.assign(SovereignShell, {
 
     if (routes && routes.move) {
       row.classList.add("has-drag");
-      row.draggable = true;
       const handle = document.createElement("button");
       handle.type = "button";
       handle.className = "shell-agenda-drag";
@@ -1181,28 +1180,11 @@ Object.assign(SovereignShell, {
         document.addEventListener("mousemove", move);
         document.addEventListener("mouseup", up);
       };
-      row.ondragstart = (event) => {
-        if (this._dragAgendaUuid !== item.uuid) {
-          event.preventDefault();
-          return;
-        }
-        if (event.dataTransfer) {
-          event.dataTransfer.effectAllowed = "move";
-          event.dataTransfer.setData("text/plain", item.uuid);
-        }
-      };
-      row.ondragover = (event) => {
-        if (!this._dragAgendaUuid || this._dragAgendaUuid === item.uuid) return;
-        event.preventDefault();
-        targetAt(event.clientX, event.clientY);
-      };
-      row.ondrop = (event) => {
-        event.preventDefault();
-        finishDrag(event.clientX, event.clientY);
-      };
-      row.ondragend = () => {
-        if (this._dragAgendaUuid === item.uuid) clearDrag();
-      };
+      // Do not also opt the row into native HTML drag-and-drop. WebView2 can
+      // switch from these mouse handlers to native dragging after mousedown;
+      // the drop then belongs to the target row and its item closure, which
+      // rejects the source UUID. One mouse path keeps the source authoritative
+      // and works consistently in the desktop window and ordinary browsers.
       row.append(handle);
     }
 

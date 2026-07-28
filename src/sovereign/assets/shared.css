@@ -406,7 +406,7 @@ dialog menu .danger:not(:last-child) {
   display: none;
   position: absolute;
   top: calc(100% + 6px);
-  left: 50%;
+  left: 0;
   z-index: 930;
   min-width: min(280px, 70vw);
   max-height: 280px;
@@ -416,7 +416,6 @@ dialog menu .danger:not(:last-child) {
   border-radius: 8px;
   background: var(--shell-surface);
   box-shadow: 0 14px 34px rgba(0, 0, 0, 0.35);
-  transform: translateX(-50%);
 }
 .shell-topic-picker.open .shell-topic-menu {
   display: flex;

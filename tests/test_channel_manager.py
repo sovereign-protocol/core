@@ -113,6 +113,14 @@ class _PollingChannel(_Channel):
         return [self.endpoint]
 
 
+class _CloseableStorage:
+    def __init__(self):
+        self.close_count = 0
+
+    def close(self):
+        self.close_count += 1
+
+
 class ChannelManagerTests(unittest.TestCase):
     def test_shipped_relay_backends_satisfy_storage_contract(self):
         self.assertIsInstance(LocalFolderRelayStorage("relay"), RelayStorage)
@@ -133,6 +141,20 @@ class ChannelManagerTests(unittest.TestCase):
         self.assertIsInstance(mailbox, PairingChannel)
         self.assertIsInstance(mailbox, PersistenceParticipant)
         self.assertIsInstance(mailbox, PollingChannel)
+
+    def test_mailbox_close_skips_unconfigured_storage_and_is_repeatable(self):
+        storage = _CloseableStorage()
+        configured = type("Connection", (), {"storage": storage})()
+        unconfigured = type("Connection", (), {"storage": None})()
+        mailbox = MailboxChannel(type("Manager", (), {
+            "all_connections": lambda self: [configured, unconfigured],
+        })())
+
+        mailbox.close()
+        mailbox.close()
+
+        self.assertEqual(storage.close_count, 1)
+        self.assertIsNone(configured.storage)
 
     def test_minimal_third_party_channel_loses_no_implicit_functionality(self):
         session = Session("http://a")

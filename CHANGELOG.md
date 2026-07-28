@@ -2,6 +2,15 @@
 
 ## Unreleased
 
+- **Fixed: dragging an agenda item could show the drop position but leave the
+  order unchanged in the desktop window.** The shared shell now uses one
+  mouse-drag path instead of competing with WebView2's native HTML drag.
+- **Fixed: shutting down a CLI host failed when a retired or unconfigured
+  mailbox connection had no storage backend to close.** Mailbox shutdown now
+  skips absent storage and is safe to repeat.
+- **Fixed: the topic selector menu was centered on short titles and could open
+  beyond the window's left edge.** It now aligns with the topic field's left
+  edge.
 - Core is now version `0.1.4`; Session registries are private, controller
   result handling is centralized, and pairing/storage capability contracts
   are explicit.
