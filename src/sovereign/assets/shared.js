@@ -1437,21 +1437,6 @@ Object.assign(SovereignShell, {
       "</fieldset>",
       '<p id="shellTargetsNote" class="shell-note"></p>',
       "</div>",
-      // Pairing gets its own section rather than another channel action. An
-      // invite token connects you to another person; a pairing token makes a
-      // second machine into *you*. Side by side those read as variations of
-      // one thing, which is the confusion the token kinds are checked for
-      // server-side - better not to invite it in the first place.
-      '<div class="shell-pane-section">',
-      "<h3>My other clients</h3>",
-      '<p class="shell-note">A paired client is not another person: it'
-      + " publishes as you, and everything you own follows it.</p>",
-      '<button type="button" id="shellPairClientBtn">Generate pairing token</button>',
-      '<p class="shell-note">Paste it into the other client under'
-      + " &quot;Use a token&quot;. Pair a client that has nothing on it yet -"
-      + " content already there cannot be merged, only chosen between.</p>",
-      '<p id="shellPairingNote" class="shell-note"></p>',
-      "</div>",
       "</aside>",
       '<dialog id="shellChannelManager" class="shell-dialog">',
       '<div class="shell-pane-header">',
@@ -1472,6 +1457,25 @@ Object.assign(SovereignShell, {
       '<button type="button" id="shellCancelChannelBtn">Cancel</button>',
       "</div>",
       "</fieldset>",
+      // Pairing lives here, beside the channel list, because that is what it
+      // is about: a pairing token carries this client's channels, not the
+      // board that happens to be open. It is deliberately not a channel row
+      // action - an invite token connects you to another person, a pairing
+      // token makes a second machine into *you*, and side by side as row
+      // actions those read as variations of one thing.
+      '<div class="shell-pane-section shell-pairing-section">',
+      "<h3>My other clients</h3>",
+      '<p class="shell-note">A paired client is not another person: it'
+      + " publishes as you, over the channels above, and everything you own"
+      + " follows it.</p>",
+      '<button type="button" id="shellPairClientBtn">Generate pairing token</button>',
+      '<p class="shell-note">Paste it into the other client under'
+      + " &quot;Use a token&quot;. Pair a client that has nothing on it yet -"
+      + " content already there cannot be merged, only chosen between."
+      + " Generating a token again later adds any new channels to the ones"
+      + " the paired client already has.</p>",
+      '<p id="shellPairingNote" class="shell-note"></p>',
+      "</div>",
       '<p id="shellChannelManagerNote" class="shell-note"></p>',
       "</dialog>",
     ].join("");
@@ -1787,11 +1791,17 @@ Object.assign(SovereignShell, {
           },
         ));
       }
-      actions.append(this._channelAction(
-        "Get token",
-        () => this._copyToken(channel.ref, channel.name),
-        "primary",
-      ));
+      // Only for a channel this topic is actually on. Inviting someone to a
+      // channel is a decision to publish here, and that decision is the
+      // "Use for this topic" above - taken first, and revocable from the same
+      // row. A direct connection has nothing to assign, so it always offers.
+      if (channel.in_use || channel.type === "direct") {
+        actions.append(this._channelAction(
+          "Get invitation",
+          () => this._copyToken(channel.ref, channel.name),
+          "primary",
+        ));
+      }
       row.append(identity, statuses, actions);
       list.append(row);
     }

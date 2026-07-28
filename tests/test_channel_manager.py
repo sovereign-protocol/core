@@ -373,28 +373,58 @@ class ChannelManagerTests(unittest.TestCase):
         direct.invite_to_discuss("http://b", "topic", read_only=True)
         self.assertEqual(adapter.invites[0][1], {"read_only": True})
 
-    def test_mailbox_channel_assigns_offer_and_accepts_with_inviter_identity(self):
+    def _offer_manager(self, session, assigned_topics=()):
         class Manager:
             def __init__(self):
+                self.session = session
+                self.assigned = list(assigned_topics)
                 self.assignments = []
                 self.accepted = []
 
             def target_descriptor(self, target_id):
                 return {"type": "relay", "identity": "A", "target_id": target_id}
 
+            def target_for_topic(self, topic_uuid):
+                return "target" if topic_uuid in self.assigned else None
+
             def assign_topics_target(self, topics, target_id):
                 self.assignments.append((topics, target_id))
+                self.assigned.extend(topics)
                 return type("Result", (), {"status": "ok", "value": target_id})()
 
             def accept_descriptor(self, descriptor, topics, inviter_uuid):
                 self.accepted.append((descriptor, topics, inviter_uuid))
                 return type("Result", (), {"status": "ok", "value": "target"})()
 
-        manager = Manager()
+        return Manager()
+
+    def test_mailbox_offer_refuses_a_topic_the_channel_is_not_used_for(self):
+        # Composing an invitation is not how a board gets bound to a channel.
+        # It used to be, so asking for a token once bound it for good.
+        session = Session("http://a")
+        manager = self._offer_manager(session)
         channel = MailboxChannel(manager)
+
         offered = channel.offer_descriptor(("topic",), {"target_id": "target"})
-        self.assertTrue(offered.ok)
-        self.assertEqual(manager.assignments, [(["topic"], "target")])
+
+        self.assertFalse(offered.ok)
+        self.assertIn("use this channel", offered.reason)
+        self.assertEqual(manager.assignments, [])
+
+    def test_mailbox_offer_accepts_with_inviter_identity_once_in_use(self):
+        session = Session("http://a")
+        identity_uuid = session.identity.uuid
+        manager = self._offer_manager(session, assigned_topics=["topic"])
+        channel = MailboxChannel(manager)
+
+        offered = channel.offer_descriptor(
+            ("topic", identity_uuid), {"target_id": "target"},
+        )
+
+        self.assertTrue(offered.ok, offered.reason)
+        # Only the identity topic is assigned here: it is not a board, so it
+        # follows the invitation's route rather than needing its own decision.
+        self.assertEqual(manager.assignments, [([identity_uuid], "target")])
 
         invitation = Invitation({"uuid": "inviter"}, ("topic",))
         accepted = channel.accept_descriptor(offered.value, invitation)

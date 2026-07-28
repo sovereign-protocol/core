@@ -630,7 +630,9 @@ class PairingTokenTests(unittest.TestCase):
 
             self.assertTrue(token.ok, getattr(token, "reason", ""))
             self.assertEqual(token.value["token_kind"], "pairing")
-            self.assertEqual(token.value["channel"]["root"], relay_root)
+            self.assertEqual(
+                [item["root"] for item in token.value["channels"]], [relay_root],
+            )
 
     def test_a_target_configured_relay_pairs_end_to_end(self):
         # The whole flow the way the application sets it up: relay added as a
@@ -652,8 +654,8 @@ class PairingTokenTests(unittest.TestCase):
             )
             token = desktop.collaboration.compose_pairing_token()
             self.assertTrue(token.ok, getattr(token, "reason", ""))
-            paired = desktop.relay_manager._pairing_connection()
-            paired.publish_due_topics()
+            for paired in desktop.relay_manager._pairing_connections():
+                paired.publish_due_topics()
 
             laptop = self.runtime(8830, "laptop", state_dir)
             accepted = laptop.collaboration.accept_pairing_token(token.value)
@@ -665,6 +667,70 @@ class PairingTokenTests(unittest.TestCase):
             self.assertEqual(
                 [child.data["text"] for child in adopted.live_children()],
                 ["start"],
+            )
+
+    def test_a_pairing_token_carries_every_relay_in_use(self):
+        # A sibling is a copy of this client, so it is given every relay this
+        # one has. Choosing between them used to be required, and refused with
+        # "several relays are configured - say which one to pair over" as soon
+        # as a second relay existed.
+        with tempfile.TemporaryDirectory() as first_root, \
+                tempfile.TemporaryDirectory() as second_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            desktop = self.runtime(8831, "desktop", state_dir)
+            desktop.relay_manager.create_target({
+                "backend": "local", "name": "Home", "root": first_root,
+            })
+            desktop.relay_manager.create_target({
+                "backend": "local", "name": "Work", "root": second_root,
+            })
+
+            token = desktop.collaboration.compose_pairing_token()
+
+            self.assertTrue(token.ok, getattr(token, "reason", ""))
+            self.assertEqual(
+                sorted(item["root"] for item in token.value["channels"]),
+                sorted([first_root, second_root]),
+            )
+
+    def test_pairing_again_adds_channels_instead_of_replacing_them(self):
+        # Generating a token later, with more channels, must leave the sibling
+        # holding both sets - the point of re-pairing is to extend what the
+        # other client can reach, not to swap it.
+        with tempfile.TemporaryDirectory() as first_root, \
+                tempfile.TemporaryDirectory() as second_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            desktop = self.runtime(8832, "desktop", state_dir)
+            desktop.relay_manager.create_target({
+                "backend": "local", "name": "Home", "root": first_root,
+            })
+            first_token = desktop.collaboration.compose_pairing_token()
+            self.assertTrue(first_token.ok, getattr(first_token, "reason", ""))
+
+            laptop = self.runtime(8833, "laptop", state_dir)
+            self.assertTrue(
+                laptop.collaboration.accept_pairing_token(first_token.value).ok,
+            )
+
+            desktop.relay_manager.create_target({
+                "backend": "local", "name": "Work", "root": second_root,
+            })
+            second_token = desktop.collaboration.compose_pairing_token()
+            self.assertTrue(second_token.ok, getattr(second_token, "reason", ""))
+
+            accepted = laptop.collaboration.accept_pairing_token(second_token.value)
+
+            self.assertTrue(accepted.ok, getattr(accepted, "reason", ""))
+            roots = sorted(
+                str(conn.storage.root)
+                for conn in laptop.relay_manager._pairing_connections()
+            )
+            self.assertEqual(roots, sorted([first_root, second_root]))
+            # One publication identity across every relay, or the sibling is a
+            # peer of itself on the ones the identity did not reach.
+            self.assertEqual(
+                {conn.identity for conn in laptop.relay_manager._pairing_connections()},
+                {first_token.value["client_id"]},
             )
 
     def test_the_shell_offers_pairing_and_routes_a_pasted_token(self):
@@ -680,6 +746,30 @@ class PairingTokenTests(unittest.TestCase):
         self.assertIn("/api/core/siblings/pairing", shared_js)
         self.assertIn("/api/core/siblings/pairing/accept", shared_js)
         self.assertIn('token.token_kind === "pairing"', shared_js)
+        # Pairing belongs beside the channel list, not in the sharing pane: a
+        # pairing token carries this client's channels, not whichever board
+        # happens to be open. Placement is asserted by position rather than
+        # presence, because the button worked in the wrong place too.
+        dialog_start = shared_js.index('id="shellChannelManager"')
+        self.assertGreater(shared_js.index("shellPairClientBtn"), dialog_start)
+        self.assertGreater(
+            shared_js.index("shellAddChannelBtn"), dialog_start,
+        )
+
+    def test_an_invitation_is_only_offered_for_a_channel_in_use(self):
+        # The shell half of the same rule the mailbox channel enforces: a
+        # channel this topic is not on cannot be invited to, so the button
+        # that would do it is not drawn.
+        shared_js = (
+            Path(__file__).resolve().parents[1]
+            / "src" / "sovereign" / "assets" / "shared.js"
+        ).read_text(encoding="utf-8")
+
+        self.assertIn(
+            'if (channel.in_use || channel.type === "direct") {', shared_js,
+        )
+        self.assertIn('"Get invitation"', shared_js)
+        self.assertNotIn('"Get token"', shared_js)
 
         with tempfile.TemporaryDirectory() as relay_root, \
                 tempfile.TemporaryDirectory() as state_dir:

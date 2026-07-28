@@ -771,6 +771,18 @@ dialog menu .danger:not(:last-child) {
   flex-direction: column;
   gap: 8px;
 }
+/* The same section inside the channel dialog, which supplies its own
+   horizontal padding and ends after this block - so the rule that separates
+   stacked sections in the pane has to move to the top edge here. */
+.shell-pairing-section {
+  padding: 14px 0 0;
+  border-bottom: none;
+  border-top: 1px solid var(--shell-border);
+  margin-top: 14px;
+}
+.shell-pairing-section button {
+  align-self: flex-start;
+}
 .shell-pane-section h3 {
   margin: 0;
   font-size: 12px;

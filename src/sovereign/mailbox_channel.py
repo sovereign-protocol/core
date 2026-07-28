@@ -25,7 +25,28 @@ class MailboxChannel:
         descriptor = self.manager.target_descriptor(target_id)
         if not descriptor:
             return ChannelResult.error("mailbox target not found", 404)
-        assigned = self.manager.assign_topics_target(list(topic_uuids), target_id)
+        # Composing an invitation no longer assigns. Inviting someone to a
+        # channel is a decision to publish this topic there, and that decision
+        # is "use this channel for this board" - taken first, visible in the
+        # interface, and revocable from the same place. Assigning here made
+        # pressing "Get token" once bind the board to the channel for good,
+        # with nothing on screen saying so and nothing ever clearing it.
+        identity_uuid = self.manager.session.identity.uuid
+        unassigned = sorted(
+            topic_uuid for topic_uuid in topic_uuids
+            if topic_uuid != identity_uuid
+            and self.manager.target_for_topic(topic_uuid) != target_id
+        )
+        if unassigned:
+            return ChannelResult.error(
+                "use this channel for the topic before inviting anyone to it",
+                409,
+            )
+        # The identity topic is the exception: it is not a board, is never
+        # "used for" anything, and has to travel over whatever route the
+        # invitation takes or the invitee cannot see who invited them. It
+        # follows the decision rather than needing one of its own.
+        assigned = self.manager.assign_topics_target([identity_uuid], target_id)
         if assigned.status != "ok":
             return ChannelResult.error(assigned.reason or "could not assign topics")
         return ChannelResult.success(descriptor)

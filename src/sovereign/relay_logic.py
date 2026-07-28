@@ -2417,8 +2417,8 @@ class RelayManager:
         with self._manager_lock:
             return self.connections.get(_relay_fingerprint(storage))
 
-    def _pairing_connection(self, target_id: str = "") -> RelayLogic | None:
-        """The connection to pair over.
+    def _pairing_connections(self, target_id: str = "") -> list[RelayLogic]:
+        """Every relay this client can pair over.
 
         Not simply `primary`. A relay added through Manage channels is a
         *target*, and every target gets its own connection keyed by storage
@@ -2426,27 +2426,34 @@ class RelayManager:
         with `relay_root` in a config file, which the packaged executable
         never is. Looking only at primary refused pairing for everyone whose
         relay was configured the ordinary way.
+
+        All of them, not a chosen one. A sibling is a copy of this client, so
+        whatever this client can reach it must be able to reach too. Picking
+        one meant refusing with "several relays are configured - say which one
+        to pair over" the moment a second relay existed, which is the ordinary
+        state for anyone using more than one.
         """
         if target_id:
             connection = self.connection_for_target(target_id)
-            return connection if connection and connection.storage else None
-        if self.primary.storage:
-            return self.primary
-        usable = [conn for conn in self.all_connections() if conn.storage]
-        return usable[0] if len(usable) == 1 else None
+            return [connection] if connection and connection.storage else []
+        usable: list[RelayLogic] = []
+        seen: set[str] = set()
+        for connection in (self.primary, *self.all_connections()):
+            if connection.storage is None:
+                continue
+            # primary and a target can be the same relay; the fingerprint is
+            # what tells two connections apart everywhere else, so use it here
+            # rather than letting one relay into the token twice.
+            fingerprint = _relay_fingerprint(connection.storage)
+            if fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            usable.append(connection)
+        return usable
 
     def compose_pairing_token(self, target_id: str = "") -> SessionResult:
-        connection = self._pairing_connection(target_id)
-        if connection is None:
-            configured = [conn for conn in self.all_connections() if conn.storage]
-            if len(configured) > 1:
-                return SessionResult(
-                    "error",
-                    reason=(
-                        "several relays are configured - say which one to"
-                        " pair over"
-                    ),
-                )
+        connections = self._pairing_connections(target_id)
+        if not connections:
             return SessionResult(
                 "error",
                 reason=(
@@ -2454,8 +2461,25 @@ class RelayManager:
                     " first, since the other client reaches this one through it"
                 ),
             )
-        descriptor = connection.channel_descriptor()
-        if not descriptor:
+        # Siblings publish under one identity, so a token covering several
+        # relays can only carry one. Divergent identities mean this client is
+        # already inconsistent with itself; say so rather than pick one and
+        # leave the sibling a *peer* on every relay the guess was wrong for.
+        identities = {conn.identity for conn in connections}
+        if len(identities) > 1:
+            return SessionResult(
+                "error",
+                reason=(
+                    "these relays publish under different identities, so one"
+                    " pairing token cannot cover them - pair over one at a time"
+                ),
+            )
+        descriptors = []
+        for connection in connections:
+            descriptor = connection.channel_descriptor()
+            if descriptor:
+                descriptors.append(dict(descriptor))
+        if not descriptors:
             return SessionResult("error", reason="no relay channel to pair over")
         # Everything the account owns, not a selected subset. Scoping is for
         # peers; a sibling needs the whole environment.
@@ -2465,14 +2489,15 @@ class RelayManager:
         # drop-box relay has no back-channel announcing that the sibling
         # arrived - so this client would publish nothing and the sibling
         # would find an empty slot and never receive anything at all.
-        if topic_uuids:
-            connection.mark_topics_shared(list(topic_uuids))
-        connection.pair_all_topics()
+        for connection in connections:
+            if topic_uuids:
+                connection.mark_topics_shared(list(topic_uuids))
+            connection.pair_all_topics()
         return SessionResult("ok", value={
             "token_version": CONNECT_TOKEN_VERSION,
             "token_kind": self.PAIRING_TOKEN_KIND,
-            "client_id": connection.identity,
-            "channel": dict(descriptor),
+            "client_id": connections[0].identity,
+            "channels": descriptors,
             "topic_uuids": sorted(topic_uuids),
             "profile": self.session.identity.to_dict(),
         })
@@ -2487,14 +2512,50 @@ class RelayManager:
         if token.get("token_version") != CONNECT_TOKEN_VERSION:
             return SessionResult("error", reason="unrecognized token version")
         client_id = str(token.get("client_id") or "").strip()
-        descriptor = token.get("channel")
-        if not client_id or not isinstance(descriptor, dict):
+        descriptors = [
+            item for item in (token.get("channels") or []) if isinstance(item, dict)
+        ]
+        if not client_id or not descriptors:
             return SessionResult("error", reason="pairing token is incomplete")
         profile = token.get("profile")
         if isinstance(profile, dict):
             adopted = self.session.adopt_pairing_identity(profile)
             if adopted.status != "ok":
                 return adopted
+        topic_uuids = [
+            str(item) for item in (token.get("topic_uuids") or []) if item
+        ]
+        # Identity before storage: the state file is keyed by identity and
+        # location together, so binding storage under the old identity would
+        # tie this client's bookkeeping to a slot it is about to leave. Set
+        # once, before any connection is created, because a connection built
+        # after this point reads it from app_metadata as its own identity.
+        self.session.app_metadata["relay_paired_client_id"] = client_id
+        for descriptor in descriptors:
+            accepted = self._adopt_pairing_channel(
+                descriptor, client_id, topic_uuids,
+            )
+            if accepted.status != "ok":
+                return accepted
+        self.session.trace_event(
+            "relay.pairing_token_accepted",
+            client_id=client_id,
+            channel_count=len(descriptors),
+            topic_count=len(topic_uuids),
+        )
+        return SessionResult("ok", value=client_id)
+
+    def _adopt_pairing_channel(
+        self, descriptor: dict, client_id: str, topic_uuids: list[str],
+    ) -> SessionResult:
+        """Take one relay from a pairing token, adding it if it is new.
+
+        Additive on purpose. A later pairing token may name relays this
+        client already has and relays it does not; the ones it already has
+        are re-keyed to the sibling identity and the rest are registered as
+        ordinary targets, so pairing again with more channels adds them
+        instead of replacing what is here.
+        """
         # Reuse the connection for this relay if there already is one - the
         # accepting client may have the same relay configured as a target -
         # and otherwise let primary adopt it, which is the existing entry
@@ -2502,11 +2563,21 @@ class RelayManager:
         # lookup and not ensure_connection: creating a second connection to
         # storage primary is about to adopt would leave two writers on one
         # machine publishing into the same slot.
-        connection = self._connection_for_descriptor(descriptor) or self.primary
-        # Identity before storage: the state file is keyed by identity and
-        # location together, so binding storage under the old identity would
-        # tie this client's bookkeeping to a slot it is about to leave.
-        self.session.app_metadata["relay_paired_client_id"] = client_id
+        connection = self._connection_for_descriptor(descriptor)
+        if connection is None and self.primary.storage is None:
+            connection = self.primary
+        if connection is None:
+            # primary is already carrying a different relay, so this one
+            # becomes a target of its own - the same shape it would have had
+            # if the user had added it under Manage channels.
+            registered = self.register_descriptor(descriptor)
+            if registered.status != "ok":
+                return registered
+            connection = self.connection_for_target(registered.value)
+            if connection is None:
+                return SessionResult(
+                    "error", reason="relay connection could not be created",
+                )
         connection.identity = client_id
         if connection.storage is None:
             connection.adopt_storage_from_descriptor(descriptor)
@@ -2518,18 +2589,10 @@ class RelayManager:
             return SessionResult(
                 "error", reason="could not open the relay named in the token",
             )
-        topic_uuids = [
-            str(item) for item in (token.get("topic_uuids") or []) if item
-        ]
         if topic_uuids:
             connection.mark_topics_desired(topic_uuids)
         connection.pair_all_topics()
-        self.session.trace_event(
-            "relay.pairing_token_accepted",
-            client_id=client_id,
-            topic_count=len(topic_uuids),
-        )
-        return SessionResult("ok", value=client_id)
+        return SessionResult("ok", value=connection.identity)
 
     # ---- sibling alarms ------------------------------------------------
     # A topic can only be in alarm on the connection whose slot holds the

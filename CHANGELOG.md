@@ -39,12 +39,26 @@
     packaged executable never is. Looking only at that one answered "no relay
     channel to pair over" to every user who had configured a relay the
     ordinary way.
-  - In the Sharing pane: a **My other clients** section with a "Generate
-    pairing token" button, and one paste field that takes either kind of
-    token and routes by the marker the server sets. Pairing is a separate
-    section rather than another channel action, because an invite token
-    connects you to another person and a pairing token makes a second machine
-    into you - side by side those read as variations of one thing.
+  - A pairing token carries **every** relay this client has, not a chosen
+    one. A sibling is a copy of this client, so whatever this one can reach
+    it must reach too. Picking one refused with "several relays are
+    configured - say which one to pair over" as soon as a second relay
+    existed, which is the ordinary state for anyone using more than one.
+    Accepting is additive: relays the client already has are re-keyed to the
+    sibling identity and the rest are registered as ordinary targets, so
+    generating a token again later *adds* the new channels instead of
+    replacing what is there. Relays publishing under different identities are
+    refused outright rather than silently covered by one of them, which would
+    leave the sibling a *peer* of itself wherever the guess was wrong.
+  - A **My other clients** section in the Manage channels dialog, beside the
+    channel list, with a "Generate pairing token" button; and one paste field
+    in the Sharing pane that takes either kind of token and routes by the
+    marker the server sets. Pairing sits with the channels because that is
+    what the token carries - this client's channels, not whichever board
+    happens to be open - and is deliberately not a channel row action,
+    because an invite token connects you to another person while a pairing
+    token makes a second machine into you, and side by side as row actions
+    those read as variations of one thing.
   - New: `POST /api/core/siblings/pairing`, `/pairing/accept`,
     `GET /api/core/siblings/alarms`, `POST /api/core/siblings/alarms/resolve`.
     The alarm names the storage file so the person can copy it before choosing;
@@ -92,11 +106,24 @@
   assignment is invisible in the interface and nothing cleared it when the
   peers went away, so the refusal accumulated until a channel could not be
   removed at all - and explained itself with a bare uuid. Composing an invite
-  token is enough to cause it: `MailboxChannel.offer_descriptor` assigns the
-  topic to the target, so pressing "Get token" once and never sending it left
-  the board bound to that channel permanently. Deletion is now unconditional;
-  `delete_target` already released the assignments, and the topics it held go
-  back to private the same way "stop using" sends them.
+  token used to be enough to cause it - see the next entry. Deletion is now
+  unconditional; `delete_target` already released the assignments, and the
+  topics it held go back to private the same way "stop using" sends them.
+- **Inviting someone to a channel no longer decides to publish there.**
+  `MailboxChannel.offer_descriptor` assigned the topic to the target as a
+  side effect of composing, so pressing "Get token" once - and never sending
+  it - bound the board to that channel for good, with nothing on screen
+  saying so and nothing ever clearing it. The order is now the other way
+  round: "Use for this topic" is the decision, taken first and revocable from
+  the same row, and composing refuses for a channel the topic is not on.
+  "Get token" is renamed **Get invitation** and is only drawn for a channel
+  in use, or for a direct connection, which has nothing to assign. The
+  identity topic is the one exception - it is not a board, is never "used
+  for" anything, and has to travel over whatever route the invitation takes
+  or the invitee cannot see who invited them, so it follows the decision
+  rather than needing one of its own. Polling follows use for the same
+  reason: an outstanding invitation to a channel you have stopped using is an
+  invitation to a channel you are no longer polling.
 - **Fixed: a host with no topic could not be given one.** The shell disabled
   the connection button whenever no topic was selected, which on a first run
   is always - and the invite-token form lives behind that button. There was
