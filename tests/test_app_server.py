@@ -10,6 +10,7 @@ from unittest.mock import patch
 from sovereign import app_server
 from sovereign.application import ApplicationInstance, ApplicationManifest
 from sovereign.channel import ChannelManager, PollCycleResult
+from sovereign.host import PeerUpdateOutcome
 from sovereign.mailbox_channel import MailboxChannel
 from sovereign.protocol import ProtocolNode
 from sovereign.relay_logic import RelayLogic
@@ -281,7 +282,10 @@ class AppServerTests(unittest.TestCase):
         session.start_discussion(topic.uuid)
         session.note_indirect_peer_topic("relay:B", topic.uuid)
         session.bind_peer_topic_channel("relay:B", topic.uuid, "mailbox")
-        session.application_metadata("kanban")["selected_board_uuid"] = "board-1"
+        with session.lock:
+            session.application_metadata("kanban")["selected_board_uuid"] = (
+                "board-1"
+            )
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "state.json"
@@ -295,10 +299,11 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(
             loaded.peer_channel_for_topic("relay:B", topic.uuid), "mailbox",
         )
-        self.assertEqual(
-            loaded.application_metadata("kanban")["selected_board_uuid"],
-            "board-1",
-        )
+        with loaded.lock:
+            self.assertEqual(
+                loaded.application_metadata("kanban")["selected_board_uuid"],
+                "board-1",
+            )
 
 
     def test_restore_keeps_routed_remote_profile_topic_for_refetch(self):
@@ -537,7 +542,47 @@ class AppServerTests(unittest.TestCase):
         paths = {route.path for route in app.routes}
         self.assertIn("/api/protocol", paths)
         self.assertIn("/api/network", paths)
+        self.assertIn("/api/core/revision", paths)
+        self.assertIn("/api/core/mutations/{mutation_id}", paths)
+        self.assertIn("/shared-session.js", paths)
         self.assertIn("/api/core/invitations", paths)
+
+    def test_notify_change_advances_the_browser_revision(self):
+        module = _fake_application_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "applications": [{"module": "fake_revision_logic"}],
+                "storage_file": str(Path(tmp) / "state.json"),
+            }
+            with patch.dict("sys.modules", {"fake_revision_logic": module}):
+                runtime = app_server.create_runtime(8150, config)
+
+            before = runtime.current_revision()
+            runtime.notify_change("test")
+
+        self.assertEqual(runtime.current_revision(), before + 1)
+
+    def test_blob_sweep_runs_after_releasing_the_session_lock(self):
+        session = Session("local")
+        lock_available = []
+
+        class BlobStore:
+            def collect(self, _referenced):
+                def probe():
+                    acquired = session.lock.acquire(blocking=False)
+                    lock_available.append(acquired)
+                    if acquired:
+                        session.lock.release()
+
+                thread = threading.Thread(target=probe)
+                thread.start()
+                thread.join(1)
+                return []
+
+        runtime = types.SimpleNamespace(session=session, blob_store=BlobStore())
+
+        self.assertEqual(app_server.AppRuntime.collect_local_blobs(runtime), [])
+        self.assertEqual(lock_available, [True])
 
     def test_build_app_mounts_explicit_applications_alongside_primary(self):
         primary = _fake_application_module("primary")
@@ -575,7 +620,7 @@ class AppServerTests(unittest.TestCase):
         logic = Logic()
         def notify_peer_update():
             logic.on_peer_update()
-            return False
+            return PeerUpdateOutcome(changed=False)
         runtime = types.SimpleNamespace(
             host=types.SimpleNamespace(notify_peer_update=notify_peer_update),
         )
@@ -591,6 +636,7 @@ class AppServerTests(unittest.TestCase):
         # synced. The tick must drain the app's on_peer_update hook.
         hook_calls = {"count": 0}
         notifications = []
+        session = Session("local")
 
         class FakeRelay:
             poll_interval_seconds = 3
@@ -599,7 +645,11 @@ class AppServerTests(unittest.TestCase):
                 return True
 
             def poll_once(self, after_apply=None):
-                after_apply()
+                # poll_and_apply invokes the callback inside its Session
+                # transaction; a stand-in that skipped the lock would not
+                # exercise the contract the real caller establishes.
+                with session.lock:
+                    after_apply()
                 return PollCycleResult(
                     ok=True,
                     changed=True,
@@ -617,13 +667,14 @@ class AppServerTests(unittest.TestCase):
         logic = Logic()
         def notify_peer_update():
             logic.on_peer_update()
-            return False
+            return PeerUpdateOutcome(changed=False)
 
         runtime = types.SimpleNamespace(
             config={},
+            session=session,
             channel_manager=_FakeRelayManager([FakeRelay()]),
             host=types.SimpleNamespace(notify_peer_update=notify_peer_update),
-            notify_change=lambda kind=None: notifications.append(kind),
+            persist_confirmed_change=lambda kind=None: notifications.append(kind),
         )
 
         changed = asyncio.run(app_server.channel_poll_tick(runtime))
@@ -631,6 +682,80 @@ class AppServerTests(unittest.TestCase):
         self.assertTrue(changed)
         self.assertEqual(hook_calls["count"], 1)
         self.assertEqual(notifications, ["channel"])
+        self.assertEqual(runtime.session.current_view_revision(), 1)
+
+    def test_runtime_delivers_effects_through_the_collaboration_service(self):
+        # The deferred-effect tests below drive a stand-in runtime, so the
+        # real AppRuntime must be checked to actually carry this callable -
+        # otherwise the whole deferral path raises AttributeError the first
+        # time an application returns an effect.
+        delivered = []
+        runtime = app_server.AppRuntime(
+            port=0,
+            address="local",
+            config={},
+            session=Session("local"),
+            blob_store=None,
+            profile=None,
+            relay_manager=None,
+            channel_manager=None,
+            collaboration=types.SimpleNamespace(
+                execute_effects=lambda effects: delivered.extend(effects) or [],
+            ),
+            mailbox_channel=None,
+        )
+
+        runtime.deliver_effects(("effect-1", "effect-2"))
+
+        self.assertEqual(delivered, ["effect-1", "effect-2"])
+
+    def test_peer_update_effects_run_after_poll_and_session_locks_are_released(self):
+        session = Session("local")
+        effect = types.SimpleNamespace(
+            type="release_topic_channels",
+            target="topic-1",
+            channel_kind=None,
+            payload={"topic_uuid": "topic-1"},
+        )
+        delivered = []
+        session_available = []
+
+        class FakeRelay:
+            poll_interval_seconds = 3
+
+            def has_active_relationship(self):
+                return True
+
+            def poll_once(self, after_apply=None):
+                with session.lock:
+                    after_apply()
+                return PollCycleResult(ok=True, changed=True)
+
+        def deliver_effects(effects):
+            acquired = session.lock.acquire(blocking=False)
+            session_available.append(acquired)
+            if acquired:
+                session.lock.release()
+            delivered.extend(effects)
+
+        runtime = types.SimpleNamespace(
+            config={},
+            session=session,
+            channel_manager=_FakeRelayManager([FakeRelay()]),
+            host=types.SimpleNamespace(notify_peer_update=lambda: (
+                types.SimpleNamespace(
+                    changed=False,
+                    effects=(effect, effect),
+                )
+            )),
+            deliver_effects=deliver_effects,
+            persist_confirmed_change=lambda _kind=None: None,
+        )
+
+        self.assertTrue(asyncio.run(app_server.channel_poll_tick(runtime)))
+        self.assertEqual(session_available, [True])
+        self.assertEqual(delivered, [effect])
+        self.assertEqual(session.current_view_revision(), 2)
 
     def test_polling_endpoint_traces_its_complete_cycle(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -644,7 +769,9 @@ class AppServerTests(unittest.TestCase):
             relay = RelayLogic(session, {})
             relay.calibrate_timing_if_due = lambda: None
             relay.write_presence = lambda: None
-            relay.poll_and_apply = lambda: [("topic-1", "peer-b")]
+            relay.poll_and_apply = lambda _after_apply=None: [
+                ("topic-1", "peer-b"),
+            ]
             relay.publish_due_topics = lambda: ["topic-1"]
 
             result = relay.poll_once(lambda: None)
@@ -679,8 +806,6 @@ class AppServerTests(unittest.TestCase):
                 # merely a stale one.
                 "poll_and_apply",
                 "publish_after_poll",
-                "adopt_peer_updates",
-                "publish_response",
             ],
         )
         self.assertEqual(len(completed), 1)
@@ -739,7 +864,7 @@ class AppServerTests(unittest.TestCase):
         runtime = types.SimpleNamespace(
             config={}, channel_manager=_FakeRelayManager([FakeRelay()]),
             host=types.SimpleNamespace(notify_peer_update=lambda: False),
-            notify_change=lambda kind=None: None,
+            persist_confirmed_change=lambda kind=None: None,
         )
 
         self.assertFalse(asyncio.run(app_server.channel_poll_tick(runtime)))
@@ -772,7 +897,7 @@ class AppServerTests(unittest.TestCase):
                 FakeRelay(first_started, second_started),
                 FakeRelay(second_started, first_started),
             ]), host=types.SimpleNamespace(notify_peer_update=lambda: False),
-            notify_change=lambda kind=None: None,
+            persist_confirmed_change=lambda kind=None: None,
         )
 
         asyncio.run(app_server.channel_poll_tick(runtime))
@@ -799,9 +924,12 @@ class AppServerTests(unittest.TestCase):
 
         relay = FakeRelay()
         runtime = types.SimpleNamespace(
-            config={}, channel_manager=_FakeRelayManager([relay]),
-            host=types.SimpleNamespace(notify_peer_update=lambda: False),
-            notify_change=lambda kind=None: None,
+            config={}, session=Session("local"),
+            channel_manager=_FakeRelayManager([relay]),
+            host=types.SimpleNamespace(
+                notify_peer_update=lambda: PeerUpdateOutcome(changed=False),
+            ),
+            persist_confirmed_change=lambda kind=None: None,
         )
         started = app_server.time.monotonic()
 
@@ -850,7 +978,7 @@ class AppServerTests(unittest.TestCase):
             },
             channel_manager=_FakeRelayManager([relay]),
             host=types.SimpleNamespace(notify_peer_update=lambda: False),
-            notify_change=lambda kind=None: None,
+            persist_confirmed_change=lambda kind=None: None,
         )
 
         asyncio.run(app_server.channel_poll_tick(runtime, due_only=False))
@@ -1124,6 +1252,47 @@ class AppServerTests(unittest.TestCase):
                 f"mailbox:{second}",
             )
             self.assertTrue(deleted.ok, deleted.reason)
+            self.assertIsNone(runtime.relay_manager.target_for_topic(
+                runtime.session.identity.uuid,
+            ))
+
+    def test_manage_channels_reports_topics_and_can_stop_all_use(self):
+        with (
+            tempfile.TemporaryDirectory() as tmp,
+            tempfile.TemporaryDirectory() as relay_root,
+        ):
+            runtime, board = _runtime_with_topic(8215, {
+                "storage_file": str(Path(tmp) / "state.json"),
+                "relay_state_directory": tmp,
+            })
+            target_id = runtime.relay_manager.create_target({
+                "name": "T5", "backend": "local", "root": relay_root,
+            }).value
+            runtime.relay_manager.assign_topic_target(board.uuid, target_id)
+
+            channel = next(
+                item for item in runtime.collaboration.channels_payload()["channels"]
+                if item["id"] == target_id
+            )
+            stopped = runtime.collaboration.stop_channel(
+                f"mailbox:{target_id}",
+            )
+            after = next(
+                item for item in runtime.collaboration.channels_payload()["channels"]
+                if item["id"] == target_id
+            )
+
+            self.assertEqual(
+                {(item["title"], item["identity"])
+                 for item in channel["assigned_topics"]},
+                {("My identity", True), (board.data["name"], False)},
+            )
+            self.assertTrue(stopped.ok, stopped.reason)
+            self.assertEqual(after["assigned_topics"], [])
+            self.assertFalse(after["identity_home"])
+            self.assertIsNone(
+                runtime.relay_manager.target_for_topic(board.uuid),
+            )
             self.assertIsNone(runtime.relay_manager.target_for_topic(
                 runtime.session.identity.uuid,
             ))

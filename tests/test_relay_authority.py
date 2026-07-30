@@ -7,11 +7,12 @@ those events reach the peers that publish into it.
 """
 
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 
 from sovereign.protocol import ProtocolNode
-from sovereign.relay_logic import RelayLogic
+from sovereign.relay_logic import RelayLogic, RelayManager
 from sovereign.session import Session
 from sovereign.topic_registry import ApplicationRegistration
 
@@ -112,6 +113,43 @@ class RepublishesAfterTheRelayLosesItTests(unittest.TestCase):
 
             self.assertIn((topic.uuid, "A"), relay_b.poll_and_apply())
 
+    def test_peer_snapshot_and_reaction_share_one_session_transaction(self):
+        with tempfile.TemporaryDirectory() as relay_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            session_a = Session("addr-a")
+            topic = register_topic(session_a, "plan")
+            relay_a = RelayLogic(
+                session_a, relay_config(relay_root, "A", state_dir),
+            )
+            relay_a.set_scoped_topics({topic.uuid})
+            relay_a.publish_due_topics()
+
+            session_b = Session("addr-b")
+            register_notes_app(session_b)
+            relay_b = RelayLogic(
+                session_b, relay_config(relay_root, "B", state_dir),
+            )
+            relay_b.set_scoped_topics({topic.uuid})
+            relay_b.mark_topics_desired([topic.uuid])
+            reader_entered = []
+
+            def after_apply():
+                def reader():
+                    acquired = session_b.lock.acquire(blocking=False)
+                    reader_entered.append(acquired)
+                    if acquired:
+                        session_b.lock.release()
+
+                probe = threading.Thread(target=reader)
+                probe.start()
+                probe.join(1)
+                session_b.advance_view_revision()
+
+            relay_b.poll_and_apply(after_apply)
+
+            self.assertEqual(reader_entered, [False])
+            self.assertEqual(session_b.current_view_revision(), 1)
+
     def test_an_intact_relay_is_not_republished(self):
         # The check must not turn every tick into a write; the skip is what
         # keeps an idle topic quiet.
@@ -145,6 +183,169 @@ class RepublishesAfterTheRelayLosesItTests(unittest.TestCase):
 
             self.assertNotIn(topic.uuid, relay.publish_due_topics())
             self.assertIn("relay.publication_presence_unknown", traced)
+
+
+class WithdrawsOnlyTheDetachedPublicationTests(unittest.TestCase):
+    def test_detaching_a_topic_removes_only_this_clients_publication(self):
+        with tempfile.TemporaryDirectory() as relay_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            session = Session("addr-a")
+            topic = register_topic(session, "plan")
+            manager = RelayManager(session, {
+                "relay_state_directory": state_dir,
+            })
+            target_id = manager.create_target({
+                "name": "T5", "backend": "local", "root": relay_root,
+            }, verify=False).value
+            assigned = manager.assign_topic_target(topic.uuid, target_id)
+            connection = manager.connection_for_target(target_id)
+            self.assertEqual(assigned.status, "ok")
+            self.assertIn(topic.uuid, connection.publish_due_topics())
+
+            connection.storage.write_snapshot(
+                topic.uuid, "B", "peer-state",
+                {"subtree": {}, "_relay_publication_seq": 1},
+            )
+            self.assertEqual(
+                connection.storage.list_peers(topic.uuid),
+                sorted([session.identity.uuid, "B"]),
+            )
+
+            detached = manager.assign_topic_target(topic.uuid, None)
+
+            self.assertEqual(detached.status, "ok", detached.reason)
+            self.assertEqual(
+                connection.storage.list_peers(topic.uuid), ["B"],
+            )
+            self.assertIsNone(manager.target_for_topic(topic.uuid))
+            self.assertNotIn(topic.uuid, connection._state["published"])
+            self.assertNotIn(topic.uuid, connection.publish_due_topics())
+
+    def test_detach_waits_for_an_in_flight_publication_then_removes_it(self):
+        with tempfile.TemporaryDirectory() as relay_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            session = Session("addr-a")
+            topic = register_topic(session, "plan")
+            manager = RelayManager(session, {
+                "relay_state_directory": state_dir,
+            })
+            target_id = manager.create_target({
+                "name": "T5", "backend": "local", "root": relay_root,
+            }, verify=False).value
+            manager.assign_topic_target(topic.uuid, target_id)
+            connection = manager.connection_for_target(target_id)
+            original_write = connection.storage.write_snapshot
+            publication_started = threading.Event()
+            allow_publication = threading.Event()
+            detach_done = threading.Event()
+
+            def paused_write(topic_uuid, *args, **kwargs):
+                if topic_uuid == topic.uuid:
+                    publication_started.set()
+                    allow_publication.wait(timeout=2)
+                return original_write(topic_uuid, *args, **kwargs)
+
+            connection.storage.write_snapshot = paused_write
+            publisher = threading.Thread(target=connection.publish_due_topics)
+            detacher = threading.Thread(target=lambda: (
+                manager.assign_topic_target(topic.uuid, None),
+                detach_done.set(),
+            ))
+            publisher.start()
+            self.assertTrue(publication_started.wait(timeout=2))
+            detacher.start()
+            self.assertFalse(detach_done.wait(timeout=0.1))
+            allow_publication.set()
+            publisher.join(timeout=2)
+            detacher.join(timeout=2)
+
+            self.assertFalse(publisher.is_alive())
+            self.assertFalse(detacher.is_alive())
+            self.assertEqual(
+                connection.storage.list_peers(topic.uuid), [],
+            )
+
+    def test_deleting_a_channel_withdraws_its_assigned_publications(self):
+        with tempfile.TemporaryDirectory() as relay_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            session = Session("addr-a")
+            topic = register_topic(session, "plan")
+            manager = RelayManager(session, {
+                "relay_state_directory": state_dir,
+            })
+            target_id = manager.create_target({
+                "name": "T5", "backend": "local", "root": relay_root,
+            }, verify=False).value
+            manager.assign_topic_target(topic.uuid, target_id)
+            connection = manager.connection_for_target(target_id)
+            connection.publish_due_topics()
+            storage = connection.storage
+
+            deleted = manager.delete_target(target_id)
+
+            self.assertEqual(deleted.status, "ok", deleted.reason)
+            self.assertEqual(storage.list_peers(topic.uuid), [])
+
+
+class TopicScopedPresenceTests(unittest.TestCase):
+    def test_peer_is_offline_for_a_topic_moved_to_another_channel(self):
+        with tempfile.TemporaryDirectory() as relay_root, \
+                tempfile.TemporaryDirectory() as state_dir:
+            session_a = Session("addr-a")
+            topics = register_notes_app(session_a)
+            first = session_a.create_child(
+                session_a.root_uuid(),
+                {"type": "notes", "name": "first"},
+                {},
+            ).value
+            second = session_a.create_child(
+                session_a.root_uuid(),
+                {"type": "notes", "name": "second"},
+                {},
+            ).value
+            topics.extend([first, second])
+            relay_a = RelayLogic(
+                session_a, relay_config(relay_root, "A", state_dir),
+            )
+            relay_b = RelayLogic(
+                Session("addr-b"),
+                relay_config(relay_root, "B", state_dir),
+            )
+            relay_a.set_scoped_topics({first.uuid})
+            relay_a.write_presence()
+            relay_b.write_presence()
+            read_presence = relay_b.storage.read_presence_with_mtime
+            relay_b._peer_presence_cache["A"] = read_presence("A")
+            relay_b.storage.read_presence_with_mtime = lambda _peer: (
+                (_ for _ in ()).throw(
+                    AssertionError("UI liveness must use the poll cache")
+                )
+            )
+
+            self.assertEqual(
+                relay_b.peer_liveness("A", first.uuid)["state"], "alive",
+            )
+            self.assertEqual(
+                relay_b.peer_liveness("A", second.uuid)["state"], "unrouted",
+            )
+
+            relay_a.set_scoped_topics({second.uuid})
+            relay_a.write_presence()
+            relay_b.write_presence()
+            relay_b.storage.read_presence_with_mtime = read_presence
+            relay_b._peer_presence_cache["A"] = read_presence("A")
+            relay_b.storage.read_presence_with_mtime = lambda _peer: (
+                (_ for _ in ()).throw(
+                    AssertionError("UI liveness must use the poll cache")
+                )
+            )
+
+            self.assertEqual(
+                relay_b.peer_liveness("A", first.uuid)["state"], "unrouted",
+            )
+            self.assertEqual(
+                relay_b.peer_liveness("A", second.uuid)["state"], "alive",
+            )
 
 
 class ForgetsPeersTheRelayNoLongerListsTests(unittest.TestCase):

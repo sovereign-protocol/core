@@ -12,11 +12,13 @@ import copy
 import time
 import threading
 import uuid as uuid_mod
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from functools import wraps
 from typing import Any, Callable
 
 from .blob_store import avatar_attachment
+from .locking import OrderedRLock, SESSION_LOCK_ORDER
 from .protocol import (
     ProtocolNode, ProtocolState, collect_subtree_uuids,
     protocol_tree_envelope, stable_hash,
@@ -149,6 +151,7 @@ class ReadOnlyProtocolView:
 
 class Session:
     ORDER_GAP_EPSILON = 1e-9
+    MUTATION_HISTORY_LIMIT = 512
     # Another client of this same user caches its version of a topic under an
     # address with this prefix. It is not a peer address and must never be
     # treated as one: a sibling has no place in the participant lists, and no
@@ -160,7 +163,7 @@ class Session:
         return str(peer_addr or "").startswith(cls.SIBLING_ADDRESS_PREFIX)
 
     def __init__(self, address: str, trace: TraceLogger | None = None):
-        self.lock = threading.RLock()
+        self.lock = OrderedRLock(SESSION_LOCK_ORDER, "Session.lock")
         self.address = address
         self.trace = trace or TraceLogger.disabled()
         self._protocol = ProtocolState(author=address)
@@ -169,6 +172,15 @@ class Session:
         # receives a larger value; adopted/forwarded revisions preserve the
         # originator's value instead of consuming this counter.
         self.local_revision_seq = 0
+        # Runtime revision of the complete confirmed Session view. Unlike a
+        # protocol node revision, this also covers peer perspectives and
+        # application metadata. It is intentionally not persisted: after a
+        # restart browsers fetch a fresh snapshot before comparing revisions.
+        self._view_revision = 0
+        # Bounded runtime ledger for idempotent browser mutations. A retry with
+        # the same client-generated ID observes the original result instead of
+        # applying a human intention twice.
+        self._mutation_results: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self._peer_topic_sets: dict[str, set[str]] = {}
         self._peer_perspectives: dict[str, ProtocolNode] = {}
         # Which channel type last successfully delivered to/from a peer
@@ -208,7 +220,47 @@ class Session:
             mount_invitation=False,
         )
 
+    @_session_locked
+    def current_view_revision(self) -> int:
+        """Revision identifying the current confirmed browser-visible state."""
+        return self._view_revision
+
+    @_session_locked
+    def advance_view_revision(self) -> int:
+        """Commit a new confirmed browser-visible Session revision."""
+        self._view_revision += 1
+        return self._view_revision
+
+    @_session_locked
+    def read_snapshot(self, builder: Callable[[], Any]) -> tuple[int, Any]:
+        """Build one application view atomically with its Session revision."""
+        return self._view_revision, builder()
+
+    @_session_locked
+    def mutation_result(self, mutation_id: str) -> dict[str, Any] | None:
+        """Return a detached prior result and refresh its bounded LRU entry."""
+        if not mutation_id:
+            return None
+        stored = self._mutation_results.get(mutation_id)
+        if stored is None:
+            return None
+        self._mutation_results.move_to_end(mutation_id)
+        return copy.deepcopy(stored)
+
+    @_session_locked
+    def remember_mutation_result(
+        self, mutation_id: str, payload: dict[str, Any],
+    ) -> None:
+        """Remember a definitive mutation outcome for safe request retries."""
+        if not mutation_id:
+            return
+        self._mutation_results[mutation_id] = copy.deepcopy(payload)
+        self._mutation_results.move_to_end(mutation_id)
+        while len(self._mutation_results) > self.MUTATION_HISTORY_LIMIT:
+            self._mutation_results.popitem(last=False)
+
     @property
+    @_session_locked
     def active_topic_uuid(self) -> str | None:
         return sorted(self._active_topic_uuids)[0] if self._active_topic_uuids else None
 
@@ -301,9 +353,18 @@ class Session:
     def peer_identity_key_for_address(self, peer_addr: str) -> str | None:
         return self._peer_identity_key.get(peer_addr)
 
-    @_session_locked
     def application_metadata(self, application_id: str) -> dict[str, Any]:
-        """Return the mutable metadata namespace owned by one application."""
+        """Return one application's live metadata namespace.
+
+        Deliberately not detached: applications read and modify nested
+        structures here, which a snapshot-and-replace API cannot express
+        without copying whole subtrees. The caller must therefore already
+        hold Session.lock, so a write can never race persistence_metadata()
+        deep-copying the same dictionary. Acquiring the lock here instead
+        would only make each single access atomic, not the read-modify-write
+        the callers actually perform.
+        """
+        self.lock.assert_owned()
         apps = self._app_metadata.setdefault("apps", {})
         if not isinstance(apps, dict):
             apps = {}
@@ -316,7 +377,24 @@ class Session:
 
     @_session_locked
     def component_metadata(self, component_id: str) -> dict[str, Any]:
-        """Return a private Core component's persisted metadata namespace."""
+        """Return a detached private Core-component metadata snapshot."""
+        return copy.deepcopy(self._component_metadata_namespace(component_id))
+
+    @_session_locked
+    def update_component_metadata(
+        self, component_id: str, values: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Atomically replace selected keys in a component namespace."""
+        if not isinstance(values, dict):
+            raise TypeError("component metadata update must be a dictionary")
+        namespace = self._component_metadata_namespace(component_id)
+        for key, value in values.items():
+            namespace[str(key)] = copy.deepcopy(value)
+        return copy.deepcopy(namespace)
+
+    def _component_metadata_namespace(
+        self, component_id: str,
+    ) -> dict[str, Any]:
         components = self._app_metadata.setdefault("core_components", {})
         if not isinstance(components, dict):
             components = {}
@@ -1099,15 +1177,34 @@ class Session:
         events = []
         for uuid in [compare_uuid, *other_uuids]:
             local = local_by_uuid.get(uuid)
+            peer = peer_by_uuid.get(uuid)
+            is_compare_root = uuid == compare_uuid
             event = self._analyze_transition_node(
                 peer_addr,
                 local,
-                peer_by_uuid.get(uuid),
-                is_topic_root=(uuid == compare_uuid),
+                peer,
+                is_topic_root=is_compare_root,
             )
-            event["peer_observed_local_revision"] = bool(
+            observed = bool(
                 local and self.peer_observed_node(peer_addr, local)
             )
+            event["peer_observed_local_revision"] = observed
+            # Returning a field to an earlier value crosses both content/base
+            # relations. Relay observation supplies the causal direction that
+            # hashes alone cannot: this peer built its new revision on ours.
+            if (
+                observed
+                and local is not None
+                and peer is not None
+                and event["type"] == "local_made_changes"
+                and peer.content_hash == local.base_hash
+                and local.content_hash == peer.base_hash
+                and (
+                    is_compare_root
+                    or local.parent_uuid == peer.parent_uuid
+                )
+            ):
+                event["type"] = "peer_made_changes"
             events.append(self._stage_transition_event(event))
         return events
 
@@ -1563,6 +1660,7 @@ class Session:
             return None
         return protocol_tree_envelope(node)
 
+    @_session_locked
     def get_network_info(self) -> dict:
         # No health or retry state here any more. Reachability was a fact
         # about a direct connection; a channel that publishes into a slot
@@ -1664,6 +1762,19 @@ class Session:
         self._peer_topic_sets.pop(peer_addr, None)
         self._peer_perspectives.pop(peer_addr, None)
         self.peer_topic_channel.pop(peer_addr, None)
+
+    @_session_locked
+    def forget_peer_address(self, peer_addr: str) -> None:
+        """Remove an address that this client now publishes as itself.
+
+        Ordinary peer teardown keeps the identity registry because the fact
+        remains useful. Pairing is different: once a relay address becomes
+        our own publication slot, retaining its former peer identity makes
+        Core resolve our own slot as another person forever.
+        """
+        self.remove_peer(peer_addr)
+        self._peer_identity_key.pop(peer_addr, None)
+        self.peer_observed_node_revisions.pop(peer_addr, None)
 
     def remove_peer_topics(
         self, peer_addr: str, topic_uuids: list[str] | set[str] | tuple[str, ...],
@@ -1947,11 +2058,14 @@ class Session:
         application without a richer user model of its own still needs to
         show *some* name for "who wrote this".
         """
-        def describe(uuid: str, data: dict, address: str) -> dict:
+        def describe(
+            uuid: str, data: dict, address: str, addresses: list[str],
+        ) -> dict:
             attachment = avatar_attachment(data)
             return {
                 "uuid": uuid,
                 "address": address,
+                "addresses": addresses,
                 "name": data.get("display_name") or "",
                 "picture": (
                     f"/api/blob/{attachment['blob_id']}" if attachment
@@ -1959,18 +2073,33 @@ class Session:
                 ),
             }
 
-        out = [describe(self.identity.uuid, self.identity.data, self.address)]
+        out = [describe(
+            self.identity.uuid, self.identity.data, self.address, [self.address],
+        )]
         seen = {self.identity.uuid}
         addrs = (
             set(self._peer_perspectives) | set(self._peer_topic_sets)
         ) - {self.address}
         for addr in sorted(addr for addr in addrs
                            if not self.is_sibling_address(addr)):
-            profile = self.peer_identity(addr)
+            identity_key = self._peer_identity_key.get(addr)
+            profile = (
+                self.peer_identity(addr)
+                or (self.find_peer_identity(identity_key) if identity_key else None)
+            )
             if not profile or profile.uuid in seen:
                 continue
             seen.add(profile.uuid)
-            out.append(describe(profile.uuid, profile.data, addr))
+            aliases = (
+                [
+                    candidate for candidate in sorted(addrs)
+                    if self._peer_identity_key.get(candidate) == identity_key
+                ]
+                if identity_key else [addr]
+            )
+            out.append(describe(
+                profile.uuid, profile.data, addr, aliases or [addr],
+            ))
         return out
 
     def reaction_for_event(self, event: dict) -> str:

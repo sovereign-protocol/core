@@ -35,7 +35,7 @@ import sys
 import threading
 import time
 from contextlib import asynccontextmanager
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from importlib.resources import files
 from pathlib import Path
 from typing import Any
@@ -114,18 +114,12 @@ class AppRuntime:
     def persist(self) -> None:
         storage_file = self.config.get("storage_file")
         if storage_file:
-            with self.channel_manager.persistence_guard():
-                save_session_to_file(self.session, storage_file)
+            save_session_to_file(self.session, storage_file)
         # Grace time protects a new upload until its reference is committed.
         # Running after persisted mutations completes local GC automatically.
         self.collect_local_blobs()
 
-    def notify_change(self, kind: str = "changed") -> None:
-        # Name kept for its many call sites; `kind` is retained as a
-        # readable marker of what triggered the save. Browsers learn about
-        # changes by polling (every UI does its own interval) - there is no
-        # push channel, by design.
-        self.persist()
+    def _wake_channels(self, kind: str) -> None:
         # Local edits should publish immediately instead of waiting for the
         # next polling timeout. Channel-originated persistence must not wake
         # the loop recursively; that cycle already publishes its response.
@@ -133,14 +127,48 @@ class AppRuntime:
             if self.channel_loop.is_running():
                 self.channel_loop.call_soon_threadsafe(self.channel_wakeup.set)
 
+    def persist_confirmed_change(self, kind: str = "changed") -> None:
+        """Persist a revision that Session already confirmed atomically.
+
+        Application mutations advance the visible revision while holding
+        Session.lock, then call this after releasing it. Persistence snapshots
+        Session directly; channel configuration now writes through Session's
+        locked component-metadata API and needs no cross-layer guard.
+        """
+        self.persist()
+        self._wake_channels(kind)
+
+    def notify_change(self, kind: str = "changed") -> None:
+        # Name kept for its many call sites; `kind` is retained as a
+        # readable marker of what triggered the save. Browsers learn about
+        # changes by polling (every UI does its own interval) - there is no
+        # push channel, by design.
+        self.persist()
+        self.session.advance_view_revision()
+        self._wake_channels(kind)
+
+    def current_revision(self) -> int:
+        return self.session.current_view_revision()
+
+    def deliver_effects(self, effects) -> list[Any]:
+        """Execute application effects through the Core-owned channel service.
+
+        Effects can enter channel management, so callers must already have
+        released Session and relay I/O locks - see the lock order in
+        DESIGN_LOCKING_AND_COMPOSITE_READS.md.
+        """
+        return self.collaboration.execute_effects(effects)
+
     def collect_local_blobs(self) -> list[str]:
         with self.session.lock:
             referenced = referenced_blob_ids(self.session.protocol.root)
             for tree in self.session.peer_perspectives_for_topic().values():
                 referenced.update(referenced_blob_ids(tree))
-            # Keep the mark and sweep atomic with respect to references being
-            # added by local edits or incoming session updates.
-            return self.blob_store.collect(referenced)
+        # Filesystem enumeration and deletion can be slow on Windows and
+        # never belongs inside the Session transaction. The grace period
+        # protects a blob uploaded after this detached reference snapshot;
+        # the next sweep sees any reference committed meanwhile.
+        return self.blob_store.collect(referenced)
 
 
 def parse_target(target: str) -> tuple[int, str | None]:
@@ -253,6 +281,8 @@ def create_runtime(port: int, config: dict) -> AppRuntime:
         trace=trace,
         notify_change=runtime.notify_change,
         collect_local_blobs=runtime.collect_local_blobs,
+        current_revision=runtime.current_revision,
+        persist_confirmed_change=runtime.persist_confirmed_change,
     )
     runtime.host = ApplicationHost(
         services,
@@ -289,6 +319,14 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
             media_type="application/javascript",
         )
 
+    async def serve_shared_session_js(request: Request):
+        return Response(
+            files("sovereign.assets").joinpath("shared-session.js").read_text(
+                encoding="utf-8",
+            ),
+            media_type="application/javascript",
+        )
+
     async def api_protocol(request: Request):
         # No pull here any more. What a peer is publishing arrives on the
         # channel's own poll; this route reports what has already arrived.
@@ -318,6 +356,18 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         return JSONResponse({
             "status": "ok",
             "applications": runtime.host.application_summaries() if runtime.host else [],
+        })
+
+    async def api_core_revision(request: Request):
+        return JSONResponse({"revision": runtime.current_revision()})
+
+    async def api_core_mutation_status(request: Request):
+        mutation_id = request.path_params["mutation_id"]
+        result = runtime.session.mutation_result(mutation_id)
+        return JSONResponse(result or {
+            "status": "unknown",
+            "mutation_id": mutation_id,
+            "revision": runtime.current_revision(),
         })
 
     async def api_core_profile(request: Request):
@@ -474,10 +524,13 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
         Route("/styles.css", serve_css),
         Route("/shared.css", serve_shared_css),
         Route("/shared-api.js", serve_shared_api_js),
+        Route("/shared-session.js", serve_shared_session_js),
         Route("/shared.js", serve_shared_js),
         Route("/api/protocol", api_protocol),
         Route("/api/network", api_network),
         Route("/api/core/applications", api_core_applications),
+        Route("/api/core/revision", api_core_revision),
+        Route("/api/core/mutations/{mutation_id}", api_core_mutation_status),
         Route("/api/core/profile", api_core_profile, methods=["GET", "POST"]),
         Route(
             "/api/core/profile/avatar",
@@ -491,10 +544,14 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
 
 
 async def run_peer_update_hook(runtime: AppRuntime) -> bool:
-    host = getattr(runtime, "host", None)
+    host = runtime.host
     if not host:
         return False
-    return await asyncio.to_thread(host.notify_peer_update)
+    outcome = await asyncio.to_thread(host.notify_peer_update)
+    if outcome.effects:
+        await asyncio.to_thread(runtime.deliver_effects, outcome.effects)
+        runtime.session.advance_view_revision()
+    return outcome.changed
 
 
 async def drain_peer_update_hook(runtime: AppRuntime, passes: int = 4) -> None:
@@ -582,16 +639,43 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
             continue
         due_endpoints.append((endpoint, scheduled_for, was_due))
 
-    adoption_lock = threading.Lock()
+    view_confirmed = threading.Event()
+    deferred_effects: dict[tuple, Any] = {}
+
+    def effect_key(effect) -> tuple:
+        return (
+            str(getattr(effect, "type", "")),
+            str(getattr(effect, "target", "") or ""),
+            str(getattr(effect, "channel_kind", "") or ""),
+            json.dumps(
+                getattr(effect, "payload", {}) or {},
+                sort_keys=True,
+                separators=(",", ":"),
+                default=str,
+            ),
+        )
 
     def after_apply() -> None:
-        host = getattr(runtime, "host", None)
+        # Every endpoint in this tick shares one closure, so the drain loop
+        # and deferred_effects are reached from several poll threads. What
+        # serializes them is Session.lock, which poll_and_apply holds across
+        # this call - that is also what makes the reconciled state and its
+        # visible revision observable together. Asserting it is cheaper than
+        # a second lock, and states the contract a caller has to honour.
+        runtime.session.lock.assert_owned()
+        host = runtime.host
         if not host:
+            runtime.session.advance_view_revision()
+            view_confirmed.set()
             return
-        with adoption_lock:
-            for _ in range(4):
-                if not host.notify_peer_update():
-                    break
+        for _ in range(4):
+            outcome = host.notify_peer_update()
+            for effect in outcome.effects:
+                deferred_effects.setdefault(effect_key(effect), effect)
+            if not outcome.changed:
+                break
+        runtime.session.advance_view_revision()
+        view_confirmed.set()
 
     async def run_endpoint(endpoint, scheduled_for, was_due):
         started = time.monotonic()
@@ -632,8 +716,22 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
                 flush=True,
             )
             continue
+    if deferred_effects:
+        # Reconciliation above was atomic with incoming Session state, but
+        # effects can enter channel management. Deliver them only after every
+        # poll_once has released both Session and per-connection I/O locks.
+        await asyncio.to_thread(
+            runtime.deliver_effects, tuple(deferred_effects.values()),
+        )
+        runtime.session.advance_view_revision()
+        changed = True
     if changed:
-        runtime.notify_change("channel")
+        # Incoming state was already made visible atomically by after_apply.
+        # A result can also change through publication/acknowledgement alone,
+        # in which case it still needs one visible revision.
+        if not view_confirmed.is_set():
+            runtime.session.advance_view_revision()
+        runtime.persist_confirmed_change("channel")
     return changed
 
 

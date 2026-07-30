@@ -14,4 +14,5 @@ Protocol and Session do not import applications, HTTP controllers, channels, or
 storage. Applications own domain policy and UI. Channels exchange registered
 topic trees without knowing their node types.
 
-See `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` for the accepted boundary decisions.
+See `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` for the accepted boundary decisions
+and `DESIGN_LOCKING_AND_COMPOSITE_READS.md` for transaction and lock ownership.

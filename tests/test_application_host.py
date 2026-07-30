@@ -1,6 +1,7 @@
 import sys
 import types
 import unittest
+from dataclasses import replace
 from unittest.mock import patch
 
 from starlette.routing import Route
@@ -13,7 +14,7 @@ from sovereign.application import (
 )
 from sovereign.host import ApplicationHost
 from sovereign.protocol import ProtocolNode
-from sovereign.session import Session
+from sovereign.session import Session, SessionEffect, SessionResult
 from sovereign.topic_registry import ApplicationRegistration
 
 
@@ -40,6 +41,7 @@ def _application_module(
     root_type=None,
     route_path=None,
     on_close=None,
+    on_peer_update=None,
     facade_api_version=None,
     facade_api=None,
 ):
@@ -57,6 +59,7 @@ def _application_module(
                 accept_invitation=services.session.accept_topic_invitation,
                 assignment_scoped=True,
                 mount_invitation=True,
+                on_peer_update=on_peer_update,
             )
         controllers = ()
         if route_path:
@@ -84,6 +87,31 @@ def _application_module(
 
 
 class ApplicationHostTests(unittest.TestCase):
+    def test_peer_update_returns_effects_without_delivering_them_under_session(self):
+        session = Session("http://a")
+        effect = SessionEffect("release_topic_channels", target="topic")
+        delivered = []
+        module = _application_module(
+            "notes",
+            root_type="notes",
+            on_peer_update=lambda: SessionResult(
+                "ok", value=True, effects=[effect],
+            ),
+        )
+        services = replace(
+            _services(session),
+            deliver_effects=lambda effects: delivered.extend(effects),
+        )
+        with patch.dict(sys.modules, {"test_notes": module}):
+            host = ApplicationHost(services, ["test_notes"])
+
+        with session.lock:
+            outcome = host.notify_peer_update()
+
+        self.assertTrue(outcome.changed)
+        self.assertEqual(outcome.effects, (effect,))
+        self.assertEqual(delivered, [])
+
     def test_facade_lookup_is_late_bound_versioned_and_removed_on_deactivate(self):
         session = Session("http://a")
         api = object()

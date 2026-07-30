@@ -110,11 +110,45 @@ class ApplicationServices:
     trace: Any
     notify_change: Callable[[str], None]
     collect_local_blobs: Callable[[], list[str]]
+    current_revision: Callable[[], int] = lambda: 0
+    persist_confirmed_change: Callable[[str], None] = lambda _kind: None
     facades: ApplicationFacadeLookup = _NO_APPLICATION_FACADES
     settings: Mapping[str, Any] = MappingProxyType({})
 
     def with_settings(self, settings: Mapping[str, Any] | None) -> "ApplicationServices":
         return replace(self, settings=MappingProxyType(dict(settings or {})))
+
+    def snapshot_response(self, builder: Callable[[], Any]) -> Any:
+        """Return one application snapshot with its confirmed Session revision."""
+        return application_snapshot_response(self, builder)
+
+    def composite_response(
+        self,
+        snapshot_builder: Callable[[], Any],
+        observer: Callable[[Any], Any],
+        merger: Callable[[Any, Any], Any],
+    ) -> Any:
+        """Build a Session snapshot, observe transport, then merge detached data."""
+        return application_composite_response(
+            self, snapshot_builder, observer, merger,
+        )
+
+    async def mutation_response(
+        self,
+        operation: Callable[[], Any],
+        *,
+        mutation_id: str | None = None,
+        change_kind: str = "application",
+        invalidates: tuple[str, ...] = (),
+    ) -> Any:
+        """Commit one retry-safe application intention."""
+        return await application_mutation_json_response(
+            self,
+            operation,
+            mutation_id=mutation_id,
+            change_kind=change_kind,
+            invalidates=invalidates,
+        )
 
 
 @dataclass
@@ -190,6 +224,108 @@ async def application_json_response(
         services.notify_change(change_kind)
     view = application_result_view(result)
     return JSONResponse(view.payload, status_code=200 if view.ok else 409)
+
+
+def application_snapshot_response(services, builder: Callable[[], Any]) -> Any:
+    """Render an application view atomically with its Session revision."""
+    from starlette.responses import JSONResponse
+
+    revision, value = services.session.read_snapshot(builder)
+    payload = json_value(value)
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    return JSONResponse({**payload, "revision": revision})
+
+
+def application_composite_response(
+    services,
+    snapshot_builder: Callable[[], Any],
+    observer: Callable[[Any], Any],
+    merger: Callable[[Any, Any], Any],
+) -> Any:
+    """Render a Session snapshot decorated by detached transport observations."""
+    from starlette.responses import JSONResponse
+
+    revision, snapshot = services.session.read_snapshot(snapshot_builder)
+    observations = observer(snapshot)
+    value = merger(snapshot, observations)
+    payload = json_value(value)
+    if not isinstance(payload, dict):
+        payload = {"value": payload}
+    return JSONResponse({**payload, "revision": revision})
+
+
+async def application_mutation_json_response(
+    services,
+    operation: Callable[[], Any],
+    *,
+    mutation_id: str | None = None,
+    change_kind: str = "application",
+    invalidates: tuple[str, ...] = (),
+) -> Any:
+    """Atomically commit and identify one retry-safe human intention.
+
+    The operation is deliberately passed as a callback: accepting an already
+    computed SessionResult would allow readers to observe the changed state
+    before persistence and the confirmed Session revision were committed.
+    """
+    from starlette.responses import JSONResponse
+
+    if mutation_id is not None:
+        if not isinstance(mutation_id, str) or not mutation_id.strip():
+            return JSONResponse(
+                {"status": "error", "reason": "invalid mutation_id"},
+                status_code=400,
+            )
+        mutation_id = mutation_id.strip()
+        if len(mutation_id) > 200:
+            return JSONResponse(
+                {"status": "error", "reason": "mutation_id is too long"},
+                status_code=400,
+            )
+
+    effects = []
+    with services.session.lock:
+        cached = (
+            services.session.mutation_result(mutation_id)
+            if mutation_id else None
+        )
+        if cached is not None:
+            return JSONResponse(
+                cached,
+                status_code=200 if cached.get("status") == "ok" else 409,
+            )
+
+        result = operation()
+        if result.status == "ok":
+            # The mutation and visible revision are one in-memory commit.
+            # Persistence deliberately happens after releasing Session.lock:
+            # file I/O is a consequence of the confirmed transaction, not
+            # part of it.
+            services.session.advance_view_revision()
+            effects = list(result.effects)
+        revision = services.current_revision()
+        view = application_result_view(result)
+        payload = {
+            **view.payload,
+            "revision": revision,
+            "mutation_id": mutation_id,
+            "invalidates": list(invalidates),
+        }
+        if mutation_id:
+            services.session.remember_mutation_result(mutation_id, payload)
+
+    if view.ok:
+        # Disk persistence and channel wakeup are consequences of the already
+        # confirmed Session transaction.  They must never run under its lock.
+        await asyncio.to_thread(
+            services.persist_confirmed_change, change_kind,
+        )
+        # Peer response time never controls whether the human's local
+        # intention is confirmed.
+        if effects:
+            await asyncio.to_thread(services.deliver_effects, effects)
+    return JSONResponse(payload, status_code=200 if view.ok else 409)
 
 
 def json_value(value: Any) -> JsonValue:

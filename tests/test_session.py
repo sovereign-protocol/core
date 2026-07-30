@@ -18,6 +18,18 @@ class SessionTests(unittest.TestCase):
         self.assertEqual(result.status, "ok")
         self.assertEqual(session.active_topic_uuid, topic.uuid)
 
+    def test_internal_network_and_active_topic_readers_take_the_session_lock(self):
+        # Both walk Session internals directly, so losing the decorator would
+        # let a UI request iterate _peer_perspectives while the poller
+        # inserts into it. Callers hold nothing; the readers lock themselves.
+        self.assertTrue(hasattr(Session.get_network_info, "__wrapped__"))
+        self.assertTrue(hasattr(Session.active_topic_uuid.fget, "__wrapped__"))
+
+        session = Session("si-a")
+
+        self.assertEqual(session.get_network_info()["peers"], {})
+        self.assertIsNone(session.active_topic_uuid)
+
 
     def test_start_discussion_allows_multiple_topics(self):
         session = Session("si-a")
@@ -61,12 +73,40 @@ class SessionTests(unittest.TestCase):
 
     def test_application_metadata_is_namespaced(self):
         session = Session("si-a")
-        session.application_metadata("one")["selected"] = "a"
+        with session.lock:
+            session.application_metadata("one")["selected"] = "a"
+
+            self.assertEqual(
+                session.application_metadata("one"), {"selected": "a"},
+            )
+            self.assertEqual(session.application_metadata("two"), {})
+
+    def test_application_metadata_requires_the_session_lock(self):
+        # The namespace is live, so an unlocked write could race
+        # persistence_metadata() deep-copying the same dictionary.
+        session = Session("si-a")
+
+        with self.assertRaisesRegex(RuntimeError, "must be held"):
+            session.application_metadata("one")
+
+    def test_component_metadata_is_detached_and_updates_atomically(self):
+        session = Session("si-a")
+        session.update_component_metadata("relay", {
+            "relay_targets": {"one": {"name": "First"}},
+        })
+
+        detached = session.component_metadata("relay")
+        detached["relay_targets"]["one"]["name"] = "Changed outside Session"
 
         self.assertEqual(
-            session.application_metadata("one"), {"selected": "a"},
+            session.component_metadata("relay")["relay_targets"]["one"]["name"],
+            "First",
         )
-        self.assertEqual(session.application_metadata("two"), {})
+        updated = session.update_component_metadata("relay", {
+            "relay_topic_targets": {"topic": "one"},
+        })
+        self.assertEqual(updated["relay_topic_targets"], {"topic": "one"})
+        self.assertEqual(updated["relay_targets"]["one"]["name"], "First")
 
     def test_node_revision_changes_when_node_moves(self):
         session = Session("si-a")
@@ -240,6 +280,48 @@ class SessionTests(unittest.TestCase):
         events = local.analyze_peer_transitions("si-c", topic.uuid)
 
         self.assertEqual(events[0]["type"], "peer_made_changes")
+
+    def test_observed_peer_revert_to_an_earlier_value_is_a_newer_change(self):
+        local = Session("si-a")
+        peer = Session("si-b")
+        local.identity
+        peer.identity
+        topic = local.create_child(
+            local.protocol.root.uuid, {"name": "topic"}, {},
+        ).value
+        child = local.create_child(
+            topic.uuid, {"name": "Doing"}, {},
+        ).value
+        peer.accept_topic_invitation(ProtocolNode.from_dict(topic.to_dict()))
+
+        local.modify(child.uuid, {"name": "Doings"}, {})
+        peer.apply_peer_subtree(
+            "si-a",
+            ProtocolNode.from_dict(local.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        self.assertTrue(peer.reconcile_peer_changes("si-a", topic.uuid))
+        peer.modify(child.uuid, {"name": "Doing"}, {})
+
+        local.apply_peer_subtree(
+            "si-b",
+            ProtocolNode.from_dict(peer.protocol.index[topic.uuid].to_dict()),
+            local.protocol.root.uuid,
+        )
+        local.record_peer_observations("si-b", {
+            child.uuid: Session.node_revision(local.protocol.index[child.uuid]),
+        })
+
+        events = local.analyze_peer_transitions("si-b", topic.uuid)
+        child_event = next(
+            event for event in events if event["node_uuid"] == child.uuid
+        )
+
+        self.assertEqual(child_event["type"], "peer_made_changes")
+        self.assertTrue(local.reconcile_peer_changes("si-b", topic.uuid))
+        self.assertEqual(
+            local.protocol.index[child.uuid].data["name"], "Doing",
+        )
 
     @staticmethod
     def _node(state_hash, base_hash, parent_uuid, base_parent_uuid,
@@ -635,6 +717,41 @@ class SessionTests(unittest.TestCase):
             ["http://addr-b", "relay:B"],
         )
         self.assertEqual(session.addresses_for_identity("key-nobody"), [])
+
+    def test_known_identity_resolves_profile_across_transport_addresses(self):
+        session = Session("si-a")
+        bob = ProtocolNode({
+            "type": "shared_user_profile", "name": "public_profile",
+            "profile_schema_version": 1, "identity_key": "key-bob",
+            "display_name": "Bob", "picture": "",
+        })
+        bob.refresh_hashes()
+        session.apply_peer_subtree("relay:identity-home", bob, None)
+        session.set_peer_identity_key("relay:board-home", "key-bob")
+        session.note_indirect_peer_topic("relay:board-home", "board")
+
+        identities = session.known_identities()
+        remote = next(item for item in identities if item["uuid"] == bob.uuid)
+
+        self.assertEqual(remote["name"], "Bob")
+        self.assertEqual(
+            remote["addresses"],
+            ["relay:board-home", "relay:identity-home"],
+        )
+
+    def test_forget_peer_address_removes_a_new_own_publication_slot(self):
+        session = Session("si-a")
+        session.note_indirect_peer_topic("relay:paired", "board")
+        session.set_peer_identity_key("relay:paired", "old-peer-key")
+        session.peer_observed_node_revisions["relay:paired"] = {"node": "rev"}
+
+        session.forget_peer_address("relay:paired")
+
+        self.assertNotIn("relay:paired", session.peer_topic_sets)
+        self.assertNotIn("relay:paired", session.peer_identity_key)
+        self.assertNotIn(
+            "relay:paired", session.peer_observed_node_revisions,
+        )
 
     def test_apply_peer_subtree_records_identity_key_for_profile_roots(self):
         session = Session("si-a")

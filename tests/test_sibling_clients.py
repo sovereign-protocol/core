@@ -120,6 +120,14 @@ class SiblingClientTests(unittest.TestCase):
         laptop.tick()
         return desktop, laptop, topic
 
+    def test_take_sibling_version_refuses_an_unconfigured_relay(self):
+        relay = RelayLogic(Session("local"), {})
+
+        result = relay.take_sibling_version("topic")
+
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.reason, "relay not configured")
+
     def test_a_second_client_receives_the_topic(self):
         with tempfile.TemporaryDirectory() as relay_root, \
                 tempfile.TemporaryDirectory() as state_dir:
@@ -784,6 +792,9 @@ class PairingTokenTests(unittest.TestCase):
 
         self.assertIn('"Identity home"', shared_js)
         self.assertIn('"Use for my identity"', shared_js)
+        self.assertIn('"Stop all use"', shared_js)
+        self.assertIn("channel.assigned_topics", shared_js)
+        self.assertIn("/api/core/channels/stop", shared_js)
         self.assertIn("breaks previous", shared_js)
         self.assertIn("removes every topic", shared_js)
         self.assertIn("token.token_version !== 2", shared_js)

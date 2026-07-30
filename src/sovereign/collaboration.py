@@ -98,11 +98,29 @@ class CollaborationService:
                 continue
             described = channel.management_descriptor()
             channel_types.extend(described.get("types") or [])
-            instances.extend({
-                **instance,
-                "identity_home": identity_uuid
-                in set(instance.get("topic_uuids") or []),
-            } for instance in (described.get("instances") or []))
+            for instance in described.get("instances") or []:
+                assigned_topics = []
+                for topic_uuid in instance.get("topic_uuids") or []:
+                    topic_uuid = str(topic_uuid)
+                    is_identity = topic_uuid == identity_uuid
+                    node = self.session.get_node(topic_uuid)
+                    data = node.data if node else {}
+                    assigned_topics.append({
+                        "uuid": topic_uuid,
+                        "title": (
+                            "My identity" if is_identity
+                            else data.get("name") or data.get("title")
+                            or topic_uuid
+                        ),
+                        "identity": is_identity,
+                    })
+                instances.append({
+                    **instance,
+                    "identity_home": any(
+                        topic["identity"] for topic in assigned_topics
+                    ),
+                    "assigned_topics": assigned_topics,
+                })
         identity_channel_ref = next((
             str(instance.get("ref") or "")
             for instance in instances
@@ -122,11 +140,11 @@ class CollaborationService:
             return ChannelResult.error("application topic not found", 404)
         network = self.network_info(topic_uuid)
         peers = []
-        identities = {
-            item.get("address"): item
-            for item in self.session.known_identities()
-            if item.get("address")
-        }
+        identities = {}
+        for item in self.session.known_identities():
+            for address in item.get("addresses") or [item.get("address")]:
+                if address:
+                    identities[address] = item
         for peer_addr, info in sorted((network.get("peers") or {}).items()):
             if not self.session.peer_discusses_node(peer_addr, topic_uuid):
                 continue
@@ -201,6 +219,24 @@ class CollaborationService:
                 return ChannelResult.error("channel instance cannot be detached", 400)
             return channel.detach_instance_topics((topic_uuid,), instance_id)
         return channel.detach_topics((topic_uuid,))
+
+    def stop_channel(self, channel_ref: str) -> ChannelResult:
+        """Detach every topic, including identity, while keeping the channel."""
+        channel, instance_id = self._channel_instance(channel_ref)
+        if not channel or not instance_id:
+            return ChannelResult.error("channel not found", 404)
+        if not isinstance(channel, ManagedChannel):
+            return ChannelResult.error("channel instance cannot be detached", 400)
+        instance = next((
+            item for item in channel.management_descriptor().get("instances") or []
+            if str(item.get("id") or "") == instance_id
+        ), None)
+        if instance is None:
+            return ChannelResult.error("channel not found", 404)
+        topic_uuids = tuple(str(item) for item in instance.get("topic_uuids") or [])
+        if not topic_uuids:
+            return ChannelResult.success()
+        return channel.detach_instance_topics(topic_uuids, instance_id)
 
     def compose_invitation(
         self, topic_uuid: str, channel_ref: str,

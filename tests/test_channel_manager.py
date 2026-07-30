@@ -1,3 +1,4 @@
+import threading
 import unittest
 
 from sovereign.channel import (
@@ -10,12 +11,12 @@ from sovereign.channel import (
     LivenessChannel,
     ManagedChannel,
     PairingChannel,
-    PersistenceParticipant,
     PollCycleResult,
     PollingChannel,
     PollingEndpoint,
 )
 from sovereign.collaboration import CollaborationService
+from sovereign.locking import RELAY_IO_LOCK_ORDER, OrderedRLock
 from sovereign.mailbox_channel import MailboxChannel
 from sovereign.relay_storage import LocalFolderRelayStorage, SftpRelayStorage
 from sovereign import RelayStorage
@@ -139,13 +140,21 @@ class ChannelManagerTests(unittest.TestCase):
         self.assertIsInstance(mailbox, LivenessChannel)
         self.assertIsInstance(mailbox, ManagedChannel)
         self.assertIsInstance(mailbox, PairingChannel)
-        self.assertIsInstance(mailbox, PersistenceParticipant)
         self.assertIsInstance(mailbox, PollingChannel)
+        self.assertFalse(hasattr(mailbox, "persistence_lock"))
 
     def test_mailbox_close_skips_unconfigured_storage_and_is_repeatable(self):
         storage = _CloseableStorage()
-        configured = type("Connection", (), {"storage": storage})()
-        unconfigured = type("Connection", (), {"storage": None})()
+        # Closing takes each connection's relay I/O lock, so a stand-in has
+        # to carry one exactly as RelayLogic does.
+        configured = type("Connection", (), {
+            "storage": storage,
+            "_io_lock": OrderedRLock(RELAY_IO_LOCK_ORDER, "fake._io_lock"),
+        })()
+        unconfigured = type("Connection", (), {
+            "storage": None,
+            "_io_lock": OrderedRLock(RELAY_IO_LOCK_ORDER, "fake._io_lock"),
+        })()
         mailbox = MailboxChannel(type("Manager", (), {
             "all_connections": lambda self: [configured, unconfigured],
         })())
@@ -155,6 +164,39 @@ class ChannelManagerTests(unittest.TestCase):
 
         self.assertEqual(storage.close_count, 1)
         self.assertIsNone(configured.storage)
+
+    def test_mailbox_close_waits_for_in_flight_relay_io(self):
+        storage = _CloseableStorage()
+        connection = type("Connection", (), {
+            "storage": storage,
+            "_io_lock": threading.RLock(),
+        })()
+        mailbox = MailboxChannel(type("Manager", (), {
+            "all_connections": lambda self: [connection],
+        })())
+        entered = threading.Event()
+        release = threading.Event()
+
+        def poll_phase():
+            with connection._io_lock:
+                entered.set()
+                release.wait(timeout=2)
+                self.assertIs(connection.storage, storage)
+
+        poller = threading.Thread(target=poll_phase)
+        closer = threading.Thread(target=mailbox.close)
+        poller.start()
+        self.assertTrue(entered.wait(timeout=2))
+        closer.start()
+        self.assertIs(connection.storage, storage)
+        release.set()
+        poller.join(timeout=2)
+        closer.join(timeout=2)
+
+        self.assertFalse(poller.is_alive())
+        self.assertFalse(closer.is_alive())
+        self.assertEqual(storage.close_count, 1)
+        self.assertIsNone(connection.storage)
 
     def test_minimal_third_party_channel_loses_no_implicit_functionality(self):
         session = Session("http://a")
@@ -168,15 +210,13 @@ class ChannelManagerTests(unittest.TestCase):
         self.assertNotIsInstance(channel, BlobChannel)
         self.assertNotIsInstance(channel, LivenessChannel)
         self.assertNotIsInstance(channel, PairingChannel)
-        self.assertNotIsInstance(channel, PersistenceParticipant)
         self.assertNotIsInstance(channel, PollingChannel)
         self.assertEqual(manager.status()["minimal"], {"configured": False})
         self.assertEqual(
             CollaborationService(session, manager).channels_payload()["channels"],
             [],
         )
-        with manager.persistence_guard():
-            pass
+        self.assertFalse(hasattr(manager, "persistence_guard"))
 
     def test_compose_token_uses_registered_offers_and_identity(self):
         session = Session("http://a")

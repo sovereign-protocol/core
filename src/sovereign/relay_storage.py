@@ -17,6 +17,8 @@ Offered API:
     read_snapshot(topic_uuid, peer_id, state_hash) -> dict | None
     list_peers(topic_uuid) -> list[str]
     list_topics() -> list[str]
+    delete_publication(topic_uuid, peer_id) -> None
+      Removes only one peer's publication from a topic.
     delete_topic(topic_uuid) -> None
       Removes the whole topic subtree (every peer's snapshots under it) -
       not scoped to one peer, since a topic is a shared mailbox namespace,
@@ -106,6 +108,7 @@ class RelayStorage(Protocol):
     ) -> dict | None: ...
     def list_peers(self, topic_uuid: str) -> list[str]: ...
     def list_topics(self) -> list[str]: ...
+    def delete_publication(self, topic_uuid: str, peer_id: str) -> None: ...
     def delete_topic(self, topic_uuid: str) -> None: ...
     def write_presence(self, peer_id: str, payload: dict) -> float | None: ...
     def read_presence_with_mtime(
@@ -262,6 +265,12 @@ class LocalFolderRelayStorage:
         if not topics_dir.is_dir():
             return []
         return sorted(entry.name for entry in topics_dir.iterdir() if entry.is_dir())
+
+    def delete_publication(self, topic_uuid: str, peer_id: str) -> None:
+        import shutil
+        peer_dir = self._peer_dir(topic_uuid, peer_id)
+        if peer_dir.is_dir():
+            shutil.rmtree(peer_dir)
 
     def delete_topic(self, topic_uuid: str) -> None:
         import shutil
@@ -543,6 +552,12 @@ class SftpRelayStorage:
 
     def list_topics(self) -> list[str]:
         return self._list_dir(posixpath.join(self.root, "topics"))
+
+    def delete_publication(self, topic_uuid: str, peer_id: str) -> None:
+        def operation(sftp):
+            self._rmtree(sftp, self._peer_dir(topic_uuid, peer_id))
+
+        self._with_retry(operation)
 
     def delete_topic(self, topic_uuid: str) -> None:
         def operation(sftp):

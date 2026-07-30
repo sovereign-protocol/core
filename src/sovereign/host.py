@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import importlib
 import threading
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from importlib.resources import files
 from typing import Any, Iterable
 
@@ -15,6 +15,17 @@ from .application import (
     ApplicationFacade, ApplicationInstance, ApplicationManifest,
     ApplicationServices, ApplicationSpec, IncompatibleApplicationFacade,
 )
+
+
+@dataclass(frozen=True)
+class PeerUpdateOutcome:
+    """Application reconciliation committed inside the Session transaction."""
+
+    changed: bool
+    effects: tuple[Any, ...] = ()
+
+    def __bool__(self) -> bool:
+        return self.changed
 
 
 class _ApplicationFacadeRegistry:
@@ -232,8 +243,16 @@ class ApplicationHost:
             self._reserved_paths = core_paths
             self._starlette_app = app
 
-    def notify_peer_update(self) -> bool:
+    def notify_peer_update(self) -> PeerUpdateOutcome:
+        """Reconcile applications without executing cross-layer effects.
+
+        Relay polling calls this while Session.lock is held so an automatic
+        reaction is atomic with the incoming peer snapshot. Effects may enter
+        channel management and are therefore returned for delivery only after
+        the caller releases Session and relay I/O locks.
+        """
         changed = False
+        effects = []
         for instance in self.instances.values():
             hook = (
                 instance.registration.on_peer_update
@@ -244,11 +263,9 @@ class ApplicationHost:
             result = hook()
             if getattr(result, "status", None) != "ok":
                 continue
-            effects = getattr(result, "effects", ())
-            if effects:
-                self.services.deliver_effects(effects)
+            effects.extend(getattr(result, "effects", ()) or ())
             changed = bool(getattr(result, "value", False)) or changed
-        return changed
+        return PeerUpdateOutcome(changed, tuple(effects))
 
     def read_primary_asset(self, kind: str) -> str:
         instance = self.primary_instance

@@ -1,7 +1,52 @@
 # Changelog
 
+## 0.1.5
+
+- Enforce the lock order `relay manager -> relay I/O -> Session` at runtime,
+  including a rejection of two locks from the same layer: nothing orders one
+  relay connection's I/O lock against another's.
+- Deliver application effects only after relay and Session transactions end.
+- Separate Core component metadata ownership from Session persistence.
+- **`Session.application_metadata()` now requires the caller to hold
+  `Session.lock`.** It returns the live namespace so applications can
+  read-modify-write nested structures; an unlocked write could race
+  persistence deep-copying the same dictionary. Core's response helpers hold
+  the lock already, so only applications calling from outside a request need
+  to open their own transaction.
+- Add atomic snapshot-observe-merge responses for transport-decorated views.
+- Remove the obsolete `PersistenceParticipant` lock-sharing contract.
+- The channel poll tick now asserts that peer-update reconciliation runs
+  inside the Session transaction, replacing a lock that could never be
+  contended, and calls the runtime's persistence and effect delivery
+  directly instead of probing for them.
+
 ## Unreleased
 
+- Fixed optimistic Session view confirmations that refreshed application data
+  without notifying subscribers to redraw when pending state changed in the
+  same batch.
+- Core now provides an optimistic `SessionView`: confirmed snapshots remain
+  separate from pending human intentions, mutations carry retry-safe IDs, and
+  timeouts reconcile instead of rolling the visible state back. Session-owned
+  view revisions make application snapshots atomic with their revision.
+- **Fixed: changing a field back to an earlier value no longer creates a
+  false divergence.** Relay observation now supplies the causal direction
+  when current and base content hashes form a cycle.
+- Browser liveness reads now use the channel poll's in-memory presence cache
+  instead of performing relay/SFTP I/O, and Core exposes a lightweight local
+  change revision for revision-gated application refreshes.
+
+- **Fixed: stopping use of a relay channel now withdraws that client's
+  publication.** The removal is serialized with publishing and leaves other
+  clients' publications intact. Manage Channels now lists every assigned
+  topic and can stop all use without deleting the channel.
+- **Fixed: relay heartbeats now describe which topics they actually carry.**
+  A client using the same relay for another board or only for identity traffic
+  no longer appears online for a board it has moved elsewhere. Agenda rows
+  also take their visible drop position before persistence and sync finish.
+- **Fixed: relay presence and shutdown could remain stale or race.** The shell
+  refreshes peer liveness without requiring a browser reload, and mailbox
+  shutdown now waits for in-flight relay I/O before closing its storage.
 - **Fixed: dragging an agenda item could show the drop position but leave the
   order unchanged in the desktop window.** The shared shell now uses one
   mouse-drag path instead of competing with WebView2's native HTML drag.

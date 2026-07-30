@@ -3,10 +3,9 @@
 from __future__ import annotations
 
 import threading
-from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
 from typing import (
-    Any, Callable, ContextManager, Iterable, Mapping, Protocol,
+    Any, Callable, Iterable, Mapping, Protocol,
     runtime_checkable,
 )
 
@@ -131,13 +130,6 @@ class PairingChannel(Channel, Protocol):
     def resolve_sibling_alarm(
         self, topic_uuid: str, decision: str,
     ) -> ChannelResult: ...
-
-
-@runtime_checkable
-class PersistenceParticipant(Channel, Protocol):
-    """A channel whose state must be locked while Core persists Session."""
-
-    persistence_lock: ContextManager[Any]
 
 
 @dataclass(frozen=True)
@@ -531,14 +523,6 @@ class ChannelManager:
     def close(self) -> None:
         for channel in reversed(self.channels()):
             channel.close()
-
-    @contextmanager
-    def persistence_guard(self):
-        with ExitStack() as stack:
-            for channel in self.channels():
-                if isinstance(channel, PersistenceParticipant):
-                    stack.enter_context(channel.persistence_lock)
-            yield
 
     def read_topic_blob(
         self, blob_id: str, peer_addr: str, topic_uuid: str,

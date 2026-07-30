@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import threading
 from typing import Any, Iterable, Mapping
 
 from .channel import ChannelAcceptance, ChannelResult, Invitation
@@ -14,9 +13,6 @@ class MailboxChannel:
 
     def __init__(self, manager):
         self._manager = manager
-        self.persistence_lock = getattr(
-            manager, "persistence_lock", threading.RLock(),
-        )
 
     def offer_descriptor(
         self, topic_uuids: tuple[str, ...], options: Mapping[str, Any],
@@ -251,14 +247,19 @@ class MailboxChannel:
 
     def close(self) -> None:
         for connection in self._manager.all_connections():
-            storage = connection.storage
-            if storage is None:
-                continue
-            storage.close()
-            # Shutdown may be entered again after a partial lifespan failure.
-            # Mark the resource closed so a second pass remains a no-op.
-            if connection.storage is storage:
-                connection.storage = None
+            # A cancelled asyncio.to_thread poll keeps running until its
+            # current transport call returns. Close under the same lock as
+            # relay I/O so storage cannot disappear between a phase's guard
+            # and its backend call.
+            with connection._io_lock:
+                storage = connection.storage
+                if storage is None:
+                    continue
+                storage.close()
+                # Shutdown may be entered again after a partial lifespan failure.
+                # Mark the resource closed so a second pass remains a no-op.
+                if connection.storage is storage:
+                    connection.storage = None
 
     def list_targets(self):
         return self._manager.list_targets()
@@ -282,8 +283,11 @@ class MailboxChannel:
             self._release_topic_peers(topic_uuid)
         return ChannelResult.success()
 
-    def peer_liveness(self, peer_id: str, target_id: str | None = None):
-        return self._manager.peer_liveness(peer_id, target_id)
+    def peer_liveness(
+        self, peer_id: str, target_id: str | None = None,
+        topic_uuid: str | None = None,
+    ):
+        return self._manager.peer_liveness(peer_id, target_id, topic_uuid)
 
     def peer_liveness_for_address(
         self, peer_addr: str, topic_uuid: str | None = None,
@@ -292,7 +296,9 @@ class MailboxChannel:
         if not peer_addr.startswith(prefix):
             return None
         target_id = self.target_for_topic(topic_uuid) if topic_uuid else None
-        return self.peer_liveness(peer_addr[len(prefix):], target_id)
+        return self.peer_liveness(
+            peer_addr[len(prefix):], target_id, topic_uuid,
+        )
 
     def compose_pairing_token(self, target_id: str = "") -> ChannelResult:
         return self._result(self._manager.compose_pairing_token(target_id))

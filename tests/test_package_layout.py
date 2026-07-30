@@ -20,6 +20,9 @@ import sovereign
 
 ROOT = Path(__file__).resolve().parents[1]
 SHARED_JS = files("sovereign.assets").joinpath("shared.js").read_text(encoding="utf-8")
+SHARED_SESSION_JS = files("sovereign.assets").joinpath(
+    "shared-session.js",
+).read_text(encoding="utf-8")
 
 
 class PackageLayoutTests(unittest.TestCase):
@@ -39,6 +42,9 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertTrue(files("sovereign.assets").joinpath("shared.js").is_file())
         self.assertTrue(
             files("sovereign.assets").joinpath("shared-api.js").is_file(),
+        )
+        self.assertTrue(
+            files("sovereign.assets").joinpath("shared-session.js").is_file(),
         )
         self.assertTrue(files("sovereign.assets").joinpath("manual.html").is_file())
 
@@ -76,6 +82,13 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertIn("this._renderAgenda()", pane_refresh)
         self.assertIn("agenda.contains(document.activeElement)", pane_refresh)
 
+    def test_confirmed_snapshot_replaces_optimistic_projection_atomically(self):
+        confirmation = SHARED_SESSION_JS.split(
+            "async _confirm(", 1,
+        )[1].split("\n    _remove(", 1)[0]
+        self.assertIn("this._beginBatch()", confirmation)
+        self.assertIn("this._endBatch(", confirmation)
+
     def test_agenda_reordering_uses_one_mouse_drag_path(self):
         agenda_row = SHARED_JS.split("_agendaRow(item) {", 1)[1].split(
             "\n  _renderAgenda() {", 1,
@@ -84,6 +97,24 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertIn('document.addEventListener("mouseup", up)', agenda_row)
         self.assertNotIn("row.draggable = true", agenda_row)
         self.assertNotIn("row.ondrop", agenda_row)
+        visible_drop = agenda_row.index("placement.target.after(row)")
+        network_post = agenda_row.index("await this._post(routes.move")
+        self.assertLess(visible_drop, network_post)
+
+    def test_agenda_creation_uses_the_shared_optimistic_session(self):
+        create = SHARED_JS.split("async _addAgendaItem()", 1)[1].split(
+            "_identityFor(uuid)", 1,
+        )[0]
+        self.assertIn("sessionView.mutate", create)
+        self.assertIn("optimisticUuid", create)
+        self.assertIn('invalidates: ["tiles", "context"]', create)
+
+    def test_relay_presence_refreshes_without_a_browser_reload(self):
+        self.assertIn(
+            "() => this.refreshSharingHeader()",
+            SHARED_JS,
+        )
+        self.assertIn("_sharingRefreshTimer", SHARED_JS)
 
     def test_domain_logic_modules_do_not_depend_on_host_or_http_controllers(self):
         paths = [

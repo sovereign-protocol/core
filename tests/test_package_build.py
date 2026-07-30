@@ -19,6 +19,7 @@ import sovereign
 assert version('sovereign-protocol') == sovereign.__version__
 assert files('sovereign.assets').joinpath('shared.js').is_file()
 assert files('sovereign.assets').joinpath('shared-api.js').is_file()
+assert files('sovereign.assets').joinpath('shared-session.js').is_file()
 assert files('sovereign.assets').joinpath('shared.css').is_file()
 assert files('sovereign.assets').joinpath('manual.html').is_file()
 assert sovereign.__all__

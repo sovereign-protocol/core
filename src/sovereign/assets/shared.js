@@ -264,8 +264,8 @@ const SovereignShell = {
     return this._applications;
   },
 
-  async _post(path, body) {
-    return SovereignApi.request(path, body || {});
+  async _post(path, body, options = {}) {
+    return SovereignApi.request(path, body || {}, options);
   },
 
   // options: { container, applicationId, topicUuid(), state(), onChanged() }
@@ -308,6 +308,15 @@ const SovereignShell = {
 
     this.refresh();
     this.refreshAvatar();
+    if (!this._sharingRefreshTimer) {
+      // Relay liveness changes without an application mutation. Keep the
+      // header current in desktop WebViews, where there is no browser reload
+      // button to force a fresh presence query.
+      this._sharingRefreshTimer = window.setInterval(
+        () => this.refreshSharingHeader(),
+        3000,
+      );
+    }
   },
 
   refresh() {
@@ -1071,12 +1080,58 @@ Object.assign(SovereignShell, {
     const text = field.value.trim();
     const topic = this._topic();
     if (!routes || !text || !topic) return;
+    const sessionView = this._options.sessionView;
+    const optimisticUuid = globalThis.crypto?.randomUUID
+      ? `optimistic:${globalThis.crypto.randomUUID()}`
+      : `optimistic:${Date.now()}:${Math.random()}`;
+    const selected = this._options.state
+      ? this._options.state().selected_topic : null;
+    const applicationId = selected?.uuid === topic
+      ? selected.application_id : "";
+    field.value = "";
     try {
-      await this._post(routes.create, { [routes.topicKey]: topic, text });
-      field.value = "";
-      await this._changed();
+      if (sessionView && typeof sessionView.mutate === "function") {
+        await sessionView.mutate({
+          key: `agenda:${topic}`,
+          command: "create-agenda-item",
+          arguments: {topic, text, optimisticUuid, applicationId},
+          invalidates: ["tiles", "context"],
+          action: (context) => this._post(
+            routes.create,
+            {
+              [routes.topicKey]: topic,
+              text,
+              mutation_id: context.mutationId,
+            },
+            {signal: context.signal},
+          ),
+          project: (draft, change) => {
+            const items = draft.agenda_items || [];
+            if (!items.some((item) => item.uuid === change.optimisticUuid)) {
+              draft.agenda_items = [...items, {
+                uuid: change.optimisticUuid,
+                data: {
+                  type: "agenda_item",
+                  text: change.text,
+                  priority: null,
+                  author: draft.identity_uuid || "",
+                },
+              }];
+            }
+            const topics = change.applicationId === "agreement"
+              ? (draft.agreements || []) : (draft.boards || []);
+            const tile = topics.find((entry) => entry.uuid === change.topic);
+            if (tile) tile.agenda_count = Number(tile.agenda_count || 0) + 1;
+            return draft;
+          },
+        });
+      } else {
+        await this._post(routes.create, { [routes.topicKey]: topic, text });
+        await this._changed();
+      }
       this.openCollab();
     } catch (error) {
+      field.value = text;
       showToast(error.message, true);
     }
   },
@@ -1146,21 +1201,39 @@ Object.assign(SovereignShell, {
       const finishDrag = async (clientX, clientY) => {
         if (this._dragAgendaUuid !== item.uuid) return;
         const placement = targetAt(clientX, clientY);
-        clearDrag();
-        if (!placement) return;
+        if (!placement) {
+          clearDrag();
+          return;
+        }
         const targetUuid = placement.target.dataset.itemUuid || "";
-        if (!targetUuid || targetUuid === item.uuid) return;
+        if (!targetUuid || targetUuid === item.uuid) {
+          clearDrag();
+          return;
+        }
         const items = (
           (this._options.state ? this._options.state() : {}).agenda_items || []
         ).filter((entry) => entry.uuid !== item.uuid);
         let index = items.findIndex((entry) => entry.uuid === targetUuid);
-        if (index < 0) return;
+        if (index < 0) {
+          clearDrag();
+          return;
+        }
         if (placement.after) index += 1;
+        // Commit the visible drop before waiting for persistence, relay
+        // publication, or an application refresh. A failed request reloads
+        // the authoritative order below.
+        if (placement.after) placement.target.after(row);
+        else placement.target.before(row);
+        clearDrag();
         try {
           await this._post(routes.move, { item_uuid: item.uuid, index });
           await this._changed();
           this.openCollab();
-        } catch (error) { showToast(error.message, true); }
+        } catch (error) {
+          showToast(error.message, true);
+          await this._changed();
+          this.openCollab();
+        }
       };
       handle.onmousedown = (event) => {
         if (event.button !== 0) return;
@@ -1368,6 +1441,7 @@ Object.assign(SovereignShell, {
   // ---- connections: the right-hand pane -----------------------------
 
   _connReady: false,
+  _sharingRefreshTimer: null,
   _sharing: { people: [], channels: [] },
   _channelCatalog: { types: [], channels: [] },
 
@@ -1844,6 +1918,15 @@ Object.assign(SovereignShell, {
       if (channel.identity_home) {
         status.append(this._targetStatus("Identity home", "is-in-use"));
       }
+      const assigned = channel.assigned_topics || [];
+      if (assigned.length) {
+        const usage = document.createElement("span");
+        usage.className = "shell-note";
+        usage.textContent = `Used by: ${assigned.map(
+          (topic) => topic.title,
+        ).join(", ")}`;
+        identity.append(usage);
+      }
       const actions = document.createElement("div");
       actions.className = "shell-target-actions";
       if (!channel.identity_home) {
@@ -1862,6 +1945,18 @@ Object.assign(SovereignShell, {
               move,
             );
           },
+        ));
+      }
+      if (assigned.length) {
+        actions.append(this._channelAction(
+          "Stop all use",
+          () => confirmAction(
+            `Stop all use of ${channel.name}?`,
+            "This removes the identity home and every topic assignment."
+              + " The channel remains available.",
+            () => this._stopChannel(channel),
+          ),
+          "danger",
         ));
       }
       if (channel.removable) {
@@ -1990,6 +2085,20 @@ Object.assign(SovereignShell, {
       await this._refreshChannelManager();
       await this._loadSharing();
       this._note("shellChannelManagerNote", `${channel.name} deleted.`);
+      await this._changed();
+    } catch (error) {
+      this._note("shellChannelManagerNote", error.message);
+    }
+  },
+
+  async _stopChannel(channel) {
+    try {
+      await this._post(
+        "/api/core/channels/stop", { channel_ref: channel.ref },
+      );
+      await this._refreshChannelManager();
+      await this._loadSharing();
+      this._note("shellChannelManagerNote", `${channel.name} is no longer in use.`);
       await this._changed();
     } catch (error) {
       this._note("shellChannelManagerNote", error.message);

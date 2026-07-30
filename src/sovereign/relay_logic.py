@@ -98,6 +98,9 @@ from pathlib import Path
 from typing import Any
 
 from .blob_store import blob_hex, referenced_blob_ids
+from .locking import (
+    MANAGER_LOCK_ORDER, RELAY_IO_LOCK_ORDER, OrderedRLock,
+)
 from .channel import PollCycleResult
 from .protocol import ProtocolNode, protocol_node_from_envelope
 from .session import Session, SessionResult
@@ -172,7 +175,9 @@ def _manager_locked(method):
 class RelayLogic:
     def __init__(self, session: Session, config: dict, blob_store=None):
         self.session = session
-        self._io_lock = threading.RLock()
+        self._io_lock = OrderedRLock(
+            RELAY_IO_LOCK_ORDER, "RelayLogic._io_lock",
+        )
         self._session_lock = session.lock
         self.blob_store = blob_store
         self._manager = None
@@ -192,6 +197,10 @@ class RelayLogic:
             or self.session.component_metadata("relay").get("relay_paired_client_id")
             or self.session.identity.uuid
         )
+        # Pairing can turn an address previously tracked as a remote peer into
+        # this client's own publication identity. Never carry that stale
+        # address-to-person relationship into the new role.
+        self.session.forget_peer_address(f"relay:{self.identity}")
         self.storage: RelayStorage | None = self._build_storage(config)
         adopted_descriptor = None
         if self.storage is None:
@@ -218,6 +227,12 @@ class RelayLogic:
         # cancels out clock skew between machines entirely, with no
         # explicit offset calculation needed - see peer_liveness().
         self._own_presence_mtime: float | None = None
+        # Populated by the channel poll. Browser/API reads consult only this
+        # in-memory snapshot: a UI request must never wait for SFTP or contend
+        # with the poller's relay I/O lock.
+        self._peer_presence_cache: dict[
+            str, tuple[dict | None, float | None]
+        ] = {}
         # Which peer ids the relay listed per topic on the previous poll.
         # In memory only, and for the same reason `applied` is: it describes
         # peer_perspectives, which does not survive a restart either. A
@@ -352,7 +367,9 @@ class RelayLogic:
             # on its next start. Keep the accepted descriptor with the
             # already-persisted session metadata so storage, credentials,
             # and the host's poll interval survive restart.
-            self.session.component_metadata("relay")["relay_adopted_storage_descriptor"] = dict(descriptor)
+            self.session.update_component_metadata("relay", {
+                "relay_adopted_storage_descriptor": dict(descriptor),
+            })
         # Re-key bookkeeping to the real location. The boot-time
         # _state_path was fingerprinted from empty config (no storage);
         # published/applied hashes are meaningless against a different
@@ -575,6 +592,11 @@ class RelayLogic:
             "profile": profile,
             "updated_at": now_iso(),
             "poll_interval_seconds": self.poll_interval_seconds,
+            # Presence is per relay identity, but reachability is per topic.
+            # Without this, using the same relay for identity traffic or a
+            # different board makes a peer appear online for a board this
+            # connection no longer carries.
+            "topic_uuids": self.relay_topic_uuids(),
         }
         started_monotonic = time.monotonic()
         started_wall = time.time()
@@ -712,16 +734,16 @@ class RelayLogic:
             phase("write_presence", self.write_presence)
             # Polling precedes publication so sibling clients sharing one
             # publication identity cannot overwrite unseen work.
-            applied = phase("poll_and_apply", self.poll_and_apply)
+            # A peer snapshot and the application's automatic reaction are
+            # committed under one Session lock inside poll_and_apply.  No
+            # reader can observe the cached divergence between those steps.
+            applied = phase(
+                "poll_and_apply",
+                lambda: self.poll_and_apply(after_apply),
+            )
             published_before = phase(
                 "publish_after_poll", self.publish_due_topics,
             )
-            if applied and after_apply:
-                phase("adopt_peer_updates", after_apply)
-            if applied:
-                published_after = phase(
-                    "publish_response", self.publish_due_topics,
-                )
             work_duration = time.monotonic() - work_started
             self.record_cycle_duration(work_duration)
             if published_before or published_after:
@@ -791,12 +813,21 @@ class RelayLogic:
         })
 
     @_relay_io_locked
-    def peer_liveness(self, peer_id: str) -> dict:
+    def peer_liveness(
+        self, peer_id: str, topic_uuid: str | None = None,
+    ) -> dict:
         if not self.storage or self._own_presence_mtime is None:
             return {"state": "unknown"}
-        content, mtime = self.storage.read_presence_with_mtime(peer_id)
+        content, mtime = self._peer_presence_cache.get(peer_id, (None, None))
         if content is None or mtime is None:
             return {"state": "unknown"}
+        carried_topics = content.get("topic_uuids")
+        if (
+            topic_uuid
+            and isinstance(carried_topics, list)
+            and topic_uuid not in carried_topics
+        ):
+            return {"state": "unrouted"}
         peer_interval = float(content.get("poll_interval_seconds") or self.poll_interval_seconds)
         # Both mtimes come from the same server clock, so this difference
         # is skew-free regardless of how far apart the two machines' own
@@ -871,12 +902,14 @@ class RelayLogic:
         """
         return f"{Session.SIBLING_ADDRESS_PREFIX}{self.identity}"
 
+    @_relay_io_locked
     def sibling_alarm_topics(self) -> list[str]:
         return sorted(self._sibling_alarms)
 
     # The two answers to the alarm. Both are offered at the application, not
     # decided here; this only carries them out.
 
+    @_relay_io_locked
     def take_sibling_version(self, topic_uuid: str) -> SessionResult:
         """Replace this client's topic with the one in the slot.
 
@@ -884,6 +917,8 @@ class RelayLogic:
         person is asked first and told where the storage file is - copying
         it is the only way back, and deliberately so (section 4.4).
         """
+        if not self.storage:
+            return SessionResult("error", reason="relay not configured")
         head = self.storage.read_head(topic_uuid, self.identity) or {}
         relay_hash = head.get("hash")
         if not relay_hash:
@@ -896,6 +931,7 @@ class RelayLogic:
         self._take_sibling_publication(topic_uuid, payload, relay_hash)
         return SessionResult("ok", value=topic_uuid)
 
+    @_relay_io_locked
     def keep_local_version(self, topic_uuid: str) -> SessionResult:
         """Publish this client's topic over the sibling's.
 
@@ -917,6 +953,7 @@ class RelayLogic:
         )
         return SessionResult("ok", value=topic_uuid)
 
+    @_relay_io_locked
     def _reconcile_sibling_publication(self, topic_uuid: str) -> bool:
         """Apply the sibling rule to whatever is in our own slot.
 
@@ -981,6 +1018,7 @@ class RelayLogic:
         self._take_sibling_publication(topic_uuid, payload, relay_hash)
         return True
 
+    @_relay_io_locked
     def _take_sibling_publication(self, topic_uuid: str, payload: dict,
                                   relay_hash: str) -> None:
         subtree = protocol_node_from_envelope(payload)
@@ -1053,6 +1091,7 @@ class RelayLogic:
             )
         return present
 
+    @_relay_io_locked
     def publish_due_topics(self) -> list[str]:
         if not self.storage:
             return []
@@ -1286,7 +1325,7 @@ class RelayLogic:
         }
 
     @_relay_io_locked
-    def poll_and_apply(self) -> list[tuple[str, str]]:
+    def poll_and_apply(self, after_apply=None) -> list[tuple[str, str]]:
         # Discovers topics from what's actually in the relay, not from
         # relay_topic_uuids() (this session's own local topics) - otherwise
         # a peer who's never seen a topic before could never learn about it
@@ -1306,6 +1345,7 @@ class RelayLogic:
         def read_presence(peer_id: str) -> tuple[dict | None, float | None]:
             if peer_id not in presence_cache:
                 presence_cache[peer_id] = self.storage.read_presence_with_mtime(peer_id)
+                self._peer_presence_cache[peer_id] = presence_cache[peer_id]
             return presence_cache[peer_id]
 
         if self._scoped_topic_uuids is None:
@@ -1553,6 +1593,12 @@ class RelayLogic:
                     self.session.record_peer_observations(
                         peer_addr, observed_for_me,
                     )
+                    if after_apply:
+                        # Session.lock is re-entrant. Application reconciliation
+                        # therefore sees the new peer cache and commits its
+                        # automatic reaction before any snapshot reader can
+                        # enter between the two states.
+                        after_apply()
                 self._state["observed"].setdefault(topic_uuid, {})[peer_id] = (
                     self.session.node_revision_map(peer_copy)
                 )
@@ -1619,6 +1665,47 @@ class RelayLogic:
         }
 
     @_relay_io_locked
+    def withdraw_topic_publication(self, topic_uuid: str) -> SessionResult:
+        """Remove only this connection identity's publication for a topic."""
+        if not self.storage:
+            return SessionResult("error", reason="relay not configured")
+        # A sibling pairing deliberately carries every topic independently
+        # of peer-channel assignments. Detaching such an assignment must not
+        # interrupt the sibling relationship.
+        if self._state.get("pair_all_topics"):
+            return SessionResult("ok", value=False)
+        try:
+            self.storage.delete_publication(topic_uuid, self.identity)
+        except Exception as exc:  # noqa: BLE001 - preserve the assignment
+            self.session.trace_event(
+                "relay.publication_withdraw_failed",
+                relay_identity=self.identity,
+                topic_uuid=topic_uuid,
+                reason=str(exc)[:200],
+            )
+            return SessionResult(
+                "error",
+                reason=f"could not withdraw relay publication: {exc}",
+            )
+        self._forget_topic_bookkeeping(topic_uuid)
+        self._save_state()
+        self.session.trace_event(
+            "relay.publication_withdrawn",
+            relay_identity=self.identity,
+            topic_uuid=topic_uuid,
+        )
+        return SessionResult("ok", value=True)
+
+    def _forget_topic_bookkeeping(self, topic_uuid: str) -> None:
+        for key in (
+            "published", "published_observations", "observed",
+            "publication_seq", "ack_publication_seq",
+            "received_publications", "observed_publications",
+            "peer_observed_publications", "applied",
+        ):
+            self._state[key].pop(topic_uuid, None)
+
+    @_relay_io_locked
     def delete_topic(self, topic_uuid: str) -> SessionResult:
         # Purely a storage/bookkeeping cleanup - never touches whatever a
         # peer may have already grafted into their own local application tree
@@ -1627,15 +1714,7 @@ class RelayLogic:
         if not self.storage:
             return SessionResult("error", reason="relay not configured")
         self.storage.delete_topic(topic_uuid)
-        self._state["published"].pop(topic_uuid, None)
-        self._state["published_observations"].pop(topic_uuid, None)
-        self._state["observed"].pop(topic_uuid, None)
-        self._state["publication_seq"].pop(topic_uuid, None)
-        self._state["ack_publication_seq"].pop(topic_uuid, None)
-        self._state["received_publications"].pop(topic_uuid, None)
-        self._state["observed_publications"].pop(topic_uuid, None)
-        self._state["peer_observed_publications"].pop(topic_uuid, None)
-        self._state["applied"].pop(topic_uuid, None)
+        self._forget_topic_bookkeeping(topic_uuid)
         self._state["desired"] = [t for t in self._state.get("desired", []) if t != topic_uuid]
         self._state["identity_topics"] = [
             t for t in self._state.get("identity_topics", []) if t != topic_uuid
@@ -1766,7 +1845,23 @@ class RelayManager:
         # Registry iteration/mutation has its own lock. Protocol snapshots
         # use Session.lock; keeping the two distinct avoids an io->session vs
         # session->io lock inversion when credentials are refreshed.
-        self._manager_lock = threading.RLock()
+        self._manager_lock = OrderedRLock(
+            MANAGER_LOCK_ORDER, "RelayManager._manager_lock",
+        )
+        metadata = self.session.component_metadata("relay")
+        stored_targets = metadata.get("relay_targets")
+        stored_topic_targets = metadata.get("relay_topic_targets")
+        self._targets: dict[str, dict] = (
+            copy.deepcopy(stored_targets)
+            if isinstance(stored_targets, dict) else {}
+        )
+        self._topic_targets: dict[str, str] = (
+            copy.deepcopy(stored_topic_targets)
+            if isinstance(stored_topic_targets, dict) else {}
+        )
+        self._startup_target_migrated = bool(
+            metadata.get("relay_startup_target_migrated"),
+        )
         self.connections: dict[str, RelayLogic] = {}
         # The implicit connection: built from the flat config (or a persisted
         # adopted-descriptor) exactly as before. Registered by fingerprint.
@@ -1780,24 +1875,18 @@ class RelayManager:
             self.ensure_connection(self.target_descriptor(target["id"]))
         self.refresh_scopes()
 
-    @property
-    def persistence_lock(self):
-        """Public lock used by the channel persistence capability."""
-        return self._manager_lock
-
     def _target_registry(self) -> dict[str, dict]:
-        registry = self.session.component_metadata("relay").setdefault("relay_targets", {})
-        if not isinstance(registry, dict):
-            registry = {}
-            self.session.component_metadata("relay")["relay_targets"] = registry
-        return registry
+        return self._targets
 
     def _topic_target_map(self) -> dict[str, str]:
-        mapping = self.session.component_metadata("relay").setdefault("relay_topic_targets", {})
-        if not isinstance(mapping, dict):
-            mapping = {}
-            self.session.component_metadata("relay")["relay_topic_targets"] = mapping
-        return mapping
+        return self._topic_targets
+
+    def _persist_configuration(self) -> None:
+        self.session.update_component_metadata("relay", {
+            "relay_targets": self._targets,
+            "relay_topic_targets": self._topic_targets,
+            "relay_startup_target_migrated": self._startup_target_migrated,
+        })
 
     @staticmethod
     def _record_from_descriptor(descriptor: dict, name: str | None = None) -> dict:
@@ -1849,16 +1938,23 @@ class RelayManager:
         # Older versions marked the target imported from JSON as protected.
         # Targets are now owned by the persisted registry, including migrated
         # ones, so every target can be edited and deleted in the UI.
+        changed = False
         for record in registry.values():
-            record.pop("configured", None)
-        migration_key = "relay_startup_target_migrated"
-        if self.session.component_metadata("relay").get(migration_key):
+            if "configured" in record:
+                record.pop("configured", None)
+                changed = True
+        if self._startup_target_migrated:
+            if changed:
+                self._persist_configuration()
             return
-        self.session.component_metadata("relay")[migration_key] = True
+        self._startup_target_migrated = True
+        changed = True
         if not self.primary.storage:
+            self._persist_configuration()
             return
         descriptor = self.primary.channel_descriptor()
         if not descriptor:
+            self._persist_configuration()
             return
         fingerprint = _relay_fingerprint(self.primary.storage)
         target_id = next(
@@ -1875,15 +1971,20 @@ class RelayManager:
             registry[target_id] = self._record_from_descriptor(
                 descriptor, "Imported relay",
             )
+            changed = True
         # Migrate durable relay intent to explicit assignments. New topics
         # remain unassigned, as required by the explicit-target model.
         mapping = self._topic_target_map()
         for topic_uuid in set(self.primary._state.get("shared", [])) | set(
             self.primary._state.get("desired", [])
         ):
-            node = self.session.protocol.index.get(topic_uuid)
+            node = self.session.get_node(topic_uuid)
             if node and self.session.supports_shared_topic(node):
-                mapping.setdefault(topic_uuid, target_id)
+                if topic_uuid not in mapping:
+                    mapping[topic_uuid] = target_id
+                    changed = True
+        if changed:
+            self._persist_configuration()
 
     @_manager_locked
     def list_targets(self) -> list[dict]:
@@ -2055,6 +2156,7 @@ class RelayManager:
                 if connection:
                     connection.mark_topics_shared([identity_uuid])
             self.refresh_scopes()
+            self._persist_configuration()
         return SessionResult("ok", value=target_id)
 
     def update_target(self, target_id: str, values: dict,
@@ -2140,6 +2242,7 @@ class RelayManager:
                     self._retire_connection(old_fingerprint, old_connection)
             self.connections[new_fingerprint] = new_connection
             self.refresh_scopes()
+            self._persist_configuration()
         return SessionResult("ok", value=target_id)
 
     @_manager_locked
@@ -2166,6 +2269,7 @@ class RelayManager:
             if connection:
                 connection.mark_topics_shared([identity_uuid])
         self.refresh_scopes()
+        self._persist_configuration()
         return SessionResult("ok", value=target_id)
 
     def accept_descriptor(self, descriptor: dict, topic_uuids: list[str],
@@ -2217,11 +2321,16 @@ class RelayManager:
                     if previous and previous is not connection:
                         previous_connections.append((previous, topic_uuid))
             for previous, topic_uuid in previous_connections:
+                withdrawn = previous.withdraw_topic_publication(topic_uuid)
+                if withdrawn.status != "ok":
+                    connection.unmark_topics_desired(topic_uuids)
+                    return withdrawn
                 previous.unmark_topics_shared([topic_uuid])
                 previous.unmark_topics_desired([topic_uuid])
             for topic_uuid in application_topics:
                 mapping[topic_uuid] = target_id
             self.refresh_scopes()
+            self._persist_configuration()
         return SessionResult("ok", value=target_id)
 
     @_manager_locked
@@ -2237,6 +2346,9 @@ class RelayManager:
         if previous_id and previous_id != target_id:
             previous = self.connection_for_target(previous_id)
             if previous and previous is not next_connection:
+                withdrawn = previous.withdraw_topic_publication(topic_uuid)
+                if withdrawn.status != "ok":
+                    return withdrawn
                 previous.unmark_topics_shared([topic_uuid])
                 previous.unmark_topics_desired([topic_uuid])
         if target_id:
@@ -2247,6 +2359,7 @@ class RelayManager:
         if target_id:
             if next_connection:
                 next_connection.mark_topics_shared([topic_uuid])
+        self._persist_configuration()
         return SessionResult("ok", value=target_id or "")
 
     @_manager_locked
@@ -2305,7 +2418,17 @@ class RelayManager:
         fingerprint = _relay_fingerprint(storage) if storage else None
         connection = self.connections.get(fingerprint) if fingerprint else None
         mapping = self._topic_target_map()
-        for topic_uuid in [uuid for uuid, assigned in mapping.items() if assigned == target_id]:
+        assigned_topics = [
+            uuid for uuid, assigned in mapping.items() if assigned == target_id
+        ]
+        if connection:
+            for topic_uuid in assigned_topics:
+                withdrawn = connection.withdraw_topic_publication(topic_uuid)
+                if withdrawn.status != "ok":
+                    return withdrawn
+                connection.unmark_topics_shared([topic_uuid])
+                connection.unmark_topics_desired([topic_uuid])
+        for topic_uuid in assigned_topics:
             mapping.pop(topic_uuid, None)
         registry.pop(target_id)
         remaining_same_connection = any(
@@ -2317,6 +2440,7 @@ class RelayManager:
         if connection and not remaining_same_connection:
             self._retire_connection(fingerprint, connection)
         self.refresh_scopes()
+        self._persist_configuration()
         return SessionResult("ok", value=target_id)
 
     def all_connections(self) -> list[RelayLogic]:
@@ -2455,7 +2579,9 @@ class RelayManager:
         # tie this client's bookkeeping to a slot it is about to leave. Set
         # once, before any connection is created, because a connection built
         # after this point reads it from app_metadata as its own identity.
-        self.session.component_metadata("relay")["relay_paired_client_id"] = client_id
+        self.session.update_component_metadata("relay", {
+            "relay_paired_client_id": client_id,
+        })
         for descriptor in descriptors:
             accepted = self._adopt_pairing_channel(
                 descriptor, client_id, topic_uuids,
@@ -2561,16 +2687,30 @@ class RelayManager:
         )
         return failed or SessionResult("ok", value=topic_uuid)
 
-    def peer_liveness(self, peer_id: str, target_id: str | None = None) -> dict:
+    def peer_liveness(
+        self, peer_id: str, target_id: str | None = None,
+        topic_uuid: str | None = None,
+    ) -> dict:
         # The same identity may exist on an old and a current target. An
         # alive heartbeat on any connection is stronger evidence than a
         # stale heartbeat on another; never let insertion order decide.
         if target_id:
             connection = self.connection_for_target(target_id)
-            return connection.peer_liveness(peer_id) if connection else {"state": "unknown"}
+            return (
+                (
+                    connection.peer_liveness(peer_id, topic_uuid)
+                    if topic_uuid is not None
+                    else connection.peer_liveness(peer_id)
+                )
+                if connection else {"state": "unknown"}
+            )
         known = []
         for conn in self.all_connections():
-            result = conn.peer_liveness(peer_id)
+            result = (
+                conn.peer_liveness(peer_id, topic_uuid)
+                if topic_uuid is not None
+                else conn.peer_liveness(peer_id)
+            )
             if result.get("state") != "unknown":
                 known.append(result)
         if not known:
@@ -2596,18 +2736,6 @@ class RelayManager:
         if len(conns) == 1:
             return conns[0].status_payload()
         return {"connections": [conn.status_payload() for conn in conns]}
-
-    def read_blob(self, blob_id: str, exclude: RelayLogic | None = None) -> bytes | None:
-        for connection in self.all_connections():
-            if connection is exclude:
-                continue
-            try:
-                data = connection.read_blob(blob_id)
-            except Exception:
-                continue
-            if data is not None:
-                return data
-        return None
 
     def blob_gc_report(self) -> dict:
         reports = []

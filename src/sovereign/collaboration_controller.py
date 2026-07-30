@@ -44,6 +44,15 @@ def build_routes(runtime) -> list[Route]:
             runtime.notify_change("channel-configuration")
         return response(result)
 
+    async def api_stop_channel(request: Request):
+        values = await request.json()
+        result = await asyncio.to_thread(
+            service.stop_channel, values.get("channel_ref", ""),
+        )
+        if result.ok:
+            runtime.notify_change("channel-configuration")
+        return response(result)
+
     async def api_topic_sharing(request: Request):
         return response(await asyncio.to_thread(
             service.topic_sharing_payload,
@@ -128,6 +137,7 @@ def build_routes(runtime) -> list[Route]:
         ),
         Route("/api/core/channels", api_channels, methods=["GET", "POST"]),
         Route("/api/core/channels/test", api_test_channel, methods=["POST"]),
+        Route("/api/core/channels/stop", api_stop_channel, methods=["POST"]),
         Route("/api/core/channels/delete", api_delete_channel, methods=["POST"]),
         Route(
             "/api/core/topics/{topic_uuid}/sharing",

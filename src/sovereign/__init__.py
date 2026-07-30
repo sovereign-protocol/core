@@ -10,7 +10,7 @@ from .blob_store import avatar_attachment, canonical_attachments
 from .desktop import desktop_main, run_desktop
 from .channel import (
     BlobChannel, Channel, ChannelAcceptance, ChannelResult, Invitation,
-    LivenessChannel, ManagedChannel, PersistenceParticipant, PollCycleResult,
+    LivenessChannel, ManagedChannel, PollCycleResult,
     PairingChannel, PollingChannel, PollingEndpoint,
 )
 from .protocol import (
@@ -28,7 +28,7 @@ __all__ = [
     "ApplicationServices", "ApplicationSpec", "BlobChannel", "Channel",
     "ChannelAcceptance", "ChannelResult", "IncompatibleApplicationFacade",
     "Invitation", "LivenessChannel", "ManagedChannel",
-    "PairingChannel", "PersistenceParticipant", "PollCycleResult",
+    "PairingChannel", "PollCycleResult",
     "PollingChannel", "PollingEndpoint", "ProtocolNode", "ProtocolResult",
     "ProtocolState", "RelayStorage",
     "Session", "SessionEffect", "SessionResult", "UnsupportedProtocolVersion",

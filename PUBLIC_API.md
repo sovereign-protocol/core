@@ -16,7 +16,7 @@ The current exports are: `ApplicationFacade`, `ApplicationFacadeLookup`,
 `ApplicationResultView`, `ApplicationServices`, `ApplicationSpec`,
 `BlobChannel`, `Channel`, `ChannelAcceptance`, `ChannelResult`,
 `IncompatibleApplicationFacade`, `Invitation`, `LivenessChannel`,
-`ManagedChannel`, `PairingChannel`, `PersistenceParticipant`, `PollCycleResult`,
+`ManagedChannel`, `PairingChannel`, `PollCycleResult`,
 `PollingChannel`, `PollingEndpoint`, `ProtocolNode`, `ProtocolResult`,
 `ProtocolState`, `RelayStorage`, `Session`, `SessionEffect`, `SessionResult`,
 `UnsupportedProtocolVersion`, `application_json_response`,
@@ -38,6 +38,14 @@ publishes and polls on its own schedule, not on a caller's.
 `ApplicationServices` deliberately exposes no channel manager. Applications
 receive a read-only collaboration view and an effect-delivery callable; channel
 configuration, invitations and topic/channel bindings are Core-only.
+Its `snapshot_response(builder)` binds an application view to one confirmed
+Session revision. `composite_response(snapshot_builder, observer, merger)`
+extends that contract for views decorated with live transport information:
+Session state is snapshotted first, observation and detached merging happen
+after its lock is released. `mutation_response(operation, mutation_id=...,
+invalidates=...)`
+commits a retry-safe human intention; applications pass an unevaluated callback
+so mutation, persistence, and revision confirmation share one boundary.
 
 ## Attachments
 
@@ -100,7 +108,6 @@ capabilities by also satisfying:
 - `LivenessChannel`: routed peer reachability;
 - `BlobChannel`: remote blob reads through an explicit peer/topic route;
 - `PairingChannel`: sibling-client pairing and conflict resolution;
-- `PersistenceParticipant`: a context-manager lock Core enters while saving;
 - `PollingChannel`: discovery of independently scheduled `PollingEndpoint`
   objects.
 
@@ -127,4 +134,8 @@ explicit connection closure.
 normative in `SPECIFICATION_S_PROTOCOL.md`; direct mutation of internal indexes,
 peer caches, locks, or application registries is unsupported.
 Session peer/topic properties are detached snapshots. Applications store local
-state only through `application_metadata(application_id)`.
+state only through `application_metadata(application_id)`, which returns the
+live namespace and requires the caller to hold `Session.lock`. Core's response
+helpers (`mutation_response`, `snapshot_response`, `composite_response`) hold it
+already; an application calling from anywhere else opens its own transaction
+with `with session.lock:`. See `DESIGN_LOCKING_AND_COMPOSITE_READS.md`.
