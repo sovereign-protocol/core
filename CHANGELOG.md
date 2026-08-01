@@ -22,6 +22,25 @@
 
 ## Unreleased
 
+- Bound every wait an SFTP relay can impose. Paramiko's connect timeout
+  covers only the TCP handshake, so a connection that died once established
+  left each later read waiting on a socket nobody would answer — stalling
+  the poll cycle, and with it every request needing relay state, for as long
+  as the OS kept the connection open. `banner_timeout` and `auth_timeout`
+  now bound the rest of connecting, a channel timeout bounds each read, and
+  keepalives make a silent peer fail rather than be waited on. Tunable with
+  `relay_sftp_connect_timeout`, `relay_sftp_operation_timeout` and
+  `relay_sftp_keepalive_seconds`; defaulted, because the stall must not
+  depend on anybody having configured it.
+- `RelayLogic.peer_liveness()` no longer takes the relay I/O lock. It reads
+  only the heartbeat cache the poller has already filled, but sharing the
+  poller's lock meant every request reporting who is reachable queued behind
+  an SFTP round trip — so a relay whose connection had died stopped the
+  client rather than only its sync. The two cached fields now have a
+  dedicated leaf lock, which is what makes the cache's existing promise
+  ("a UI request must never wait for SFTP") actually hold.
+- Hosts can override the primary application's shared header name with
+  `header_title` in the JSON configuration.
 - Fixed optimistic Session view confirmations that refreshed application data
   without notifying subscribers to redraw when pending state changed in the
   same batch.

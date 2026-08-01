@@ -527,6 +527,22 @@ class AppServerTests(unittest.TestCase):
         self.assertEqual(runtime.address, "http://100.64.1.2:8125")
         self.assertEqual(runtime.session.address, "http://100.64.1.2:8125")
 
+    def test_configured_header_title_renames_the_primary_application(self):
+        module = _fake_application_module()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            config = {
+                "applications": [{"module": "fake_titled_logic"}],
+                "primary_application_id": "fake",
+                "header_title": "personal-cockpit - D",
+                "storage_file": str(Path(tmp) / "state.json"),
+            }
+            with patch.dict("sys.modules", {"fake_titled_logic": module}):
+                runtime = app_server.create_runtime(8128, config)
+
+        [summary] = runtime.application_summaries()
+        self.assertEqual(summary["display_name"], "personal-cockpit - D")
+
     def test_build_app_contains_core_and_app_routes(self):
         module = _fake_application_module()
 

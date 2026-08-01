@@ -150,6 +150,19 @@ class AppRuntime:
     def current_revision(self) -> int:
         return self.session.current_view_revision()
 
+    def application_summaries(self) -> list[dict]:
+        """Active applications as named by this host's shared header."""
+        summaries = self.host.application_summaries() if self.host else []
+        configured_title = self.config.get("header_title")
+        if not isinstance(configured_title, str) or not configured_title.strip():
+            return summaries
+        title = configured_title.strip()
+        return [
+            {**summary, "display_name": title}
+            if summary.get("primary") else summary
+            for summary in summaries
+        ]
+
     def deliver_effects(self, effects) -> list[Any]:
         """Execute application effects through the Core-owned channel service.
 
@@ -355,7 +368,7 @@ def build_core_routes(runtime: AppRuntime) -> list[Route]:
     async def api_core_applications(request: Request):
         return JSONResponse({
             "status": "ok",
-            "applications": runtime.host.application_summaries() if runtime.host else [],
+            "applications": runtime.application_summaries(),
         })
 
     async def api_core_revision(request: Request):
