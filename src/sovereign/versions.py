@@ -2,7 +2,7 @@
 
 # Keep these domains separate. A change in one format must not accidentally
 # force every other consumer to upgrade.
-PACKAGE_VERSION = "0.1.5"
+PACKAGE_VERSION = "0.1.6"
 
 PROTOCOL_SCHEMA_VERSION = 2
 

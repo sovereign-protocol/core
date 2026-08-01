@@ -16,7 +16,7 @@ review.
 | cffi | 2.1.0 | no | MIT-0 | https://github.com/python-cffi/cffi |
 | click | 8.4.2 | no | BSD-3-Clause | https://github.com/pallets/click |
 | colorama | 0.4.6 | no | BSD-3-Clause | https://github.com/tartley/colorama |
-| cryptography | 49.0.0 | no | Apache-2.0 OR BSD-3-Clause | https://github.com/pyca/cryptography |
+| cryptography | 50.0.0 | no | Apache-2.0 OR BSD-3-Clause | https://github.com/pyca/cryptography |
 | h11 | 0.16.0 | no | MIT | https://github.com/python-hyper/h11 |
 | idna | 3.18 | no | BSD-3-Clause | https://github.com/kjd/idna |
 | invoke | 3.0.3 | no | BSD-2-Clause | https://github.com/pyinvoke/invoke |

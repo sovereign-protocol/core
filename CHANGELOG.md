@@ -1,26 +1,6 @@
 # Changelog
 
-## 0.1.5
-
-- Enforce the lock order `relay manager -> relay I/O -> Session` at runtime,
-  including a rejection of two locks from the same layer: nothing orders one
-  relay connection's I/O lock against another's.
-- Deliver application effects only after relay and Session transactions end.
-- Separate Core component metadata ownership from Session persistence.
-- **`Session.application_metadata()` now requires the caller to hold
-  `Session.lock`.** It returns the live namespace so applications can
-  read-modify-write nested structures; an unlocked write could race
-  persistence deep-copying the same dictionary. Core's response helpers hold
-  the lock already, so only applications calling from outside a request need
-  to open their own transaction.
-- Add atomic snapshot-observe-merge responses for transport-decorated views.
-- Remove the obsolete `PersistenceParticipant` lock-sharing contract.
-- The channel poll tick now asserts that peer-update reconciliation runs
-  inside the Session transaction, replacing a lock that could never be
-  contended, and calls the runtime's persistence and effect delivery
-  directly instead of probing for them.
-
-## Unreleased
+## 0.1.6
 
 - Add a deliberately small shared UI kit for disclosures, entity badges and
   avatars, semantic buttons, and inline add composers. Applications retain
@@ -44,6 +24,32 @@
   ("a UI request must never wait for SFTP") actually hold.
 - Hosts can override the primary application's shared header name with
   `header_title` in the JSON configuration.
+- Update the reviewed dependency inventory for `cryptography` 50.0.0. The
+  licence expression is unchanged (`Apache-2.0 OR BSD-3-Clause`); paramiko
+  requires only `cryptography>=3.3`, so CI resolves the newest release.
+
+## 0.1.5
+
+- Enforce the lock order `relay manager -> relay I/O -> Session` at runtime,
+  including a rejection of two locks from the same layer: nothing orders one
+  relay connection's I/O lock against another's.
+- Deliver application effects only after relay and Session transactions end.
+- Separate Core component metadata ownership from Session persistence.
+- **`Session.application_metadata()` now requires the caller to hold
+  `Session.lock`.** It returns the live namespace so applications can
+  read-modify-write nested structures; an unlocked write could race
+  persistence deep-copying the same dictionary. Core's response helpers hold
+  the lock already, so only applications calling from outside a request need
+  to open their own transaction.
+- Add atomic snapshot-observe-merge responses for transport-decorated views.
+- Remove the obsolete `PersistenceParticipant` lock-sharing contract.
+- The channel poll tick now asserts that peer-update reconciliation runs
+  inside the Session transaction, replacing a lock that could never be
+  contended, and calls the runtime's persistence and effect delivery
+  directly instead of probing for them.
+
+## Unreleased
+
 - Fixed optimistic Session view confirmations that refreshed application data
   without notifying subscribers to redraw when pending state changed in the
   same batch.
