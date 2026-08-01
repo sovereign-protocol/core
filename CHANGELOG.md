@@ -22,6 +22,9 @@
 
 ## Unreleased
 
+- Add a deliberately small shared UI kit for disclosures, entity badges and
+  avatars, semantic buttons, and inline add composers. Applications retain
+  their own workflows while reusing the same visual and interaction rules.
 - Bound every wait an SFTP relay can impose. Paramiko's connect timeout
   covers only the TCP handshake, so a connection that died once established
   left each later read waiting on a socket nobody would answer — stalling

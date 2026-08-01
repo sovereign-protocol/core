@@ -72,6 +72,18 @@ class PackageLayoutTests(unittest.TestCase):
         self.assertNotIn("shellCreateTopicBtn", SHARED_JS)
         self.assertIn('app.role === "aggregator"', SHARED_JS)
 
+    def test_shared_ui_kit_exposes_only_reusable_primitives(self):
+        for primitive in ("avatar", "entityBadge", "disclosure", "addComposer"):
+            self.assertIn(f"  {primitive}(", SHARED_JS)
+
+    def test_entity_badges_share_one_outer_height(self):
+        shared_css = files("sovereign.assets").joinpath("shared.css").read_text(
+            encoding="utf-8",
+        )
+        self.assertIn(".ui-entity-badge {", shared_css)
+        self.assertIn("box-sizing: border-box", shared_css)
+        self.assertIn("min-height: 32px", shared_css)
+
     def test_open_collaboration_pane_refreshes_with_polled_topic_state(self):
         refresh = SHARED_JS.split("refresh() {", 1)[1].split("},", 1)[0]
         self.assertIn("this.refreshCollaborationPane()", refresh)

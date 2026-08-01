@@ -34,6 +34,166 @@ button.danger {
   color: #ffffff;
 }
 
+/* Small, semantic controls shared by applications. Workflows remain
+   application-owned; these classes only make the same action look and react
+   the same wherever it appears. */
+.ui-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 32px;
+  border: 1px solid var(--line, var(--shell-border, rgba(127, 127, 127, 0.35)));
+  background: transparent;
+  color: inherit;
+}
+.ui-button:hover,
+.ui-button:focus-visible {
+  border-color: var(--teal);
+  background: var(--teal-soft);
+}
+.ui-button-primary {
+  border-color: var(--teal);
+  background: var(--teal);
+  color: #fff;
+}
+.ui-button-primary:hover,
+.ui-button-primary:focus-visible { background: #0b6855; }
+.ui-button-danger { color: var(--danger); }
+.ui-button-danger:hover,
+.ui-button-danger:focus-visible {
+  border-color: var(--danger);
+  background: rgba(143, 37, 37, 0.14);
+}
+.ui-button-small {
+  min-height: 28px;
+  padding: 3px 8px;
+  font-size: 12px;
+}
+.ui-button:disabled { cursor: default; opacity: 0.55; }
+
+/* Disclosure sections deliberately standardise only the header. The content
+   beneath it remains entirely application-specific. */
+.ui-disclosure {
+  border-top: 1px solid var(--line, var(--shell-border, rgba(127, 127, 127, 0.3)));
+}
+.ui-disclosure:first-child { border-top: 0; }
+.ui-disclosure-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  width: auto;
+  min-height: 30px;
+  margin: 0;
+  padding: 4px 2px;
+  border: 0;
+  background: transparent;
+  color: var(--text-muted, var(--shell-muted, currentColor));
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-align: left;
+}
+.ui-disclosure-toggle:hover,
+.ui-disclosure-toggle:focus-visible { color: var(--text, var(--shell-text, currentColor)); }
+.ui-disclosure-chevron {
+  display: inline-block;
+  font-size: 14px;
+  line-height: 1;
+  transition: transform 0.12s ease;
+}
+.ui-disclosure[data-expanded="true"] .ui-disclosure-chevron {
+  transform: rotate(90deg);
+}
+.ui-disclosure-content[hidden] { display: none; }
+
+/* Entity primitives. Kind supplies identity; status is a separate outline so
+   an accepted person does not stop looking like the same person when pending. */
+.ui-avatar {
+  position: relative;
+  display: inline-grid;
+  place-items: center;
+  width: 26px;
+  height: 26px;
+  overflow: hidden;
+  flex: 0 0 auto;
+  border: 1px solid rgba(96, 165, 250, 0.45);
+  border-radius: 50%;
+  background: #073b71;
+  color: #bfdbfe;
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.ui-avatar img { width: 100%; height: 100%; object-fit: cover; }
+.ui-avatar[data-owner="true"] { box-shadow: 0 0 0 2px #f59e0b; }
+.ui-avatar[data-self="true"] { border-color: var(--teal); }
+.ui-entity-badge {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  box-sizing: border-box;
+  min-height: 32px;
+  padding: 2px 8px;
+  border: 1px solid var(--line, var(--shell-border, rgba(127, 127, 127, 0.35)));
+  border-radius: 999px;
+  background: rgba(127, 127, 127, 0.08);
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+}
+.ui-entity-badge[data-entity-kind="person"] { padding-left: 2px; }
+.ui-entity-badge[data-entity-kind="agreement"] {
+  background: rgba(59, 130, 246, 0.1);
+}
+.ui-entity-badge[data-entity-kind="role"] {
+  background: rgba(168, 85, 247, 0.1);
+}
+.ui-entity-badge[data-status="accepted"] { border-color: rgba(34, 197, 94, 0.6); }
+.ui-entity-badge[data-status="pending"],
+.ui-entity-badge[data-status="requested"] { border-style: dashed; }
+.ui-entity-badge[data-status="refused"],
+.ui-entity-badge[data-status="revoked"],
+.ui-entity-badge[data-status="expired"],
+.ui-entity-badge[data-status="outdated"] { opacity: 0.68; }
+.ui-entity-badge.is-compact {
+  min-width: 26px;
+  min-height: 26px;
+  padding: 0;
+  border: 0;
+  background: transparent;
+}
+.ui-entity-icon {
+  display: inline-grid;
+  place-items: center;
+  width: 18px;
+  height: 18px;
+  color: var(--text-muted, var(--shell-muted, currentColor));
+  font-size: 14px;
+}
+.ui-entity-badge-actions,
+.ui-entity-action { opacity: 0; transition: opacity 0.12s ease; }
+.ui-entity-badge:hover .ui-entity-badge-actions,
+.ui-entity-badge:focus-within .ui-entity-badge-actions,
+.ui-entity-badge:hover > .ui-entity-action,
+.ui-entity-badge:focus-visible > .ui-entity-action { opacity: 1; }
+
+/* One reusable add flow: a quiet trigger, then a properly spaced inline form.
+   Apps choose where the control lives and what creation means. */
+.ui-add-control { margin: 6px 0; }
+.ui-inline-composer {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.ui-inline-composer input {
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.ui-inline-composer[hidden] { display: none; }
+
 .icon-btn {
   display: inline-flex;
   align-items: center;

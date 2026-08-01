@@ -79,6 +79,161 @@ function iconButton(svgInner, label, action) {
   return button;
 }
 
+// Reusable visual primitives. They deliberately stop short of prescribing an
+// application's workflow: Core supplies the same disclosure, entity and add
+// controls; each application decides where and when to use them.
+let uiDisclosureSequence = 0;
+const SovereignUI = Object.freeze({
+  avatar(person = {}, options = {}) {
+    const avatar = document.createElement("span");
+    avatar.className = `ui-avatar ${options.className || ""}`.trim();
+    avatar.dataset.owner = String(Boolean(options.owner));
+    avatar.dataset.self = String(Boolean(options.self));
+    const name = String(person.name || options.name || "?").trim() || "?";
+    const picture = person.picture || options.picture || "";
+    if (picture) {
+      const image = document.createElement("img");
+      image.src = picture;
+      image.alt = "";
+      avatar.append(image);
+    } else {
+      avatar.textContent = name.slice(0, 2).toUpperCase();
+    }
+    avatar.title = options.title || name;
+    return avatar;
+  },
+
+  entityBadge(options = {}) {
+    const interactive = Boolean(options.interactive);
+    const badge = document.createElement(interactive ? "button" : "span");
+    if (interactive) badge.type = "button";
+    const kind = options.kind || "role";
+    badge.className = [
+      "ui-entity-badge",
+      options.compact ? "is-compact" : "",
+      options.className || "",
+    ].filter(Boolean).join(" ");
+    badge.dataset.entityKind = kind;
+    if (options.status) badge.dataset.status = options.status;
+    if (kind === "person") {
+      badge.append(this.avatar(options.person || {}, {
+        owner: options.owner,
+        self: options.self,
+        title: options.title,
+      }));
+    } else {
+      const icon = document.createElement("span");
+      icon.className = "ui-entity-icon";
+      icon.setAttribute("aria-hidden", "true");
+      icon.textContent = options.icon || (kind === "agreement" ? "▤" : "◇");
+      badge.append(icon);
+    }
+    if (!options.compact && options.label) {
+      const label = document.createElement("span");
+      label.className = "ui-entity-label";
+      label.textContent = options.label;
+      badge.append(label);
+    }
+    if (options.title) badge.title = options.title;
+    if (interactive && options.onClick) badge.onclick = options.onClick;
+    return badge;
+  },
+
+  disclosure(title, options = {}) {
+    const section = document.createElement(options.tag || "section");
+    section.className = `ui-disclosure ${options.className || ""}`.trim();
+    const toggle = document.createElement("button");
+    toggle.type = "button";
+    toggle.className = "ui-disclosure-toggle";
+    const label = document.createElement("span");
+    label.textContent = title;
+    const chevron = document.createElement("span");
+    chevron.className = "ui-disclosure-chevron";
+    chevron.textContent = ">";
+    chevron.setAttribute("aria-hidden", "true");
+    const content = document.createElement("div");
+    content.className = "ui-disclosure-content";
+    const contentId = `ui-disclosure-${++uiDisclosureSequence}`;
+    content.id = contentId;
+    toggle.setAttribute("aria-controls", contentId);
+    toggle.append(label, chevron);
+    section.append(toggle, content);
+
+    const setExpanded = (expanded, notify = false) => {
+      const open = Boolean(expanded);
+      section.dataset.expanded = String(open);
+      toggle.setAttribute("aria-expanded", String(open));
+      content.hidden = !open;
+      if (notify && options.onToggle) options.onToggle(open);
+    };
+    toggle.onclick = () => setExpanded(section.dataset.expanded !== "true", true);
+    setExpanded(Boolean(options.expanded));
+    return {section, toggle, content, setExpanded};
+  },
+
+  addComposer(options = {}) {
+    const noun = String(options.noun || "item").trim();
+    const control = document.createElement("div");
+    control.className = `ui-add-control ${options.className || ""}`.trim();
+    const trigger = document.createElement("button");
+    trigger.type = "button";
+    trigger.className = "ui-button ui-button-small ui-add-trigger";
+    trigger.textContent = options.triggerLabel || `+ Add ${noun}`;
+    const form = document.createElement("form");
+    form.className = "ui-inline-composer";
+    form.hidden = true;
+    const input = document.createElement("input");
+    input.placeholder = options.placeholder || `${noun[0]?.toUpperCase() || ""}${noun.slice(1)}`;
+    input.setAttribute("aria-label", options.inputLabel || input.placeholder);
+    const submit = document.createElement("button");
+    submit.type = "submit";
+    submit.className = "ui-button ui-button-primary ui-button-small";
+    submit.textContent = options.submitLabel || "Add";
+    const cancel = document.createElement("button");
+    cancel.type = "button";
+    cancel.className = "ui-button ui-button-small";
+    cancel.textContent = "Cancel";
+    form.append(input, submit, cancel);
+    control.append(trigger, form);
+
+    const close = () => {
+      form.hidden = true;
+      trigger.hidden = false;
+      input.value = "";
+    };
+    const open = () => {
+      trigger.hidden = true;
+      form.hidden = false;
+      input.focus();
+    };
+    trigger.onclick = open;
+    cancel.onclick = close;
+    input.onkeydown = (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        close();
+      }
+    };
+    form.onsubmit = async (event) => {
+      event.preventDefault();
+      const value = input.value.trim();
+      if (!value || !options.onSubmit) return;
+      submit.disabled = true;
+      cancel.disabled = true;
+      try {
+        await options.onSubmit(value);
+        close();
+      } catch (error) {
+        if (options.onError) options.onError(error);
+      } finally {
+        submit.disabled = false;
+        cancel.disabled = false;
+      }
+    };
+    return control;
+  },
+});
+
 let toastTimer = null;
 function showToast(message, isError = false) {
   const toast = document.getElementById("toast");
@@ -1495,7 +1650,7 @@ Object.assign(SovereignShell, {
       '<p class="shell-note">Channels belong to this session and are available to every topic.</p>',
       '<p id="shellIdentityHomeNote" class="shell-note"></p>',
       '<div id="shellManagedChannelList" class="shell-target-list"></div>',
-      '<button type="button" id="shellAddChannelBtn">+ Add channel</button>',
+      '<button type="button" id="shellAddChannelBtn" class="ui-button">+ Add channel</button>',
       '<fieldset id="shellChannelForm" class="shell-target-form" hidden>',
       '<legend>Add channel</legend>',
       '<label for="shellChannelType">Channel type</label>',
