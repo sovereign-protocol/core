@@ -247,17 +247,35 @@ function showToast(message, isError = false) {
 }
 
 function confirmAction(title, message, action) {
+  const modal = document.getElementById("confirmModal");
+  if (!modal) {
+    // Loud, and naming what is missing. A page that asks to confirm and has
+    // nowhere to do it is a mistake in that page, not something to paper over
+    // by running the action unconfirmed.
+    throw new Error(
+      "confirmAction() needs the shared confirm-modal markup on this page",
+    );
+  }
   document.getElementById("confirmModalTitle").textContent = title;
   document.getElementById("confirmModalMessage").textContent = message;
-  const modal = document.getElementById("confirmModal");
   document.getElementById("confirmModalConfirmBtn").onclick = async () => {
     modal.close();
     await action();
   };
   modal.showModal();
 }
-document.getElementById("confirmModalCancelBtn").onclick = () =>
-  document.getElementById("confirmModal").close();
+
+// Carrying the confirm modal is an application's choice - S-Flow uses no
+// confirmations and has none. Binding this unconditionally at load time made
+// that an unwritten requirement: the assignment threw on a page without the
+// element, so the rest of this file never ran, `SovereignShell` was never
+// defined, and every application page missing the markup failed to render
+// with nothing in the console to say why.
+const sharedConfirmCancelBtn = document.getElementById("confirmModalCancelBtn");
+if (sharedConfirmCancelBtn) {
+  sharedConfirmCancelBtn.onclick = () =>
+    document.getElementById("confirmModal").close();
+}
 
 // Plain "+"/"-" read as barely-visible specks at badge size - wider, bolder
 // Unicode variants keep the same at-a-glance meaning but are legible.
@@ -1273,7 +1291,7 @@ Object.assign(SovereignShell, {
                 },
               }];
             }
-            const topics = change.applicationId === "agreement"
+            const topics = change.applicationId === "team"
               ? (draft.agreements || []) : (draft.boards || []);
             const tile = topics.find((entry) => entry.uuid === change.topic);
             if (tile) tile.agenda_count = Number(tile.agenda_count || 0) + 1;

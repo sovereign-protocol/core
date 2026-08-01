@@ -76,6 +76,23 @@ class PackageLayoutTests(unittest.TestCase):
         for primitive in ("avatar", "entityBadge", "disclosure", "addComposer"):
             self.assertIn(f"  {primitive}(", SHARED_JS)
 
+    def test_shared_js_requires_no_dom_element_at_load(self):
+        """Core must not make an element an unwritten requirement of using it.
+
+        `document.getElementById("confirmModalCancelBtn").onclick = ...` ran at
+        the top level, so an application page without that markup threw partway
+        through this file: `SovereignUI` was defined, `SovereignShell` was not,
+        and the page rendered nothing with an empty console. S-Flow had no
+        confirm modal and had therefore never displayed a process. Anything
+        Core touches at load time has to tolerate its absence.
+        """
+        offenders = [
+            (number, line)
+            for number, line in enumerate(SHARED_JS.splitlines(), start=1)
+            if line.startswith(("document.", "window.document."))
+        ]
+        self.assertEqual(offenders, [])
+
     def test_entity_badges_share_one_outer_height(self):
         shared_css = files("sovereign.assets").joinpath("shared.css").read_text(
             encoding="utf-8",
