@@ -8,7 +8,7 @@
   project's users means port forwarding or a VPN, and it was the one
   channel that could not have a home for a topic.
 - Stabilize application registration, perspectives, reactions, and blobs.
-- Exercise the public API with S-Kanban and S-Agreement, and keep the minimal
+- Exercise the public API with S-Initiative and S-Team, and keep the minimal
   notes example in `examples/notes` installed by CI so Core always proves its
   contract against a real application rather than only test stubs.
 
@@ -17,5 +17,5 @@
 - Verify Linux and macOS.
 - Add WebDAV after the mailbox storage contract is public and stable.
 - Consider 1.0 only after at least two product applications exercise Core.
-  S-Agreement became the second on 2026-07-26, when it left this repository
+  S-Team became the second on 2026-07-26, when it left this repository
   for its own.

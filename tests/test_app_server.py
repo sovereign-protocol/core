@@ -42,7 +42,7 @@ def _fake_application_module(
             # claimed its root type, so anything exercising invitations needs
             # a registered owner. Core ships no such application of its own -
             # the Protocol Explorer registers nothing - so the stub stands in
-            # for one rather than the suite depending on S-Kanban.
+            # for one rather than the suite depending on S-Initiative.
             registration = ApplicationRegistration(
                 application_id=application_id,
                 root_types=frozenset({topic_root_type}),
@@ -159,7 +159,7 @@ class AppServerTests(unittest.TestCase):
 
     def test_caller_supplied_alias_extends_the_built_in_table(self):
         # Applications reach the host by passing their own alias table, which
-        # is how S-Kanban and Personal Cockpit are launched. Core must merge
+        # is how S-Initiative and S-Cockpit are launched. Core must merge
         # it over the built-ins rather than ignoring or replacing them.
         aliases = {"demo": {
             "app_module": "demo_app.application",
@@ -534,14 +534,14 @@ class AppServerTests(unittest.TestCase):
             config = {
                 "applications": [{"module": "fake_titled_logic"}],
                 "primary_application_id": "fake",
-                "header_title": "personal-cockpit - D",
+                "header_title": "s-cockpit - D",
                 "storage_file": str(Path(tmp) / "state.json"),
             }
             with patch.dict("sys.modules", {"fake_titled_logic": module}):
                 runtime = app_server.create_runtime(8128, config)
 
         [summary] = runtime.application_summaries()
-        self.assertEqual(summary["display_name"], "personal-cockpit - D")
+        self.assertEqual(summary["display_name"], "s-cockpit - D")
 
     def test_build_app_contains_core_and_app_routes(self):
         module = _fake_application_module()

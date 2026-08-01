@@ -5,7 +5,7 @@ written against the same understanding as the code under test. This runs a
 genuine installed distribution through the host instead: manifest discovery,
 topic registration, routing, effect delivery, invitation composition.
 
-S-Agreement used to serve this purpose from inside Core's repository. It
+S-Team used to serve this purpose from inside Core's repository. It
 became a product and moved out, so the minimal notes example took over. If
 this file is ever deleted, Core stops proving that anything other than a
 mock can implement its contract.

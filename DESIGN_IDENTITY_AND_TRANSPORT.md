@@ -324,7 +324,7 @@ work — captured here as the agreed target.
 
 | Item | Status | What | Why |
 |---|---|---|---|
-| `join_discussion` type-sniffing (`_is_kanban_board_topic`/`_is_shared_user_topic`) | **current** | Classifies fetched topics by `data.type`, rejects anything else, only grafts board topics | Exists because identity currently travels through the *same* generic `topic_uuids` fetch pipeline as board content — the app layer has to sort them out itself. |
+| `join_discussion` type-sniffing (`_is_initiative_board_topic`/`_is_shared_user_topic`) | **current** | Classifies fetched topics by `data.type`, rejects anything else, only grafts board topics | Exists because identity currently travels through the *same* generic `topic_uuids` fetch pipeline as board content — the app layer has to sort them out itself. |
 | Dedicated identity-data sync path | **[PROPOSED]** | New method (e.g. `sync_identity_data()`), called from the existing update loop, that unconditionally takes the newest identity data per known peer — no divergence classification, no adopt-tools UI, ever | Implements the "always publish own, always adopt peer's, no judgement" policy agreed in §1.2, distinctly from board's selective per-node auto-adopt. |
 | `join_discussion` type-sniffing | **Stays as-is, decided** | No wire-format merge of identity_key and identity data — kanban_logic keeps sorting board topics from identity-data topics itself | Identity data is app-defined content; the protocol layer has no business knowing its shape, so this sorting genuinely belongs at the app layer, not something to push down into transport. Not a gap to close — a deliberate boundary. |
 

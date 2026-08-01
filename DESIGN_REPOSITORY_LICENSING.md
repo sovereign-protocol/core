@@ -41,24 +41,24 @@ Contains:
 
 License: `LGPL-3.0-or-later`.
 
-### `sovereign-protocol/s-kanban`
+### `sovereign-protocol/s-initiative`
 
 Purpose: reference product built on Sovereign Core.
 
 Contains:
 
-- S-Kanban application logic and policy.
+- S-Initiative application logic and policy.
 - Controllers and frontend assets.
 - Application configuration and executable packaging.
 - Kanban-specific documentation and tests.
 
 License: `Apache-2.0`.
 
-### `sovereign-protocol/personal-cockpit`
+### `sovereign-protocol/s-cockpit`
 
 Purpose: standalone cross-application aggregation app.
 
-Contains Personal Cockpit logic, controllers, assets, and optional adapters over
+Contains S-Cockpit logic, controllers, assets, and optional adapters over
 versioned public application facades. It must start coherently when any source
 application is absent or inactive.
 
@@ -66,7 +66,7 @@ License: `Apache-2.0`.
 
 ### Later repositories
 
-- `sovereign-protocol/s-agreement` — create only when the conformance skeleton becomes a
+- `sovereign-protocol/s-team` — create only when the conformance skeleton becomes a
   real product. **Condition met 2026-07-26; the repository exists.** It was
   relicensed from `LGPL-3.0-or-later` to `Apache-2.0` on the way out: it had
   carried Core's licence only because it lived inside Core's repository,
@@ -74,7 +74,7 @@ License: `Apache-2.0`.
   an application takes the application licence. Sole copyright holder, so no
   contributor consent was required. Core keeps a minimal, non-product example
   at `examples/notes` so its own CI still exercises the application contract
-  against something real — the role S-Agreement used to fill.
+  against something real — the role S-Team used to fill.
 - A reusable profile or UI package — only after ownership decisions in the
   architecture design.
 
@@ -175,7 +175,7 @@ Perform this only after architecture phase R7 passes.
 6. Add repository-specific `LICENSE`, `NOTICE`, `README`, and `pyproject.toml`.
 7. Remove files irrelevant to each repository rather than leaving mixed-license
    copies.
-8. Configure S-Kanban to depend on a released or editable Sovereign Core package.
+8. Configure S-Initiative to depend on a released or editable Sovereign Core package.
 9. Run a cross-repository clean-install test.
 10. Review generated source distributions/wheels to ensure license files are
     included.
@@ -189,9 +189,9 @@ security incident requires it.
 ### Accepted initial versions
 
 - Sovereign Core begins at `0.1.0`.
-- S-Kanban uses tag/display version `v0.1.0-alpha.1` and Python package version
+- S-Initiative uses tag/display version `v0.1.0-alpha.1` and Python package version
   `0.1.0a1`.
-- S-Kanban declares an explicit compatible Core range.
+- S-Initiative declares an explicit compatible Core range.
 
 ### Version domains
 
@@ -278,9 +278,9 @@ owned and merged solely by the founder.
 
 **ACCEPTED G2, subject to availability/trademark checks:**
 
-- Repositories: `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`.
+- Repositories: `core`, `s-initiative`, `s-cockpit`, later `s-team`.
 - Core distribution: `sovereign-protocol`; Python import namespace: `sovereign`.
-- Application distribution/executable: `s-kanban`; product name: `S-Kanban`.
+- Application distribution/executable: `s-initiative`; product name: `S-Initiative`.
 
 Check repository, package, domain, and trademark availability before creation;
 only availability conflicts reopen the naming decision.
@@ -291,8 +291,8 @@ an unrelated, actively maintained project, so it became `sovereign-protocol`,
 which is free and matches the organisation. Every application's dependency
 declaration moved with it - had they shipped naming `sovereign-core`,
 installing an application would have resolved the requirement against a
-stranger's package and failed. Verified free at the same time: `s-kanban`,
-`personal-cockpit`, `s-agreement`.
+stranger's package and failed. Verified free at the same time: `s-initiative`,
+`s-cockpit`, `s-team`.
 
 The import namespace `sovereign` is also taken on PyPI, by an Envoy control
 plane, but distribution and import names are independent so nothing is
@@ -302,7 +302,7 @@ own a top-level `sovereign` module. Kept for `0.x` under P4 and recorded in
 
 ## 11.1 Source and executable release order
 
-**ACCEPTED G4:** publish the Core source distribution/wheel and S-Kanban source
+**ACCEPTED G4:** publish the Core source distribution/wheel and S-Initiative source
 alpha first. Add the Windows executable afterward, once a focused review confirms
 LGPL notices, exact Core source availability, and library replacement/recombination
 requirements.
@@ -328,7 +328,7 @@ untouched by this amendment: building the executable for personal use is not
 distribution and never required it, which is why G4 sequences source and
 wheels first.
 
-`S-Kanban.spec` may be committed and exercised for reproducible build testing.
+`S-Initiative.spec` may be committed and exercised for reproducible build testing.
 That technical verification is not a release artifact and does not open the
 executable-distribution gate above; the focused LGPL review remains mandatory.
 
@@ -363,7 +363,7 @@ statement.
 - [x] L4: documentation/specification `CC-BY-4.0`; code/fixtures retain software
       license.
 - [x] G1: Sovereign Protocol GitHub organization; founder sole initial owner.
-- [x] G2: `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; names
+- [x] G2: `core`, `s-initiative`, `s-cockpit`, later `s-team`; names
       remain subject to availability/trademark checks.
 - [x] G3: Core `0.1.0`; Kanban `v0.1.0-alpha.1` / `0.1.0a1`.
 - [x] G4: source/wheel first; executable after LGPL packaging review.

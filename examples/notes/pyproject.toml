@@ -7,7 +7,7 @@ name = "sovereign-example-notes"
 version = "0.1.0"
 description = "Smallest complete Sovereign Core application, used by Core's own tests"
 requires-python = ">=3.10"
-# An example carries the repository licence, per NOTICE. Unlike S-Agreement,
+# An example carries the repository licence, per NOTICE. Unlike S-Team,
 # which left to become a product under Apache-2.0, this is not a product and
 # is not published: it exists so Core's suite always has a real application.
 license = "LGPL-3.0-or-later"

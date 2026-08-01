@@ -29,7 +29,7 @@ class ProtocolBoundaryTests(unittest.TestCase):
     def test_app_logic_does_not_mutate_protocol_directly(self):
         root = Path(__file__).resolve().parents[1]
         # Only what this repository ships. The candidate list used to name
-        # S-Kanban and S-Agreement at monorepo paths that no longer exist, so
+        # S-Initiative and S-Team at monorepo paths that no longer exist, so
         # it silently fell through to whichever file happened to be present.
         app_files = [
             *sorted(root.glob("examples/*/src/*/logic.py")),

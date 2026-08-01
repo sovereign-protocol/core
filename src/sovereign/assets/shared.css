@@ -323,7 +323,7 @@ dialog menu .danger:not(:last-child) {
    The shell styles itself completely rather than inheriting each page's
    palette. Inheriting looked tidy but guaranteed divergence: the same relay
    dialog rendered three different ways, because Kanban styles `input`,
-   Personal Cockpit styles `dialog input`, and a minimal application styles
+   S-Cockpit styles `dialog input`, and a minimal application styles
    neither and falls through to browser defaults. Core owns this
    functionality, so Core owns its appearance.
 

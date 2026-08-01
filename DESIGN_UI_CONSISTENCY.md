@@ -52,7 +52,7 @@ document, the overview.
 Rationale: the shell was first written colour-neutral so each page could set
 the surrounding palette. That guaranteed divergence. The same relay-target
 dialog rendered three different ways, because Kanban styles `input`, Personal
-Cockpit styles `dialog input`, and S-Agreement styles neither and fell through
+Cockpit styles `dialog input`, and S-Team styles neither and fell through
 to browser defaults. Core owns the functionality, so Core owns the appearance;
 otherwise every application must re-style Core's markup, and a minimal one
 never will.
@@ -99,7 +99,7 @@ Notes from implementing it:
 
 ## U4 — one theme for 0.1
 
-**ACCEPTED: dark everywhere.** Personal Cockpit's dark half was applied
+**ACCEPTED: dark everywhere.** S-Cockpit's dark half was applied
 unconditionally, and all three applications now declare `color-scheme: dark`
 so native controls, scrollbars, and form widgets match instead of rendering
 light on a dark surface.
@@ -112,7 +112,7 @@ follows it, including Core's chrome.
 
 Cost of the alternative, for when this is revisited: four palettes, of which
 one existed. Kanban carries about ten tokens in `:root`, the shell seven, and
-S-Agreement is mostly literal hex and would need tokenizing first.
+S-Team is mostly literal hex and would need tokenizing first.
 
 Light mode returns as a themed pass across Core and all three applications,
 with the open question of whether the machine chooses (`prefers-color-scheme`)
@@ -120,13 +120,13 @@ or the person does - a toggle stored in the Core profile would follow the user
 across every application, since the profile is already Core.
 
 **Amendment, 2026-07-26:** U4 originally kept one deliberate exception -
-S-Agreement's document surface stayed light (`#f9fafb`), reasoned as paper
+S-Team's document surface stayed light (`#f9fafb`), reasoned as paper
 inside a dark frame. Using the desktop build surfaced that the exception
 reads as a bug, not a design: a black-on-white panel inside an otherwise
 dark window looks like the one thing that failed to theme, not like a
 considered choice. "Dark everywhere" now means everywhere, including the
 document itself - the panel moved to `#262319`, one step lighter than the
-page, the relationship S-Kanban already uses for `--surface` over `--bg`.
+page, the relationship S-Initiative already uses for `--surface` over `--bg`.
 No exception survives pending the theme toggle above.
 
 ## Current palettes
@@ -134,11 +134,11 @@ No exception survives pending the theme toggle above.
 | Surface | Colour | Note |
 |---|---|---|
 | Shell chrome | `#161b22` on `#0d1117` | Core's, identical everywhere (U1) |
-| S-Kanban | `#171818` warm gray | |
-| Personal Cockpit | `#0d1117` blue-gray | |
-| S-Agreement | `#1c1a17` warm ink | document panel `#262319`, one step lighter (2026-07-26) |
+| S-Initiative | `#171818` warm gray | |
+| S-Cockpit | `#0d1117` blue-gray | |
+| S-Team | `#1c1a17` warm ink | document panel `#262319`, one step lighter (2026-07-26) |
 
-S-Agreement was `#111827` until U2, almost exactly the Cockpit's `#0d1117`, so
+S-Team was `#111827` until U2, almost exactly the Cockpit's `#0d1117`, so
 two of the three applications looked alike. The warm neutral separates it and
 avoids every reserved colour.
 

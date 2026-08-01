@@ -277,8 +277,8 @@
   handler directly. It was instant, and it exercised a route no user takes:
   direct HTTP needs a routable address between peers, which for this
   project's users means port forwarding or a VPN. The fixture it replaces
-  (`s-kanban/tests/relay_clients.py`, and smaller equivalents in Core and
-  S-Agreement) gives each client its own relay target on one shared folder
+  (`s-initiative/tests/relay_clients.py`, and smaller equivalents in Core and
+  S-Team) gives each client its own relay target on one shared folder
   and makes the test say when a cycle happens. This is the prerequisite for
   retiring the direct channel - see `DESIGN_TOPIC_HOME_CHANNELS.md` section
   3. Three tests changed what they assert, because "no implicit HTTP mesh"

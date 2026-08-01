@@ -2,7 +2,7 @@
 
 These are source scans rather than integration tests, so each one runs in
 the repository that owns the source it guards and fails in the pull request
-that breaks it. The equivalents for S-Kanban and Personal Cockpit live in
+that breaks it. The equivalents for S-Initiative and S-Cockpit live in
 those repositories.
 """
 
@@ -17,7 +17,7 @@ from sovereign.session import Session
 ROOT = Path(__file__).resolve().parents[1]
 CORE = ROOT / "src" / "sovereign"
 EXAMPLES = ROOT / "examples"
-APPLICATION_PACKAGES = ("personal_cockpit", "s_agreement", "s_kanban")
+APPLICATION_PACKAGES = ("s_cockpit", "s_team", "s_initiative")
 EXAMPLE_PACKAGE = "sovereign_example_notes"
 
 
@@ -63,7 +63,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
 
     def test_core_tests_run_without_any_application_installed(self):
         # The source rule above was already enforced; the tests were not. One
-        # of them imported S-Kanban, which passed in the pre-split repository
+        # of them imported S-Initiative, which passed in the pre-split repository
         # where every package was installed and failed for anyone who
         # installed Core alone - exactly the dependency direction Core
         # forbids. Everything under tests/ ships with Core, so everything
@@ -78,7 +78,7 @@ class ArchitectureBoundaryTests(unittest.TestCase):
                 for package in APPLICATION_PACKAGES
                 if name == package or name.startswith(f"{package}.")
             )
-            # There used to be an exemption here for S-Agreement, which
+            # There used to be an exemption here for S-Team, which
             # shipped inside Core. It became a product and moved to its own
             # repository, so no application is importable from Core's tests
             # any more and the special case is gone.
@@ -108,8 +108,8 @@ class ArchitectureBoundaryTests(unittest.TestCase):
     def test_relay_storage_does_not_depend_on_session_channels_or_apps(self):
         imports = imported_modules(CORE / "relay_storage.py")
         forbidden = {
-            "application", "channel", "host", "session", "s_kanban",
-            "personal_cockpit",
+            "application", "channel", "host", "session", "s_initiative",
+            "s_cockpit",
         }
         self.assertTrue(imports.isdisjoint(forbidden))
 

@@ -25,7 +25,7 @@ from sovereign.topic_registry import ApplicationRegistration
 def register_notes_app(session: Session) -> list[ProtocolNode]:
     """A stand-in application, listing its topics the way a real one does.
 
-    Real applications enumerate their own tree - S-Kanban's `boards()` walks
+    Real applications enumerate their own tree - S-Initiative's `boards()` walks
     its container - so a topic that arrives by sync is listed without anyone
     registering it. A stub that only returns what it was handed hides that,
     and a grafted topic then silently never publishes.

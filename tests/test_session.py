@@ -598,7 +598,7 @@ class SessionTests(unittest.TestCase):
         self.assertIn("relay:B", session.peer_topic_sets)
 
     def test_identity_is_lazily_created_and_stable(self):
-        # No KanbanLogic/app involved at all - identity is a Session-owned
+        # No InitiativeLogic/app involved at all - identity is a Session-owned
         # meta-topic, so any app (or none) gets it for free.
         session = Session("si-a")
 

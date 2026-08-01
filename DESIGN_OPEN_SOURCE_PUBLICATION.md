@@ -9,7 +9,7 @@ first public release is framed, and how external collaboration is governed.
 
 ## 1. Publication principle
 
-Publish early enough that S-Agreement and later features can be developed in
+Publish early enough that S-Team and later features can be developed in
 public, but only after the repository/license boundary is real.
 
 The publication blocker is not product polish. It is avoiding:
@@ -42,7 +42,7 @@ Non-promises:
 - Automatic failover.
 - Security against an untrusted local process or malicious invited peer.
 
-### S-Kanban alpha
+### S-Initiative alpha
 
 Promises:
 
@@ -81,7 +81,7 @@ Do not claim:
 
 Suggested positioning:
 
-> S-Kanban is a local-first Kanban application that collaborates without a
+> S-Initiative is a local-first Kanban application that collaborates without a
 > central application server. It is the first reference application for
 > Sovereign Core, where every participant keeps an explicit local perspective
 > and decides how differences converge.
@@ -98,10 +98,10 @@ public announcement. P2 may follow publicly.
 - [x] Architecture R0–R7 and the R8 repository-split rehearsal completed.
       Rehearsal reproduced on a clean machine 2026-07-19; evidence under
       "R8 — Evidence" in `DESIGN_PUBLIC_ARCHITECTURE_REFACTOR.md` §14.
-- [x] Core, S-Kanban, and Personal Cockpit repositories pass clean-install and
+- [x] Core, S-Initiative, and S-Cockpit repositories pass clean-install and
       cross-repository integration tests. Automated by
       `verify_repository_split.py` across four distributions — Core,
-      `examples/s-agreement` inside Core, S-Kanban, Personal Cockpit — against
+      `examples/s-team` inside Core, S-Initiative, S-Cockpit — against
       both pinned wheels and editable installs.
 - [ ] Core contains no application imports, names, or node-type assumptions.
 - [ ] Licenses and inbound contribution policy approved.
@@ -205,7 +205,7 @@ Recommended public pattern:
 
 ```text
 config/
-    kanban.example.json
+    initiative.example.json
     relay-local.example.json
     relay-sftp.example.json
 
@@ -399,7 +399,7 @@ Repository-specific labels can be added after real usage shows a need.
 
 ### Next public development
 
-- Grow the minimal S-Agreement conformance application into the second real
+- Grow the minimal S-Team conformance application into the second real
   product application.
 - Let it challenge and stabilize the Core public API.
 - Implement WebDAV only after the mailbox storage contract is public and tested.
@@ -411,7 +411,7 @@ Repository-specific labels can be added after real usage shows a need.
   phone, organisation, roles, personas, contact cards, per-application
   visibility). Core keeps only the minimal profile; S-Identity is consumed
   through A4 facades under the A5 rule and must degrade gracefully when absent.
-- Additional Personal Cockpit source adapters over published application facades.
+- Additional S-Cockpit source adapters over published application facades.
 
 ## 11. Launch sequence
 
@@ -455,18 +455,18 @@ and records the outcome as `site_redactions` in `R8_VERIFICATION.json`.
    makes one public. See §6.
 6. Make Sovereign Core public first, then protect its `main` at once.
 7. Publish its `0.1.0` source/wheel artifact.
-8. Make S-Kanban public against that exact Core release.
-9. Tag S-Kanban `0.1.0-alpha.1`.
-10. Make Personal Cockpit public against its declared Core and application-facade
+8. Make S-Initiative public against that exact Core release.
+9. Tag S-Initiative `0.1.0-alpha.1`.
+10. Make S-Cockpit public against its declared Core and application-facade
     compatibility ranges.
 11. Publish demo and invitation to contributors.
 12. Open a small number of curated issues; avoid an unprioritized backlog dump.
 
 ## 12. Publication decisions
 
-- **O1 — RESOLVED at launch:** lead with **S-Kanban**, as the more mature of
+- **O1 — RESOLVED at launch:** lead with **S-Initiative**, as the more mature of
   the two, and provide a clear path into the Core architecture behind it. The
-  revisit this decision reserved has been taken: S-Agreement remains the
+  revisit this decision reserved has been taken: S-Team remains the
   conformance proof that keeps Core honest about being application-neutral,
   not the product the announcement leads with. This closes the last
   provisional decision; it reopened no architecture or repository choice.

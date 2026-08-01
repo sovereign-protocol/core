@@ -93,9 +93,9 @@ import the producer's logic, controller, or persistence modules. In `0.x`, a
 producer exposes at most one facade version at a time; compatibility adapters
 belong on the consumer side.
 
-S-Kanban's current facade is `s_kanban.KanbanFacade`, API version `1`. It
+S-Initiative's current facade is `s_initiative.InitiativeFacade`, API version `1`. It
 exposes detached query snapshots plus explicit board, card, agenda, reaction,
-and policy commands. Personal Cockpit consumes it without declaring S-Kanban
+and policy commands. S-Cockpit consumes it without declaring S-Initiative
 as a package dependency.
 
 ## Channel extension API

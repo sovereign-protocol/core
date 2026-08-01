@@ -1164,7 +1164,7 @@ Object.assign(SovereignShell, {
 /*
   The collaboration pane - the same surface in every application.
 
-  Sections, in the order S-Kanban established: what I want to discuss, what
+  Sections, in the order S-Initiative established: what I want to discuss, what
   everyone wants to discuss, what is not yet in agreement, and the settings
   that govern adoption. All four are Core concepts, so all four live here and
   no application renders them itself.
@@ -1293,7 +1293,7 @@ Object.assign(SovereignShell, {
 
   // Identity is Core's. known_identities (Session.known_identities) is the
   // one place every application - even one with no user model of its own,
-  // like S-Agreement - can resolve an author uuid to a name and a picture.
+  // like S-Team - can resolve an author uuid to a name and a picture.
   _identityFor(uuid) {
     const state = this._options.state ? this._options.state() : {};
     const known = state.known_identities || [];

@@ -10,7 +10,7 @@ class SharedTopicRegistryTests(unittest.TestCase):
         topic = ProtocolNode({"type": "agreement", "title": "Terms"})
         accepted = []
         registry.register(
-            "S-Agreement",
+            "S-Team",
             {"agreement"},
             lambda: [topic],
             lambda tree: accepted.append(tree.uuid),

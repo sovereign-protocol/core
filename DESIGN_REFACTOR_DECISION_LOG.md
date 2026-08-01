@@ -56,14 +56,14 @@ above is the mapping.
 | P5 | Normative specification? | Markdown wire/hash specification plus golden fixtures and executable conformance tests | **ACCEPTED** |
 | S1 | Meaning of app load/unload? | Installed apps can activate/deactivate at runtime without deleting data; installing/updating code requires restart | **ACCEPTED** |
 | H1 | Host framework? | Support Starlette directly during `0.x`; do not abstract an unused second framework | **ACCEPTED** |
-| H2 | Apps per process? | One host/session/identity can run zero to many applications; Personal Cockpit is a standalone cross-application aggregator | **ACCEPTED** |
+| H2 | Apps per process? | One host/session/identity can run zero to many applications; S-Cockpit is a standalone cross-application aggregator | **ACCEPTED** |
 | H3 | App discovery? | Explicit configuration and manifests first; Python entry-point discovery later | **ACCEPTED** |
 | C1 | Mailbox storage API shape? | Domain-specific mailbox operations, not a generic virtual filesystem | **ACCEPTED** |
 | C2 | SFTP bearer credential? | Allow only as an explicitly experimental alpha path with dedicated jailed accounts; keep it out of the default quickstart | **ACCEPTED** |
 | A1 | Shared human profile data? | Core owns one minimal public profile: stable identity, display name, optional avatar; app-specific/contact data stays in apps | **ACCEPTED — see B1 resolution below** |
 | A2 | Manual app ownership? | Keep in Core as the non-stable diagnostic/example “Protocol Explorer” | **ACCEPTED** |
 | A3 | Shared browser assets? | Core owns the generic host shell; every application owns its actual UI/assets; no separate UI package yet | **ACCEPTED** |
-| A4 | Personal Cockpit source integration? | Personal Cockpit adapters consume other applications’ public facades through generic host lookup; Core and source apps remain cockpit-neutral | **ACCEPTED — REQUIRED BEFORE R8**: it may remain in the private monorepo during refactoring, but its direct Kanban import must be removed before repository separation |
+| A4 | S-Cockpit source integration? | S-Cockpit adapters consume other applications’ public facades through generic host lookup; Core and source apps remain cockpit-neutral | **ACCEPTED — REQUIRED BEFORE R8**: it may remain in the private monorepo during refactoring, but its direct Kanban import must be removed before repository separation |
 | A5 | May an application depend on another application? | Only optional, late-bound, consumer-side facade dependencies. Mandatory app→app dependencies are disallowed during `0.x` | **ACCEPTED** |
 
 Implementation must not start before this section is resolved, except for
@@ -73,9 +73,9 @@ committing/documenting the already completed generic-topic decoupling baseline.
 
 Review found a contradiction between A1/H2 and the implementation: Core owns the
 identity *node* (`session.identity`, `is_identity_node`, `peer_identity_key`),
-but S-Kanban owns the entire profile *surface* — `/api/kanban/profile`,
-`/api/kanban/profile/avatar`, and the only accept path for an invited profile
-topic. With zero applications, or with S-Agreement/Protocol Explorer only, the
+but S-Initiative owns the entire profile *surface* — `/api/initiative/profile`,
+`/api/initiative/profile/avatar`, and the only accept path for an invited profile
+topic. With zero applications, or with S-Team/Protocol Explorer only, the
 shared profile has no acceptance path at all.
 
 Accepted resolution:
@@ -85,7 +85,7 @@ Accepted resolution:
    `identity_key` via `Session._local_revision_origin`.
 2. The **minimal public profile** (display name, optional avatar) stays in Core
    exactly as A1 states. The existing profile routes and profile-topic accept
-   path **relocate from S-Kanban to Core** (phase R3a).
+   path **relocate from S-Initiative to Core** (phase R3a).
 3. **Rich identity data** — email, phone, organisation, roles, personas, contact
    cards, per-application visibility — is explicitly *not* Core. It becomes a
    future optional **S-Identity** application, consumed through A4 facades with
@@ -115,7 +115,7 @@ version negotiation. All are deferred past `1.0`.
 | L3 | Profile/UI license boundary? | Minimal profile and host shell follow Core’s LGPL; application UIs follow their application license | **ACCEPTED** |
 | L4 | Documentation license? | Documentation and normative S-Protocol specification use `CC-BY-4.0`; code/fixtures retain repository software license | **ACCEPTED** |
 | G1 | Repository owner? | Sovereign Protocol GitHub organization; founder is sole initial owner/merger | **ACCEPTED** |
-| G2 | Names? | Organization repos `core`, `s-kanban`, `personal-cockpit`, later `s-agreement`; distribution `sovereign-protocol`; import `sovereign` | **ACCEPTED — availability check fired, see below** |
+| G2 | Names? | Organization repos `core`, `s-initiative`, `s-cockpit`, later `s-team`; distribution `sovereign-protocol`; import `sovereign` | **ACCEPTED — availability check fired, see below** |
 
 ### G2 availability outcome — the distribution was renamed
 
@@ -125,7 +125,7 @@ recorded here rather than silently applied.
 `sovereign-core` is taken on PyPI by an unrelated, actively maintained
 project (1.1.1, released 2026-06-30, itself redirecting to
 `sovereign-sdk-core`). Publishing under it is impossible, and every
-application declares `sovereign-core>=0.1.0,<0.2`, so a released S-Kanban
+application declares `sovereign-core>=0.1.0,<0.2`, so a released S-Initiative
 would resolve that requirement against a stranger's package, find only
 1.1.1, and fail to install with no indication why.
 
@@ -148,7 +148,7 @@ recorded as a known limitation rather than fixed now.
 
 | ID | Question | Recommendation | Status/decision |
 |---|---|---|---|
-| O1 | First audience/lead application? | Lead with S-Kanban, the more mature of the two, and provide a clear path into Core | **RESOLVED at launch — S-Kanban leads; S-Agreement stays the conformance proof** |
+| O1 | First audience/lead application? | Lead with S-Initiative, the more mature of the two, and provide a clear path into Core | **RESOLVED at launch — S-Initiative leads; S-Team stays the conformance proof** |
 | O2 | Supported platforms? | Explicit Windows 10/11 support; label Linux/macOS experimental/unverified until tested | **ACCEPTED** |
 | O3 | Initial artifact? | Core source/wheel and Kanban source alpha first; executable later | **ACCEPTED** |
 | O4 | Community channel? | GitHub Discussions first; no additional chat initially | **ACCEPTED** |
@@ -161,7 +161,7 @@ recorded as a known limitation rather than fixed now.
 1. P1–P5: protocol name, vocabulary, and compatibility.
 2. S1, H1–H3: application lifecycle and host.
 3. C1–C2: channel/storage and relay security posture.
-4. A1–A4: profile, Protocol Explorer, UI, and Personal Cockpit integration.
+4. A1–A4: profile, Protocol Explorer, UI, and S-Cockpit integration.
 5. L1–L4 and G1–G5: licenses, contribution terms, names, and repositories.
 6. O1–O7: launch audience and operational choices.
 

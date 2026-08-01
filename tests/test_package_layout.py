@@ -254,7 +254,7 @@ class ShellLayoutTests(unittest.TestCase):
 class ShippedExampleAssetTests(unittest.TestCase):
     """The example's assets are held to the rules every application follows.
 
-    These used to check S-Agreement, which shipped inside Core. It became a
+    These used to check S-Team, which shipped inside Core. It became a
     product and moved out, so they check the minimal example that replaced it.
     """
 

@@ -118,12 +118,12 @@ first-class, and local-vs-SFTP already exercises it.
 
 `MemoryHttpClient` was the in-process fast transport for multi-client tests.
 It is gone from all three repositories, replaced by
-`s-kanban/tests/relay_clients.py` and its two smaller equivalents: a shared
+`s-initiative/tests/relay_clients.py` and its two smaller equivalents: a shared
 temp folder, one relay target per client, and an explicit `sync()` that
-publishes and polls. 90 s-kanban tests, 19 s-agreement tests and core's
+publishes and polls. 90 s-initiative tests, 19 s-team tests and core's
 Explorer test now run over the route users actually take. The suite is
 green — `sync()` costs about 0.2s per two-client test, ~17s added to
-s-kanban.
+s-initiative.
 
 **Do not keep HTTP alive only for tests.** The suite would stop exercising the
 path users actually take, which is worse than either option.
@@ -173,11 +173,11 @@ All of it, with every suite green. What went, and where:
 `release_topic_channels`, which is an application lifecycle effect and not a
 transport one. That is what keeps `deliver_effects` and every application's
 `result.effects` contract unchanged — **no production change is needed in
-s-kanban, s-agreement or personal-cockpit.**
+s-initiative, s-team or s-cockpit.**
 
 The two production changes outside Core were both smaller than expected:
-S-Kanban's `users()` read `Session.members`, and four methods across S-Kanban
-and S-Agreement returned sync effects nothing could deliver.
+S-Initiative's `users()` read `Session.members`, and four methods across S-Initiative
+and S-Team returned sync effects nothing could deliver.
 
 Four things the cut settled that the map did not anticipate:
 

@@ -7,8 +7,8 @@ The boundary decisions this document settled all held — which is why removing
 one channel touched no application. See `DESIGN_TOPIC_HOME_CHANNELS.md` §3.
 
 This document defines the bounded architectural refactor to complete before
-publishing Sovereign Core and S-Kanban. It is intentionally driven by two real
-applications: S-Kanban and a minimal S-Agreement proof. It does not include
+publishing Sovereign Core and S-Initiative. It is intentionally driven by two real
+applications: S-Initiative and a minimal S-Team proof. It does not include
 unrelated optimization or feature work.
 
 Status labels:
@@ -28,8 +28,8 @@ Related documents:
 
 ## 1. Objective
 
-Create a reusable, application-neutral foundation that can host S-Kanban and
-S-Agreement without modifying protocol, Session, channel, or host code when a
+Create a reusable, application-neutral foundation that can host S-Initiative and
+S-Team without modifying protocol, Session, channel, or host code when a
 new application is added.
 
 The result must establish enforceable dependency boundaries before third-party
@@ -51,7 +51,7 @@ them.
 5. Channel selection, token composition, and channel lifecycle ownership.
 6. Separation of mailbox channel logic from Local/SFTP/WebDAV storage backends.
 7. Separation of application logic from Starlette controllers and UI assets.
-8. A minimal S-Agreement conformance application.
+8. A minimal S-Team conformance application.
 9. Boundary, packaging, and cross-application tests.
 
 ### Deferred
@@ -63,7 +63,7 @@ them.
 - Live hot-reload of application code.
 - Performance work identified in `ARCHITECTURE_REVIEW.md`.
 - UI redesign and a shared frontend component system.
-- Finished S-Agreement product features or signing workflow.
+- Finished S-Team product features or signing workflow.
 - Changing revision/reaction semantics beyond separately approved designs.
 
 ## 3. Target layers and dependency rule
@@ -296,7 +296,7 @@ installer are deferred.
 
 ## 8. ApplicationHost boundary
 
-ApplicationHost is reusable foundation, not S-Kanban code.
+ApplicationHost is reusable foundation, not S-Initiative code.
 
 ### Responsibilities
 
@@ -354,7 +354,7 @@ obtained by generic host lookup, and only **optionally**.
 > must still start and behave coherently with reduced function. If it cannot,
 > the capability belongs in Core, or the two applications should be one.
 
-Allowed: Personal Cockpit consuming a Kanban facade and simply showing no Kanban
+Allowed: S-Cockpit consuming a Kanban facade and simply showing no Kanban
 entries when Kanban is absent or inactive.
 
 Disallowed during `0.x`: a mandatory dependency such as routing every
@@ -373,11 +373,11 @@ version negotiation. All deferred past `1.0`.
    it. Framework neutrality has no second implementation to justify it.
 2. **ACCEPTED H2:** one ApplicationHost owns one Session, identity, and
    ChannelManager and may run zero to many applications simultaneously. Each app
-   receives a namespaced route/asset space. Personal Cockpit is a standalone
+   receives a namespaced route/asset space. S-Cockpit is a standalone
    application that can aggregate Kanban, Agreement, and future sources.
 
    **Namespacing must become explicit.** Routes are flat-by-convention today
-   (`/api/kanban/...`, `/api/manual/...` are registered directly into one
+   (`/api/initiative/...`, `/api/manual/...` are registered directly into one
    Starlette route list, with nothing preventing collision). R3 must define:
    the reserved Core prefix (`/api/` core endpoints such as `/api/blob`), the
    per-application prefix derived from `application_id`, the asset mount point,
@@ -457,12 +457,12 @@ encrypted. Scoped provisioning may be revisited with a future backend.
 
 ## 10. Application boundary
 
-### S-Kanban package
+### S-Initiative package
 
 Proposed structure:
 
 ```text
-s_kanban/
+s_initiative/
     manifest.py
     logic/
         kanban.py
@@ -470,8 +470,8 @@ s_kanban/
     controllers/
         kanban.py
     static/
-        kanban.html
-        kanban.css
+        initiative.html
+        initiative.css
     config/
         examples/
 ```
@@ -490,29 +490,29 @@ relay targets, or process lifecycle.
 Controllers own HTTP parsing/status codes and return serializable application
 views. They may use Starlette while application logic remains framework-neutral.
 
-### Personal Cockpit aggregation application
+### S-Cockpit aggregation application
 
-Personal Cockpit (formerly Board of Boards) is a standalone application, not an
-S-Kanban auxiliary view. It collects and presents information from multiple
+S-Cockpit (formerly Board of Boards) is a standalone application, not an
+S-Initiative auxiliary view. It collects and presents information from multiple
 installed/active sources such as Kanban, Agreement, and future applications.
 
 It remains entirely above Core. Core must not gain dashboard concepts or source-
 specific summary schemas.
 
 **ACCEPTED A4 — REQUIRED BEFORE R8.** ApplicationHost offers generic
-lookup of active applications' public facades. Personal Cockpit owns adapters
+lookup of active applications' public facades. S-Cockpit owns adapters
 that consume those facades and produce cockpit entries, never source-app
 internals or raw protocol trees. Source applications and Core know nothing about
-Personal Cockpit. Missing or inactive sources simply provide no cockpit data.
+S-Cockpit. Missing or inactive sources simply provide no cockpit data.
 
 During the private monorepo phases, the existing file may retain its direct
-`KanbanLogic` import until the public facade contract exists. Before R8, that
+`InitiativeLogic` import until the public facade contract exists. Before R8, that
 import must be replaced by an optional, version-checked Kanban facade obtained
-through generic host lookup. Personal Cockpit then moves mechanically to its own
+through generic host lookup. S-Cockpit then moves mechanically to its own
 repository as accepted in G2. The seven methods it currently consumes define the
 initial facade coverage to design and test.
 
-### S-Agreement conformance application
+### S-Team conformance application
 
 Before repository separation, implement only enough to prove the boundary:
 
@@ -556,19 +556,19 @@ A1 is confirmed, not reopened. The implementation currently contradicts it:
 | Concern | Owner today | Owner required |
 |---|---|---|
 | `identity_key`, identity node, `revision_origin`, peer identity registry | Core (`session.py`) | Core — **immovable** |
-| Minimal profile fields (display name, avatar reference) | Core node, but edited only through S-Kanban | Core |
-| Profile HTTP surface (`/api/kanban/profile`, `/api/kanban/profile/avatar`) | **S-Kanban** | **Core** |
-| Accepting an invited profile topic (`kanban_logic.py` join flow) | **S-Kanban** | **Core** |
+| Minimal profile fields (display name, avatar reference) | Core node, but edited only through S-Initiative | Core |
+| Profile HTTP surface (`/api/initiative/profile`, `/api/initiative/profile/avatar`) | **S-Initiative** | **Core** |
+| Accepting an invited profile topic (`kanban_logic.py` join flow) | **S-Initiative** | **Core** |
 
 The identity layer is immovable because `Session._local_revision_origin` reads
 `identity_key` from the profile node: **every revision in the protocol is stamped
 with it**. Identity therefore cannot be lifted into an application.
 
-Consequence of leaving it as-is: with zero applications, or with S-Agreement or
+Consequence of leaving it as-is: with zero applications, or with S-Team or
 Protocol Explorer only, there is no code path that accepts an invited profile
 topic — the shared profile silently stops working, contradicting H2. It is also a
 license-boundary problem, since L3 places the profile in LGPL Core while the code
-sits in future-Apache S-Kanban. Both are resolved by phase **R3a**.
+sits in future-Apache S-Initiative. Both are resolved by phase **R3a**.
 
 ### 11.2 Rich identity is a future application, not Core
 
@@ -617,10 +617,10 @@ No encryption change is part of this refactor.
 | `trace_log.py` | Core diagnostics | Package cleanup |
 | `trace_view.py` | Core development tool | Decide whether shipped or example-only |
 | `app_server.py` | Core host | Decompose runtime, persistence, core controllers, lifecycle |
-| `kanban_logic.py` | S-Kanban | Separate logic from controllers/routes; **surrender the profile routes and profile-topic accept path to Core (R3a)** |
-| `boardofboards_logic.py` | Personal Cockpit app | Rename during extraction; replace direct `KanbanLogic` import with optional, version-checked public facade before R8 |
-| `kanban.html/.css` | S-Kanban | Move as application assets |
-| `boardofboards.html/.css` | Personal Cockpit app | Rename and move as standalone application assets |
+| `kanban_logic.py` | S-Initiative | Separate logic from controllers/routes; **surrender the profile routes and profile-topic accept path to Core (R3a)** |
+| `boardofboards_logic.py` | S-Cockpit app | Rename during extraction; replace direct `InitiativeLogic` import with optional, version-checked public facade before R8 |
+| `initiative.html/.css` | S-Initiative | Move as application assets |
+| `boardofboards.html/.css` | S-Cockpit app | Rename and move as standalone application assets |
 | `manual_logic/html/css` | Core Protocol Explorer | Rename during extraction; diagnostic/example, non-stable API |
 | `shared.css` / shared browser helpers | Core host shell | Keep only generic launcher/identity/connection/navigation assets |
 
@@ -685,8 +685,8 @@ Exit: editable installation and clean installation both pass.
 | Distribution | Import package | Monorepo source root |
 |---|---|---|
 | `sovereign-protocol 0.1.0` | `sovereign` | `src/sovereign` |
-| `s-kanban 0.1.0a1` | `s_kanban` | `applications/s-kanban/src/s_kanban` |
-| `personal-cockpit 0.1.0a1` | `personal_cockpit` | `applications/personal-cockpit/src/personal_cockpit` |
+| `s-initiative 0.1.0a1` | `s_initiative` | `applications/s-initiative/src/s_initiative` |
+| `s-cockpit 0.1.0a1` | `s_cockpit` | `applications/s-cockpit/src/s_cockpit` |
 
 - Declared Python floor: **3.10**. CI coverage of that floor remains an R8
   publication gate; the development verification ran on Python 3.14.2.
@@ -701,7 +701,7 @@ Exit: editable installation and clean installation both pass.
   repository.
 - Full suite after extraction: **410 passed**.
 
-Personal Cockpit's direct `s_kanban` dependency remains an explicitly temporary
+S-Cockpit's direct `s_initiative` dependency remains an explicitly temporary
 private-monorepo dependency under §10. R6 must replace it with optional facade
 lookup before R8/repository publication.
 
@@ -729,7 +729,7 @@ Exit: Kanban starts through its manifest; Session imports no app.
   application mounts matching, explicitly invited topics that arrived in the
   peer cache while its type was unknown. Passively observed relay topics remain
   cache-only, preserving the token consent boundary.
-- Kanban, Personal Cockpit, and Protocol Explorer use manifests and factories.
+- Kanban, S-Cockpit, and Protocol Explorer use manifests and factories.
   Application HTTP routes live below `/api/<application-id>` and assets below
   `/apps/<application-id>`.
 - Relay is constructed once as a Core service and supplied through
@@ -749,9 +749,9 @@ Full suite after R3: **416 passed**.
 
 Small, mandatory, and separated from R3 so it can be reviewed on its own.
 
-- Move the profile routes (`/api/kanban/profile`, `/api/kanban/profile/avatar`)
+- Move the profile routes (`/api/initiative/profile`, `/api/initiative/profile/avatar`)
   to Core-owned endpoints under the reserved Core prefix.
-- Move acceptance of an invited profile topic out of the S-Kanban join flow into
+- Move acceptance of an invited profile topic out of the S-Initiative join flow into
   Core, so it works with zero or non-Kanban applications.
 - Register identity/profile as a Core-owned topic handler, replacing the mailbox
   channel's hand-appended identity topic (§3 invariant 3).
@@ -759,7 +759,7 @@ Small, mandatory, and separated from R3 so it can be reviewed on its own.
 
 Exit: a host running **no** applications, and a host running only the Agreement
 proof, both accept an invited profile topic and render display name and avatar.
-No `/api/kanban/*` route serves a Core concept.
+No `/api/initiative/*` route serves a Core concept.
 
 **Implemented R3a record:**
 
@@ -768,9 +768,9 @@ No `/api/kanban/*` route serves a Core concept.
   node-type branch or hand-appended identity UUID.
 - `CoreProfileService` owns profile editing and presentation. Core endpoints are
   `GET|POST /api/core/profile` and `POST /api/core/profile/avatar`; the former
-  S-Kanban routes no longer exist and its UI calls the Core endpoints.
+  S-Initiative routes no longer exist and its UI calls the Core endpoints.
 - Direct HTTP invitation dispatch is Core-owned and routes mounting through the
-  shared-topic registry. S-Kanban no longer owns a `join_discussion` override.
+  shared-topic registry. S-Initiative no longer owns a `join_discussion` override.
 - Peer profiles remain cache-only and pairwise: accepting a profile never
   grafts over the local sovereign identity and never cross-introduces peers from
   unrelated application topics.
@@ -815,7 +815,7 @@ and mailbox adapters.
 
 ### R5 — separate controllers from application logic
 
-- Move Starlette imports and route factories out of Kanban, Personal Cockpit, and
+- Move Starlette imports and route factories out of Kanban, S-Cockpit, and
   Manual logic.
 - Define serializable view/result boundaries.
 - Move assets into application packages.
@@ -824,13 +824,13 @@ Exit: application logic tests require no Starlette request/response objects.
 
 **Implemented 2026-07-19.**
 
-- S-Kanban and Personal Cockpit now separate `logic.py`, `controller.py`, and
+- S-Initiative and S-Cockpit now separate `logic.py`, `controller.py`, and
   `application.py`. Protocol Explorer has the equivalent Core modules.
 - Domain logic imports neither Starlette, host contracts, nor controller
   modules. Manifests and `create_application` factories live in the composition
   modules, so dependencies point controller → logic, never logic → controller.
 - Configured application entry points now name the composition modules
-  (`s_kanban.application`, `personal_cockpit.application`, and
+  (`s_initiative.application`, `s_cockpit.application`, and
   `sovereign.protocol_explorer_application`). The old internal module names are
   intentionally unsupported under P4.
 - `ApplicationResultView`, `application_result_view`, and `json_value` define a
@@ -843,7 +843,7 @@ Exit: application logic tests require no Starlette request/response objects.
   removed from local tracking.
 - Browser assets were already moved into their owning application packages by
   R2; R5 retains and verifies that ownership.
-- `S-Kanban.spec` now collects the installed Core and application packages,
+- `S-Initiative.spec` now collects the installed Core and application packages,
   replacing obsolete flat-module and loose-asset declarations. A full frozen
   executable build remains part of the R6 packaging smoke work.
 - Controller tests are separate from Protocol Explorer logic tests. An AST
@@ -859,7 +859,7 @@ Verification: **427 tests passed**.
 - Add package build/install smoke tests.
 - Document the supported public API; mark internals private.
 - Define and test the application facade/API version contract.
-- Replace Personal Cockpit's direct Kanban import with an optional Kanban facade
+- Replace S-Cockpit's direct Kanban import with an optional Kanban facade
   lookup and verify graceful behavior when Kanban is inactive.
 
 Exit: architectural violations fail CI.
@@ -869,11 +869,11 @@ Exit: architectural violations fail CI.
 - Core owns a late-bound facade registry. `ApplicationFacade` carries an
   application-owned `facade_api_version`; lookup returns `None` for an inactive
   producer and rejects an incompatible active version explicitly.
-- S-Kanban exposes facade API 1 for its seven read/query operations. Personal
-  Cockpit consumes it without importing or depending on S-Kanban, and remains
+- S-Initiative exposes facade API 1 for its seven read/query operations. Personal
+  Cockpit consumes it without importing or depending on S-Initiative, and remains
   usable when Kanban is inactive. Its legacy launcher activates both apps.
 - The application launch catalog moved out of Core into the application
-  launcher. Core contains no Kanban or Personal Cockpit knowledge.
+  launcher. Core contains no Kanban or S-Cockpit knowledge.
 - `PUBLIC_API.md` and `sovereign.__all__` define the supported `0.x` surface.
   Shipped applications import Core only through that public root.
 - AST tests reject forbidden Core/app/Session/storage dependency directions and
@@ -886,7 +886,7 @@ Exit: architectural violations fail CI.
 - Required Windows jobs run the full suite on Python 3.10 and 3.14, making the
   supported platform and declared floor executable contracts. Python 3.14 on
   Ubuntu remains an explicitly experimental, non-blocking signal.
-- A clean PyInstaller build from `S-Kanban.spec` completed in temporary output
+- A clean PyInstaller build from `S-Initiative.spec` completed in temporary output
   directories and the frozen executable reached its command-line entry point.
   This is a buildability check only: committing the spec and running the smoke
   test do not satisfy G4/G5 or authorize executable distribution.
@@ -901,7 +901,7 @@ prefix.
 Verification: **441 tests passed**, plus the dependency-resolving wheel-install
 smoke.
 
-### R7 — prove with minimal S-Agreement
+### R7 — prove with minimal S-Team
 
 - Implement the conformance application described above.
 - Run direct HTTP and relay two-client tests.
@@ -911,11 +911,11 @@ Exit: two independent applications run on the same installed core.
 
 **Implemented R7 record:**
 
-- Added the independently packaged `s-agreement 0.1.0a1` conformance
+- Added the independently packaged `s-team 0.1.0a1` conformance
   application. It owns agreement, section, and clause data, its controllers,
   and a deliberately minimal document view.
 - `agreement` is registered as an application topic root. Invitations mount
-  beneath S-Agreement's local container through the existing generic Session
+  beneath S-Team's local container through the existing generic Session
   registration contract.
 - The application exposes Session transition classifications but defines no
   auto-adoption policy. Expiry, sign-off, and the finished negotiation UI remain
@@ -940,7 +940,7 @@ and a clean frozen-launcher build/entry-point smoke on Windows.
 - Rehearse the mandatory publication checks in
   `DESIGN_OPEN_SOURCE_PUBLICATION.md`.
 
-Exit: Core, S-Kanban, and Personal Cockpit repositories can be published without
+Exit: Core, S-Initiative, and S-Cockpit repositories can be published without
 history rewriting afterward.
 
 #### Tooling
@@ -957,8 +957,8 @@ Published-repository scaffolding lives in `release/repositories/<name>/` and is
 filtered into place; `release-pyproject.toml` becomes the repository's real
 `pyproject.toml` during the split.
 
-The split produces **four** distributions, not three: S-Agreement travels inside
-Core as `examples/s-agreement/`, per the licensing plan's "minimal non-product
+The split produces **four** distributions, not three: S-Team travels inside
+Core as `examples/s-team/`, per the licensing plan's "minimal non-product
 example applications" clause, and therefore carries Core's LGPL rather than an
 application Apache-2.0 license.
 
@@ -975,7 +975,7 @@ rehearsal:
   package before public contribution; a second focused review before any frozen
   executable. A green rehearsal is evidence for that review, not a substitute.
 - **G2 name availability.** Repository, distribution, domain, and trademark
-  checks for `sovereign-protocol`, `s-kanban`, `personal-cockpit`.
+  checks for `sovereign-protocol`, `s-initiative`, `s-cockpit`.
 - **Credential rotation.** The scanner proves no secret is *present*; it cannot
   prove no credential ever needs rotating.
 - **O1 lead-application choice**, still provisional.
@@ -995,7 +995,7 @@ Windows 11, Python 3.14.2, after the User-Agent fix below.
 
 | Check | Result |
 |---|---|
-| Distributions built | 4 wheels — `sovereign_core-0.1.0`, `s_agreement-0.1.0a1`, `s_kanban-0.1.0a1`, `personal_cockpit-0.1.0a1` |
+| Distributions built | 4 wheels — `sovereign_core-0.1.0`, `s_team-0.1.0a1`, `s_initiative-0.1.0a1`, `s_cockpit-0.1.0a1` |
 | Cross-repository install | pinned (`sovereign-protocol==0.1.0`) and editable, both green |
 | Per-repository tests | passed in all three isolated repositories |
 | Packaged license payloads | present in every wheel |
@@ -1034,12 +1034,12 @@ above.
 
 | ID | Finding | How it was closed |
 |---|---|---|
-| B1 | Profile surface owned by S-Kanban, so a zero-application or non-Kanban host had no profile accept path | Profile moved to Core: `/api/core/profile{,/avatar}`; proven by `tests/test_core_profile.py`, which asserts `/api/kanban/profile` is absent from a zero-application host |
+| B1 | Profile surface owned by S-Initiative, so a zero-application or non-Kanban host had no profile accept path | Profile moved to Core: `/api/core/profile{,/avatar}`; proven by `tests/test_core_profile.py`, which asserts `/api/initiative/profile` is absent from a zero-application host |
 | S2f | S1 runtime activation/deactivation had no implementation path (`unregister` never called) | `ApplicationHost.activate()/deactivate()`; deactivation calls `Session.unregister_application`, which unregisters the topic handler |
 | S4f | The mailbox channel hand-appended the identity topic, special-casing a node type | `relay_topic_uuids` now calls `Session.shared_topic_uuids(scoped)`; the channel names no node type |
 | D12 | Route namespacing and collision policy undefined | `ApplicationHost._validate_routes` enforces `api_prefix`/`asset_prefix` and rejects duplicate, cross-application, and Core-reserved collisions with named errors |
 | F1 | Applications read private channel services from host config | Applications receive only a read-only collaboration view and effect-delivery callable; `ChannelManager` is not part of `ApplicationServices` or the public package exports |
-| S3f | Protocol Explorer had no mailbox topic handler despite an overly broad lifecycle claim | A2 was narrowed explicitly: Protocol Explorer is a local/HTTP diagnostic; mailbox conformance belongs to real applications, beginning with S-Agreement |
+| S3f | Protocol Explorer had no mailbox topic handler despite an overly broad lifecycle claim | A2 was narrowed explicitly: Protocol Explorer is a local/HTTP diagnostic; mailbox conformance belongs to real applications, beginning with S-Team |
 
 ### Closed by R6
 
@@ -1048,13 +1048,13 @@ above.
 | F2 | The Python `>=3.10` floor was not executed | CI now runs Python 3.10 and 3.14 |
 | F3 | Clean wheel installation was not proven | `test_package_build.py` installs all three wheels in a new isolated venv |
 | F4 | Ignored build trees contained stale routes | Generated application build trees were removed; smoke builds use temporary directories |
-| F5 | Personal Cockpit imported S-Kanban internals | Optional version-checked facade lookup; no package/import dependency remains |
+| F5 | S-Cockpit imported S-Initiative internals | Optional version-checked facade lookup; no package/import dependency remains |
 
 ### Closed by R7
 
 | ID | Finding | How it was closed |
 |---|---|---|
-| S-6 | UUID-sorted reconciliation was suspected to prevent one-pass adoption of a new nested subtree | The S-Agreement conformance test forces clause-before-section processing. The clause is initially skipped, then grafted with the complete section subtree when its parent event is processed, so one pass succeeds without a Core change. |
+| S-6 | UUID-sorted reconciliation was suspected to prevent one-pass adoption of a new nested subtree | The S-Team conformance test forces clause-before-section processing. The clause is initially skipped, then grafted with the complete section subtree when its parent event is processed, so one pass succeeds without a Core change. |
 
 ### Open
 
@@ -1097,20 +1097,20 @@ above.
 - [x] P5: normative Markdown specification plus fixtures/conformance tests.
 - [x] S1: runtime activation/deactivation; package changes require restart.
 - [x] H1: Starlette as the `0.x` host/controller framework.
-- [x] H2: zero-to-many applications per host; Personal Cockpit standalone.
+- [x] H2: zero-to-many applications per host; S-Cockpit standalone.
 - [x] H3: explicit configuration/manifests; entry-point discovery deferred.
 - [x] C1: mailbox-specific storage API.
 - [x] C2: experimental bearer SFTP credential posture for public alpha.
 - [x] A1: minimal Core public profile; app-specific/contact data stays in apps.
       **B1 resolution:** the profile HTTP surface and profile-topic accept path
-      move from S-Kanban to Core in R3a (§11.0); rich identity becomes a future
+      move from S-Initiative to Core in R3a (§11.0); rich identity becomes a future
       optional S-Identity application (§11.2).
 - [x] A2: Manual becomes Core's non-stable Protocol Explorer. **Scope note:**
       it registers no topic handler and is intentionally a local/HTTP-only
       diagnostic surface. Mailbox conformance belongs to real applications,
-      beginning with S-Agreement.
+      beginning with S-Team.
 - [x] A3: Core host shell versus application-owned domain UI.
-- [x] A4: Personal Cockpit adapters over public application facades; separation
+- [x] A4: S-Cockpit adapters over public application facades; separation
       and removal of the direct Kanban import are required before R8 (§10).
 - [x] A5: application-to-application dependencies are optional, late-bound
       facade lookups only; mandatory app→app dependencies disallowed in `0.x`.
