@@ -233,6 +233,19 @@ class RelayLogic:
         self._peer_presence_cache: dict[
             str, tuple[dict | None, float | None]
         ] = {}
+        # What makes that promise true rather than merely intended. These two
+        # fields are written by the poller while it holds the I/O lock and
+        # read by peer_liveness(), which the request path calls on the way to
+        # answering anything; guarding them with the I/O lock would have made
+        # every such read queue behind an SFTP round trip, and a relay whose
+        # connection has died then stops the client rather than just its sync.
+        #
+        # Deliberately outside the ordered hierarchy (manager < I/O <
+        # Session), because it is a strict leaf: nothing is ever acquired
+        # while it is held. A leaf cannot take part in a cycle, so it needs no
+        # rank - but that argument only holds while the critical sections stay
+        # what they are here, plain reads and writes of these two fields.
+        self._presence_lock = threading.Lock()
         # Which peer ids the relay listed per topic on the previous poll.
         # In memory only, and for the same reason `applied` is: it describes
         # peer_perspectives, which does not survive a restart either. A
@@ -631,7 +644,8 @@ class RelayLogic:
             mtime,
         )
         if mtime is not None:
-            self._own_presence_mtime = mtime
+            with self._presence_lock:
+                self._own_presence_mtime = mtime
 
     @_relay_io_locked
     def calibrate_timing(self, samples: int = 1) -> dict:
@@ -834,14 +848,30 @@ class RelayLogic:
             for peer_id in peers
         })
 
-    @_relay_io_locked
     def peer_liveness(
         self, peer_id: str, topic_uuid: str | None = None,
     ) -> dict:
-        if not self.storage or self._own_presence_mtime is None:
+        """How recently this peer was heard from, per the cached heartbeats.
+
+        Deliberately not under the relay I/O lock. This runs on the way to
+        answering any request that reports who is reachable, and it reads
+        only what the poller has already cached - so making it wait for the
+        poller's SFTP round trip would let one unreachable relay stop the
+        whole client, rather than only its sync.
+
+        `storage` is read without the lock as a "is a relay configured at
+        all" flag, where a reference one poll out of date changes nothing;
+        the two fields whose agreement actually matters are read together
+        under the presence lock.
+        """
+        if not self.storage:
             return {"state": "unknown"}
-        content, mtime = self._peer_presence_cache.get(peer_id, (None, None))
-        if content is None or mtime is None:
+        with self._presence_lock:
+            own_mtime = self._own_presence_mtime
+            content, mtime = self._peer_presence_cache.get(
+                peer_id, (None, None),
+            )
+        if own_mtime is None or content is None or mtime is None:
             return {"state": "unknown"}
         carried_topics = content.get("topic_uuids")
         if (
@@ -857,7 +887,7 @@ class RelayLogic:
         # stored. A negative distance (their heartbeat is newer than our
         # own last one) just means they're doing great; only a distance
         # past the margin indicates they've gone quiet.
-        distance = self._own_presence_mtime - mtime
+        distance = own_mtime - mtime
         threshold = PRESENCE_LIVENESS_MARGIN * (self.poll_interval_seconds + peer_interval)
         return {
             "state": "alive" if distance <= threshold else "stale",
@@ -1367,7 +1397,11 @@ class RelayLogic:
         def read_presence(peer_id: str) -> tuple[dict | None, float | None]:
             if peer_id not in presence_cache:
                 presence_cache[peer_id] = self.storage.read_presence_with_mtime(peer_id)
-                self._peer_presence_cache[peer_id] = presence_cache[peer_id]
+                # Published outside the SFTP call above, so a reader is never
+                # made to wait on it - the point of the cache (see
+                # peer_liveness).
+                with self._presence_lock:
+                    self._peer_presence_cache[peer_id] = presence_cache[peer_id]
             return presence_cache[peer_id]
 
         if self._scoped_topic_uuids is None:

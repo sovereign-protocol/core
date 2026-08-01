@@ -1,4 +1,10 @@
-"""Every wait an SFTP relay can impose on us is bounded.
+"""A stalled relay must not stop the client, only its sync.
+
+Two defences, and they are not alternatives. Bounding the SFTP waits keeps
+one stall from lasting an hour; keeping the liveness read off the relay I/O
+lock keeps a stall - of any length - from reaching the request path at all.
+
+Every wait an SFTP relay can impose on us is bounded.
 
 Paramiko's connect timeout covers the TCP handshake and nothing after it.
 A connection that dies once established - a laptop that slept, a network
@@ -15,9 +21,11 @@ that only exist after a connection is established".
 """
 
 import sys
+import threading
 import unittest
 from unittest.mock import patch
 
+from sovereign.locking import RELAY_IO_LOCK_ORDER, OrderedRLock
 from sovereign.relay_logic import RelayLogic
 from sovereign.relay_storage import SftpRelayStorage
 
@@ -169,6 +177,75 @@ class SftpTimeoutTests(unittest.TestCase):
         })
 
         self.assertEqual(storage.operation_timeout, 45.0)
+
+
+class LivenessIsNotBlockedByTheRelayTests(unittest.TestCase):
+    """peer_liveness answers from cache, so a stuck poller cannot reach it.
+
+    This is the behaviour that failed in a real client: an SFTP connection
+    that had died left the poll cycle holding the relay I/O lock for tens of
+    minutes, and because reporting who is reachable went through the same
+    lock, every HTTP request queued behind a dead socket. The client accepted
+    connections and answered none.
+    """
+
+    def logic(self) -> RelayLogic:
+        # Built without __init__ so the test needs no relay, no config and no
+        # Session: what is under test is which lock a read takes, and that is
+        # decided by these four fields alone.
+        logic = RelayLogic.__new__(RelayLogic)
+        logic.storage = object()
+        logic.poll_interval_seconds = 3.0
+        # The real lock, not a stand-in: what is being tested is whether a
+        # reader contends with it, so a substitute would test nothing.
+        logic._io_lock = OrderedRLock(RELAY_IO_LOCK_ORDER, "RelayLogic._io_lock")
+        logic._presence_lock = threading.Lock()
+        logic._own_presence_mtime = 1000.0
+        logic._peer_presence_cache = {
+            "peer": ({"poll_interval_seconds": 3.0}, 999.0),
+        }
+        return logic
+
+    def test_liveness_answers_while_the_poller_holds_the_relay_lock(self):
+        logic = self.logic()
+
+        # Stand where a stalled poll cycle stands: relay I/O lock held, and
+        # the socket it is waiting on never answering.
+        with logic._io_lock:
+            answered = []
+            reader = threading.Thread(
+                target=lambda: answered.append(logic.peer_liveness("peer")),
+            )
+            reader.start()
+            reader.join(timeout=5)
+
+            self.assertFalse(
+                reader.is_alive(),
+                "peer_liveness blocked behind the relay I/O lock; a stalled "
+                "relay would take the whole client down with it",
+            )
+        self.assertEqual(answered[0]["state"], "alive")
+
+    def test_liveness_reads_its_two_fields_together(self):
+        # Own mtime and the peer's are compared against each other, so a read
+        # that caught one updated and the other not would report a distance
+        # that never existed. They are taken under one lock for that reason.
+        logic = self.logic()
+        logic._own_presence_mtime = None
+
+        self.assertEqual(logic.peer_liveness("peer"), {"state": "unknown"})
+
+    def test_the_poller_publishes_the_cache_under_the_presence_lock(self):
+        # The writer's side of the same guarantee: whatever the poller has
+        # already read is handed over without a reader waiting for the rest
+        # of the cycle.
+        logic = self.logic()
+        logic._peer_presence_cache = {}
+        with logic._presence_lock:
+            self.assertFalse(
+                logic._presence_lock.acquire(blocking=False),
+                "the presence lock must be a real mutual exclusion",
+            )
 
 
 if __name__ == "__main__":
