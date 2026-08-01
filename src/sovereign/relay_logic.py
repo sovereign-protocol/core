@@ -308,6 +308,7 @@ class RelayLogic:
                 private_key_passphrase=(
                     config.get("relay_sftp_private_key_passphrase") or None
                 ),
+                **RelayLogic._sftp_timeouts(config),
             )
         root = config.get("relay_root")
         return LocalFolderRelayStorage(root) if root else None
@@ -340,6 +341,27 @@ class RelayLogic:
                 password=descriptor.get("password"),
             )
         return None
+
+    @staticmethod
+    def _sftp_timeouts(config: dict) -> dict:
+        """Bounds on every wait an SFTP relay can make us do.
+
+        Configurable because the right value depends on the link, not on
+        the code: a relay reached over a slow tunnel legitimately needs
+        longer than one on a LAN. Defaulted rather than required, because
+        the failure being prevented - a poll cycle stalled for an hour on a
+        socket nobody is answering - must not depend on anybody having
+        thought to configure it.
+        """
+        return {
+            key: float(config[name])
+            for key, name in (
+                ("connect_timeout", "relay_sftp_connect_timeout"),
+                ("operation_timeout", "relay_sftp_operation_timeout"),
+                ("keepalive_seconds", "relay_sftp_keepalive_seconds"),
+            )
+            if config.get(name) is not None
+        }
 
     @_relay_io_locked
     def adopt_storage_from_descriptor(self, descriptor: dict) -> bool:

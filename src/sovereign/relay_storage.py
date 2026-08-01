@@ -10,7 +10,15 @@ Functionality:
 Offered API:
   LocalFolderRelayStorage(root)
   SftpRelayStorage(host, username, remote_root, port=22, password=None,
-                   private_key_path=None, private_key_passphrase=None)
+                   private_key_path=None, private_key_passphrase=None,
+                   connect_timeout=10.0, operation_timeout=30.0,
+                   keepalive_seconds=15.0)
+    Every wait is bounded: connect_timeout covers the TCP handshake, the
+    SSH banner and authentication; operation_timeout bounds each read on
+    an established channel; keepalive_seconds makes a silent peer fail
+    rather than be waited on. A connection that dies after it is
+    established is the case that matters - paramiko's own timeout does
+    not cover it, and an unbounded read stalls the whole poll cycle.
     Both satisfy RelayStorage, including:
     write_snapshot(topic_uuid, peer_id, state_hash, payload)
     read_head(topic_uuid, peer_id) -> dict | None
@@ -333,7 +341,9 @@ class SftpRelayStorage:
                 port: int = 22, password: str | None = None,
                 private_key_path: str | None = None,
                 private_key_passphrase: str | None = None,
-                connect_timeout: float = 10.0):
+                connect_timeout: float = 10.0,
+                operation_timeout: float = 30.0,
+                keepalive_seconds: float = 15.0):
         self.host = host
         self.port = port
         self.username = username
@@ -341,6 +351,17 @@ class SftpRelayStorage:
         self.private_key_path = private_key_path
         self.private_key_passphrase = private_key_passphrase
         self.connect_timeout = connect_timeout
+        # Paramiko's connect timeout covers the TCP handshake and nothing
+        # after it, so a connection that dies once established - a laptop
+        # that slept, a network that dropped mid-session - leaves every
+        # later read blocking on a socket that will never answer. These two
+        # are what actually bound that: no single read may stall longer
+        # than operation_timeout, and keepalives make a silent peer fail
+        # rather than be waited on. Without them one dead relay stalls the
+        # poll cycle for as long as the OS keeps the socket open, which
+        # observed in practice as phases of over an hour.
+        self.operation_timeout = operation_timeout
+        self.keepalive_seconds = keepalive_seconds
         # Kept as a plain posix-style string, not pathlib.Path - remote SFTP
         # paths are always forward-slash regardless of the host OS this
         # process happens to be running on (matters on Windows).
@@ -632,7 +653,10 @@ class SftpRelayStorage:
 
     # Connection handling - lazy connect, retry once on failure (a dropped
     # SSH connection between poll cycles is the common case, not the
-    # exception, for a long-running background loop).
+    # exception, for a long-running background loop). A read that times out
+    # raises TimeoutError, which is an OSError, so it resets and retries on
+    # the same path as a dropped connection - bounding one operation at
+    # roughly two timeouts rather than leaving it open-ended.
 
     def _sftp_client(self):
         if self._sftp is None:
@@ -651,7 +675,14 @@ class SftpRelayStorage:
             "hostname": self.host,
             "port": self.port,
             "username": self.username,
+            # Three separate timeouts because paramiko bounds three separate
+            # waits, and "timeout" is only the first of them: the TCP
+            # handshake, then the SSH banner, then authentication. A host
+            # that accepts a connection and then says nothing hangs on the
+            # second or third regardless of the first.
             "timeout": self.connect_timeout,
+            "banner_timeout": self.connect_timeout,
+            "auth_timeout": self.connect_timeout,
         }
         if self.private_key_path:
             connect_kwargs["key_filename"] = self.private_key_path
@@ -660,8 +691,20 @@ class SftpRelayStorage:
         if self.password:
             connect_kwargs["password"] = self.password
         client.connect(**connect_kwargs)
+        transport = client.get_transport()
+        if transport is not None and self.keepalive_seconds > 0:
+            # Makes a silent peer surface as a dead transport instead of an
+            # open socket nobody is answering.
+            transport.set_keepalive(int(self.keepalive_seconds))
+        sftp = client.open_sftp()
+        channel = sftp.get_channel()
+        if channel is not None and self.operation_timeout > 0:
+            # Bounds each read on the channel, not the operation as a whole,
+            # so a large blob still transfers for as long as data keeps
+            # arriving - it is silence that is refused, not slowness.
+            channel.settimeout(self.operation_timeout)
         self._client = client
-        self._sftp = client.open_sftp()
+        self._sftp = sftp
 
     def _reset_connection(self) -> None:
         try:
