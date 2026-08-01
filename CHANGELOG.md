@@ -1,5 +1,25 @@
 # Changelog
 
+## 0.1.7
+
+- **Fixed: an application page without the confirm modal never rendered.**
+  `shared.js` bound `confirmModalCancelBtn`'s handler at the top level, so a
+  page lacking that markup threw partway through the file: `SovereignUI` was
+  defined, `SovereignShell` was not, and any page calling into the shell
+  failed with an empty console and no visible cause. The binding is now
+  guarded, matching what `showToast` directly above it already did, and
+  `confirmAction()` raises a named error instead of a null `TypeError` when a
+  page asks to confirm without the markup to do it. Found in S-Flow, which
+  uses no confirmations and had therefore never displayed a process at all.
+  A test now fails on any top-level DOM access in `shared.js`, since carrying
+  a given element is an application's choice and Core must not make one an
+  unwritten requirement.
+- The optimistic agenda path recognises the `team` application id, following
+  S-Agreement's rename to S-Team.
+
+No public API or wire-format change; the release contract differs from 0.1.6
+only in its version.
+
 ## 0.1.6
 
 - Add a deliberately small shared UI kit for disclosures, entity badges and
