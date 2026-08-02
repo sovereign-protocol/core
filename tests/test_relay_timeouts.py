@@ -431,3 +431,47 @@ class PublishOnceCostTests(unittest.TestCase):
         logic = self.logic(due={"gone": None}, published={})
 
         self.assertEqual(logic._topics_with_unpublished_work(), [])
+
+
+class BlobPresenceCostTests(unittest.TestCase):
+    """Asking whether a blob is there must not fetch it.
+
+    presence asks this every poll cycle. Answering by downloading the bytes
+    is free on a local folder and ruinous over SFTP: one avatar became a
+    full re-download every few seconds - 30s of transfer per client in a
+    four-minute session, measured in a live trace.
+    """
+
+    def storage(self):
+        storage = SftpRelayStorage("host", "user", "/relay")
+        storage._sftp = object()
+        return storage
+
+    def test_has_blob_stats_rather_than_downloads(self):
+        storage = self.storage()
+        calls = []
+
+        class Sftp:
+            def stat(self, path):
+                calls.append(("stat", path))
+                return types.SimpleNamespace(st_mtime=1.0)
+
+            def open(self, *args, **kwargs):
+                raise AssertionError("has_blob must not read the bytes")
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            with patch.object(storage, "_sftp_client", lambda: Sftp()):
+                self.assertTrue(storage.has_blob("sha256:" + "ab" * 32))
+
+        self.assertEqual([kind for kind, _ in calls], ["stat"])
+
+    def test_a_missing_blob_is_reported_absent(self):
+        storage = self.storage()
+
+        class Sftp:
+            def stat(self, path):
+                raise FileNotFoundError(path)
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            with patch.object(storage, "_sftp_client", lambda: Sftp()):
+                self.assertFalse(storage.has_blob("sha256:" + "cd" * 32))

@@ -496,7 +496,19 @@ class SftpRelayStorage:
         return self._with_retry(operation)
 
     def has_blob(self, blob_id: str) -> bool:
-        return self.read_blob(blob_id) is not None
+        # A stat, not a download. Answering "is it there" by fetching the
+        # bytes is free on a local folder and ruinous over SFTP: presence
+        # asks this every poll cycle, which turned one avatar into a full
+        # re-download every few seconds - 30s of transfer per client in a
+        # four-minute session, measured.
+        #
+        # Blob ids are content addressed, so the name is the verification:
+        # a file at this path either hashes to this id or was written by
+        # something that does not follow the scheme. read_blob still checks
+        # the bytes for callers that actually take them.
+        digest = blob_hex(blob_id)
+        path = posixpath.join(self.root, "blobs", digest[:2], digest)
+        return self._stat_mtime(path) is not None
 
     def list_blob_ids(self) -> list[str]:
         def operation(sftp):
