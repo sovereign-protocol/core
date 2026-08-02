@@ -315,7 +315,15 @@ function authoredPhrase(info, author) {
   const details = dedupe(
     changes.map((c) => c.authored_detail).filter(Boolean),
   );
-  const head = `${node} ${acts.join(" and ")} by ${author}`;
+  // A suffix belongs to the verb and follows the author directly; a detail
+  // is a list of what changed and sits behind a colon. "Card moved by me to
+  // Doing" reads, "Card moved by me: to Doing" does not.
+  const suffixes = dedupe(
+    changes.map((c) => c.authored_suffix).filter(Boolean),
+  );
+  const head = [
+    `${node} ${acts.join(" and ")} by ${author}`, ...suffixes,
+  ].join(" ");
   return details.length ? `${head}: ${details.join("; ")}` : head;
 }
 
@@ -337,92 +345,33 @@ function transitionActorLabel(info) {
   return safePeerLabel(info.peer_addr);
 }
 
-function eventChangeSummary(event, limit = 3) {
-  const summaries = (event?.changes || [])
-    .map((change) => change.summary)
-    .filter(Boolean);
-  if (summaries.length <= limit) return summaries.join("; ");
-  return `${summaries.slice(0, limit).join("; ")}; +${summaries.length - limit} more`;
-}
-
-function localChangeSummary(info, limit = 3) {
-  const summaries = dedupe(
-    (info?.events || [info])
-      .flatMap((event) => event?.changes || [])
-      .map((change) => change.local_summary)
-      .filter(Boolean),
-  );
-  if (summaries.length <= limit) return summaries.join("; ");
-  return `${summaries.slice(0, limit).join("; ")}; +${summaries.length - limit} more`;
-}
-
-function transitionChangeDetails(info) {
-  return (info.events || [info])
-    .filter((event) => event && event.type !== "in_agreement")
-    .map((event) => {
-      const summary = eventChangeSummary(event, 6);
-      if (!summary) return "";
-      return `${transitionActorLabel(event)}: ${summary}`;
-    })
-    .filter(Boolean)
-    .join("\n");
-}
-
 // A difference still in flight reads the same whatever its relation is: the
-// peer has not had the chance to answer yet, so there is nothing to say about
-// the two versions beyond that. Everything else is named by what they are.
+// peer has not had the chance to answer yet. Only reached when a change
+// carries no describable act - otherwise the sentence names the act instead.
 function transitionKey(event) {
   return event?.stage === "in_flight" ? "in_flight" : event?.type;
 }
 
-const TRANSITION_LABELS = {
-  divergence: "Diverged from",
-  peer_made_changes: "Changes from",
-  local_missing_node: "Only in",
-  local_made_changes: "My changes not in",
-  peer_missing_node: "Missing in",
-  in_flight: "Waiting for",
-};
-
-function groupedTransitionLabel(events) {
-  const order = [
-    "divergence",
-    "peer_made_changes",
-    "local_missing_node",
-    "local_made_changes",
-    "peer_missing_node",
-    "in_flight",
-  ];
-  return order
-    .filter((key) => events.some((event) => transitionKey(event) === key))
-    .map((key) => {
-      const peers = events
-        .filter((event) => transitionKey(event) === key)
-        .map((event) => transitionActorLabel(event));
-      return `${TRANSITION_LABELS[key]} ${dedupe(peers).join(", ")}`;
-    })
-    .join("; ");
+// Where a difference stands, written from the reader's own position. Both
+// screens describe one fact, each naming its own obligation: the author is
+// told nobody has answered yet, the recipient that the decision is theirs.
+function transitionStanding(info) {
+  const peer = transitionActorLabel(info);
+  return {
+    in_flight: `not yet seen by ${peer}`,
+    awaiting_peer: `not yet adopted by ${peer}`,
+    awaiting_me: "not yet adopted by me",
+    conflict: `also changed by ${peer}`,
+  }[info?.stage] || "";
 }
 
-function transitionLabel(info) {
-  const events = (info.events || [info]).filter((event) => event.type !== "in_agreement");
-  const details = transitionChangeDetails(info);
-  if (events.length > 1) {
-    const grouped = groupedTransitionLabel(events);
-    return details ? `${grouped}\n${details}` : grouped;
-  }
-  const peer = transitionActorLabel(info);
-  // Say what happened and who did it. Only a genuinely two-sided conflict
-  // is described as a divergence; anything else is one person's change,
-  // and naming its author is more use than naming the relation.
+// One difference as one sentence: what happened, who did it, where it stands.
+function transitionSentence(info) {
+  const standing = transitionStanding(info);
   const authored = authoredPhrase(info, transitionAuthorLabel(info));
-  if (authored && info.stage !== "conflict") {
-    const label = info.stage === "in_flight"
-      ? `${authored} - not seen by ${peer} yet`
-      : authored;
-    return details ? `${label}\n${details}` : label;
-  }
-  const labels = {
+  if (authored) return standing ? `${authored}, ${standing}` : authored;
+  const peer = transitionActorLabel(info);
+  const fallback = {
     in_agreement: "In agreement",
     peer_made_changes: `Changes from ${peer}`,
     local_made_changes: `My changes not in ${peer}`,
@@ -430,9 +379,34 @@ function transitionLabel(info) {
     peer_missing_node: `Missing in ${peer}`,
     divergence: `Diverged from ${peer}`,
     in_flight: `Waiting for ${peer} to process this change`,
-  };
-  const label = labels[transitionKey(info)] || "Difference";
-  return details ? `${label}\n${details}` : label;
+  }[transitionKey(info)] || "Difference";
+  return standing ? `${fallback}, ${standing}` : fallback;
+}
+
+function transitionLabel(info) {
+  const events = (info.events || [info]).filter(
+    (event) => event.stage !== "settled",
+  );
+  // Deliberately no second, peer-relative line. Saying "Card created by me"
+  // and then "B: card exists only in your version" states one fact twice,
+  // the second time from the far end - which is what made the old tooltips
+  // read as though the peer had done something.
+  if (events.length > 1) {
+    return dedupe(events.map(transitionSentence)).join("\n");
+  }
+  return transitionSentence(info);
+}
+
+// The same act named for a button. Rollback is offered to the author and
+// adopt to whoever has to decide, so each is phrased from that side.
+function transitionReactionLabel(event) {
+  const changes = event?.changes || [];
+  const nouns = dedupe(changes.map((c) => c.authored_noun).filter(Boolean));
+  const node = changes.find((c) => c.node_label)?.node_label || "item";
+  const what = `${node.toLowerCase()} ${nouns.join(" and ") || "change"}`;
+  return event?.reaction === "rollback"
+    ? `Take back my ${what}`
+    : `Adopt ${what} from ${transitionAuthorLabel(event)}`;
 }
 
 /*
