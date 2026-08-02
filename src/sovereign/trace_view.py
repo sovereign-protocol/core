@@ -64,7 +64,6 @@ def format_record(record: dict) -> str:
         "phase",
         "duration_ms",
         "next_poll_ms",
-        "acknowledgement_wait_ms",
     ):
         if record.get(key) is not None:
             parts.append(f"{key}={record[key]}")

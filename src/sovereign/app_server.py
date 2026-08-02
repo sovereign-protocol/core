@@ -619,15 +619,25 @@ def _advance_poll_deadline(scheduled_for: float | None,
                            cycle_started: float,
                            interval_seconds: float,
                            now: float) -> float:
-    """Advance a fixed polling cadence, skipping slots consumed by slow I/O."""
+    """Advance a fixed polling cadence without idling for a whole slot.
+
+    Rounding a missed deadline up to the next whole slot turned a cycle that
+    overran its interval by a fraction into one that ran at half the rate: a
+    client whose cycle took 3.33s against a 3s interval polled every 6.00s,
+    measured, and every propagation through it paid that. There is no gradual
+    degradation to observe on the way there - one millisecond over the
+    interval doubles the period.
+
+    So a deadline already in the past becomes now: the cadence still cannot
+    run faster than the interval, but work that overruns it is followed by
+    the next cycle rather than by a wait for the remainder of a slot nobody
+    is keeping time with.
+    """
     interval = max(0.05, float(interval_seconds))
     deadline = (
         scheduled_for if scheduled_for is not None else cycle_started
     ) + interval
-    if deadline <= now:
-        missed = int((now - deadline) // interval) + 1
-        deadline += missed * interval
-    return deadline
+    return max(deadline, now)
 
 
 async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool:
@@ -748,6 +758,46 @@ async def channel_poll_tick(runtime: AppRuntime, due_only: bool = False) -> bool
     return changed
 
 
+async def channel_publish_tick(runtime: AppRuntime) -> bool:
+    """Push local work out without waiting for an inbound poll.
+
+    A cycle publishes last, so a local edit woke the loop and then queued
+    behind a heartbeat write and a full poll before it could leave. Inbound
+    state is not what the edit is waiting for, and the regular cadence is
+    still the only thing that reads it - this only shortens the way out.
+
+    Endpoints that cannot publish on their own fall back to a full cycle, so
+    a channel predating this keeps working exactly as before.
+    """
+    endpoints = [
+        endpoint for endpoint in runtime.channel_manager.polling_endpoints()
+        if endpoint.has_active_relationship()
+    ]
+    if not endpoints:
+        return False
+
+    async def run(endpoint):
+        publish = getattr(endpoint, "publish_once", None)
+        if publish is None:
+            return None
+        try:
+            return await asyncio.to_thread(publish)
+        except Exception as exc:
+            print(f"[channel] publish failed: {exc}", flush=True)
+            return None
+
+    results = await asyncio.gather(*(run(endpoint) for endpoint in endpoints))
+    if any(result is None for result in results):
+        # At least one endpoint has no publish-only path; a full cycle is the
+        # only way to serve it, and it publishes for the others too.
+        return await channel_poll_tick(runtime, due_only=False)
+    changed = any(result.changed for result in results if result)
+    if changed:
+        runtime.session.advance_view_revision()
+        runtime.persist_confirmed_change("channel")
+    return changed
+
+
 async def channel_poll_loop(runtime: AppRuntime) -> None:
     # Polling channels are always Core services. With no active relationship,
     # this loop remains idle without relying on application discovery.
@@ -773,7 +823,12 @@ async def channel_poll_loop(runtime: AppRuntime) -> None:
             runtime.channel_wakeup.clear()
         except asyncio.TimeoutError:
             pass
-        await channel_poll_tick(runtime, due_only=not woke_for_change)
+        if woke_for_change:
+            # A local edit only needs the way out. Polling stays on its own
+            # cadence rather than being pulled forward by every keystroke.
+            await channel_publish_tick(runtime)
+        else:
+            await channel_poll_tick(runtime, due_only=True)
 
 
 def main(

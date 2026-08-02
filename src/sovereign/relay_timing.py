@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import math
 import statistics
 import threading
 import time
@@ -23,7 +22,6 @@ class RelayTiming:
         self._offset_samples = deque(maxlen=30)
         self._roundtrip_samples = deque(maxlen=30)
         self._cycle_samples = deque(maxlen=30)
-        self._peer_presence: dict[str, tuple[float, float]] = {}
         self._last_probe_monotonic: float | None = None
         self._lock = threading.RLock()
 
@@ -61,17 +59,6 @@ class RelayTiming:
         with self._lock:
             self._cycle_samples.append(max(0.0, float(duration_seconds)))
 
-    def observe_peer_presence(
-        self, peer_id: str, server_mtime: float | None,
-        poll_interval_seconds: float,
-    ) -> None:
-        if not peer_id or server_mtime is None:
-            return
-        with self._lock:
-            self._peer_presence[peer_id] = (
-                float(server_mtime), max(0.1, float(poll_interval_seconds)),
-            )
-
     def probe_due(self, now_monotonic: float | None = None) -> bool:
         now_monotonic = (
             time.monotonic() if now_monotonic is None else now_monotonic
@@ -88,7 +75,6 @@ class RelayTiming:
             offsets = list(self._offset_samples)
             roundtrips = list(self._roundtrip_samples)
             cycles = list(self._cycle_samples)
-            peers = dict(self._peer_presence)
         offset = (
             statistics.median(value for value, _ in offsets)
             if offsets else None
@@ -104,7 +90,6 @@ class RelayTiming:
             "roundtrip_jitter": self._spread(roundtrips),
             "relay_cycle": statistics.median(cycles) if cycles else None,
             "cycle_jitter": self._spread(cycles),
-            "peers": peers,
             "sample_count": len(roundtrips),
             "cycle_sample_count": len(cycles),
         }
@@ -116,50 +101,6 @@ class RelayTiming:
         return (
             time.time() if local_wall is None else local_wall
         ) + summary["offset"]
-
-    def response_check_delay(
-        self, stable_interval_seconds: float,
-        published_server_time: float | None = None,
-        local_wall: float | None = None,
-    ) -> float:
-        stable = max(0.1, float(stable_interval_seconds))
-        summary = self._summary()
-        if summary["offset"] is None or not summary["peers"]:
-            return stable
-        server_now = (
-            time.time() if local_wall is None else local_wall
-        ) + summary["offset"]
-        published_at = (
-            server_now if published_server_time is None
-            else published_server_time
-        )
-        jitter = max(summary["roundtrip_jitter"], summary["cycle_jitter"])
-        relay_work = max(
-            summary["roundtrip"] or 0.0,
-            summary["relay_cycle"] or 0.0,
-            0.05,
-        )
-        response_margin = relay_work + jitter + summary["uncertainty"]
-        candidates = []
-        for peer_mtime, peer_interval in summary["peers"].values():
-            age = server_now - peer_mtime
-            stale_after = PRESENCE_LIVENESS_MARGIN * (
-                stable + peer_interval
-            )
-            if age > stale_after:
-                continue
-            if peer_mtime >= published_at - summary["uncertainty"]:
-                peer_poll = peer_mtime
-            else:
-                periods = max(
-                    1,
-                    math.ceil((published_at - peer_mtime) / peer_interval),
-                )
-                peer_poll = peer_mtime + periods * peer_interval
-            candidates.append(
-                max(0.05, peer_poll + response_margin - server_now),
-            )
-        return min(candidates) if candidates else stable
 
     def status_payload(self) -> dict:
         summary = self._summary()

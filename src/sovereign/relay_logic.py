@@ -207,11 +207,13 @@ class RelayLogic:
             adopted_descriptor = self.session.component_metadata("relay").get(
                 "relay_adopted_storage_descriptor",
             )
-            self.storage = self._storage_from_descriptor(adopted_descriptor)
+            self.storage = self._storage_from_descriptor(
+                adopted_descriptor, config,
+            )
+        self._report_transport_events()
         self.timing = RelayTiming(
             getattr(self.storage, "mtime_resolution_seconds", 1.0),
         )
-        self._last_publish_server_time: float | None = None
         self.poll_interval_seconds = self._normalize_poll_interval(
             config.get(
                 "relay_poll_interval_seconds",
@@ -326,9 +328,19 @@ class RelayLogic:
         root = config.get("relay_root")
         return LocalFolderRelayStorage(root) if root else None
 
+    def _report_transport_events(self) -> None:
+        """Let the storage backend trace link faults it silently absorbs."""
+        if hasattr(self.storage, "on_event"):
+            self.storage.on_event = lambda kind, **fields: (
+                self.session.trace_event(
+                    kind, relay_identity=self.identity, **fields,
+                )
+            )
+
     @staticmethod
     def _storage_from_descriptor(
         descriptor: dict | None,
+        config: dict | None = None,
     ) -> RelayStorage | None:
         # Mirror of _build_storage, but reading a token's channel
         # descriptor instead of the flat local config - this is how a pure
@@ -346,12 +358,19 @@ class RelayLogic:
                 return None
             if "://" in host:
                 host = host.split("://", 1)[1]
+            # The accepter side is the one most likely to be on a poor link,
+            # and it used to be the one side that could not bound its waits:
+            # this path took the constructor defaults with no way to override
+            # them, while _build_storage honoured the same three settings.
             return SftpRelayStorage(
                 host=host,
                 port=int(descriptor.get("port", 22)),
                 username=descriptor.get("username"),
                 remote_root=descriptor.get("root", "/"),
                 password=descriptor.get("password"),
+                **RelayLogic._sftp_timeouts({
+                    **(descriptor or {}), **(config or {}),
+                }),
             )
         return None
 
@@ -396,7 +415,6 @@ class RelayLogic:
         self.timing = RelayTiming(
             getattr(self.storage, "mtime_resolution_seconds", 1.0),
         )
-        self._last_publish_server_time = None
         if descriptor:
             # A token-provisioned accepter has no local relay config to load
             # on its next start. Keep the accepted descriptor with the
@@ -617,6 +635,13 @@ class RelayLogic:
         # bootstrap even when this is not the identity's home channel.
         if self.blob_store is not None:
             for blob_id in sorted(referenced_blob_ids(profile)):
+                # Blobs are content addressed, so one already on the relay is
+                # by definition the right bytes. Without this check presence -
+                # which runs every poll cycle, forever - re-uploaded the whole
+                # avatar every few seconds; publish_due_topics has always
+                # guarded its blob writes the same way.
+                if self.storage.has_blob(blob_id):
+                    continue
                 data = self.blob_store.read_blob(blob_id)
                 if data is not None:
                     self.storage.write_blob(blob_id, data)
@@ -675,13 +700,6 @@ class RelayLogic:
     @_relay_io_locked
     def record_cycle_duration(self, duration_seconds: float) -> None:
         self.timing.observe_cycle(duration_seconds)
-
-    @_relay_io_locked
-    def response_check_delay(self) -> float:
-        return self.timing.response_check_delay(
-            self.poll_interval_seconds,
-            self._last_publish_server_time,
-        )
 
     def polling_diagnostics(self) -> dict[str, Any]:
         """Stable diagnostics exposed through the polling endpoint contract."""
@@ -763,7 +781,6 @@ class RelayLogic:
         published_before = []
         published_after = []
         applied = []
-        acknowledgement_wait = None
         try:
             phase("calibrate_timing", self.calibrate_timing_if_due)
             work_started = time.monotonic()
@@ -782,10 +799,6 @@ class RelayLogic:
             )
             work_duration = time.monotonic() - work_started
             self.record_cycle_duration(work_duration)
-            if published_before or published_after:
-                acknowledgement_wait = max(
-                    0.05, float(self.response_check_delay()),
-                )
         except Exception as exc:
             duration = time.monotonic() - total_started
             trace(
@@ -818,7 +831,6 @@ class RelayLogic:
             applied=tuple(applied or ()),
             duration_seconds=duration,
             work_duration_seconds=work_duration,
-            acknowledgement_wait_seconds=acknowledgement_wait,
         )
         trace(
             "relay.cycle_done",
@@ -830,12 +842,62 @@ class RelayLogic:
             published_before=list(result.published_before),
             published_after=list(result.published_after),
             applied_topics=list(result.applied),
-            acknowledgement_wait_ms=(
-                round(acknowledgement_wait * 1000, 1)
-                if acknowledgement_wait is not None else None
-            ),
         )
         return result
+
+    def publish_once(self) -> PollCycleResult:
+        """Send local work without first draining the inbound side.
+
+        A local edit otherwise waits for a heartbeat write and a whole
+        inbound poll before it can leave, because a cycle publishes last:
+        measured, that put a floor of about 1.5s on every change, of which
+        roughly 1.3s was inbound work the edit does not depend on.
+
+        The ordering being skipped exists for one reason - a sibling sharing
+        this publication identity may have written work we have not seen, and
+        publishing over it would destroy exactly the state the person is
+        about to be asked about. So that check is made here directly, one
+        head read per topic, instead of by running a full poll cycle for it.
+        """
+        cycle_id = uuid_mod.uuid4().hex[:12]
+        started = time.monotonic()
+        published: list[str] = []
+        try:
+            for topic_uuid in self.relay_topic_uuids():
+                self._reconcile_sibling_publication(topic_uuid)
+            published = self.publish_due_topics()
+        except Exception as exc:
+            duration = time.monotonic() - started
+            self.session.trace_event(
+                "relay.publish_only_done",
+                relay_identity=self.identity,
+                cycle_id=cycle_id,
+                duration_ms=round(duration * 1000, 1),
+                ok=False,
+                error_type=type(exc).__name__,
+                error=str(exc),
+            )
+            return PollCycleResult(
+                ok=False, changed=False, duration_seconds=duration,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+        duration = time.monotonic() - started
+        self.session.trace_event(
+            "relay.publish_only_done",
+            trace_level="timing",
+            relay_identity=self.identity,
+            cycle_id=cycle_id,
+            duration_ms=round(duration * 1000, 1),
+            ok=True,
+            published_topics=list(published),
+        )
+        return PollCycleResult(
+            ok=True,
+            changed=bool(published),
+            published_before=tuple(published),
+            duration_seconds=duration,
+            work_duration_seconds=duration,
+        )
 
     @_relay_io_locked
     def known_peer_identities(self) -> list[str]:
@@ -1277,7 +1339,6 @@ class RelayLogic:
                 observed_publications=observed_publications,
             )
         if published:
-            self._last_publish_server_time = self.timing.server_now()
             self._save_state()
         return published
 
@@ -1445,11 +1506,6 @@ class RelayLogic:
                     continue
                 peer_addr = f"relay:{peer_id}"
                 presence, _mtime = read_presence(peer_id)
-                peer_interval = float(
-                    (presence or {}).get("poll_interval_seconds")
-                    or self.poll_interval_seconds
-                )
-                self.timing.observe_peer_presence(peer_id, _mtime, peer_interval)
                 profile = (presence or {}).get("profile")
                 if isinstance(profile, dict):
                     with self._session_lock:
@@ -2097,6 +2153,19 @@ class RelayManager:
                 "relay_poll_interval_seconds": record.get("poll_interval_seconds", 3),
                 "relay_blob_lease_seconds": self.config.get("relay_blob_lease_seconds", 300),
             }
+            # Named targets build their connection from a record, not from the
+            # flat config, so without this the wait bounds were unreachable
+            # for every target-based relay - configured or not, the defaults
+            # applied. A target may also carry its own, since the right value
+            # depends on the link rather than on the client.
+            for name in (
+                "relay_sftp_connect_timeout",
+                "relay_sftp_operation_timeout",
+                "relay_sftp_keepalive_seconds",
+            ):
+                value = record.get(name, self.config.get(name))
+                if value is not None:
+                    connection_config[name] = value
             state_directory = self.config.get("relay_state_directory")
             if state_directory:
                 safe_fingerprint = hashlib.sha256(fingerprint.encode("utf-8")).hexdigest()[:12]

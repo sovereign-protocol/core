@@ -143,7 +143,6 @@ class PollCycleResult:
     applied: tuple[Any, ...] = ()
     duration_seconds: float = 0.0
     work_duration_seconds: float = 0.0
-    acknowledgement_wait_seconds: float | None = None
     error: str | None = None
 
 

@@ -178,6 +178,130 @@ class SftpTimeoutTests(unittest.TestCase):
 
         self.assertEqual(storage.operation_timeout, 45.0)
 
+    def test_an_adopted_descriptor_is_bounded_like_a_configured_relay(self):
+        # The accepter side - a client that rode somebody else's connect
+        # token - is the one most likely to be on a poor link, and was the
+        # one side that could not bound its waits: this path took the
+        # constructor defaults and no setting could reach it.
+        descriptor = {
+            "type": "sftp", "host": "relay.example",
+            "username": "user", "root": "/relay",
+        }
+
+        self.assertEqual(
+            RelayLogic._storage_from_descriptor(
+                descriptor, {"relay_sftp_operation_timeout": 5},
+            ).operation_timeout,
+            5.0,
+        )
+        # A descriptor may also carry its own, since the right value is a
+        # property of the link rather than of the client reaching it.
+        self.assertEqual(
+            RelayLogic._storage_from_descriptor(
+                {**descriptor, "relay_sftp_operation_timeout": 4},
+            ).operation_timeout,
+            4.0,
+        )
+
+    def test_a_dropped_connection_is_reported_not_just_absorbed(self):
+        # _with_retry reconnects and retries, so the phase above still reports
+        # ok=True and the only remaining trace of a reconnect is an
+        # unexplained spike in that phase's duration. Sessions were diagnosed
+        # by eyeballing duration outliers because of this.
+        storage = SftpRelayStorage("host", "user", "/relay")
+        storage._sftp = object()
+        events = []
+        storage.on_event = lambda kind, **fields: events.append((kind, fields))
+        attempts = []
+
+        def operation(_sftp):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("[Errno 10054] connection reset by peer")
+            return "second attempt"
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            with patch.object(storage, "_connect") as connect:
+                connect.side_effect = lambda: setattr(
+                    storage, "_sftp", object(),
+                )
+                self.assertEqual(storage._with_retry(operation), "second attempt")
+
+        self.assertEqual([kind for kind, _ in events], ["relay.sftp_reconnect"])
+        self.assertEqual(events[0][1]["error_type"], "OSError")
+        self.assertGreaterEqual(events[0][1]["reconnect_ms"], 0)
+
+    def test_a_healthy_call_reports_no_fault(self):
+        # Otherwise the event says "the link is busy", not "the link broke".
+        storage = SftpRelayStorage("host", "user", "/relay")
+        storage._sftp = object()
+        events = []
+        storage.on_event = lambda kind, **fields: events.append((kind, fields))
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            storage._with_retry(lambda _sftp: "fine")
+
+        self.assertNotIn(
+            "relay.sftp_reconnect", [kind for kind, _ in events],
+        )
+
+    def test_each_operation_reports_what_it_cost(self):
+        # Phase timings aggregate several round trips, so two clients on the
+        # same relay differed 4x in one phase with no way to tell a slow link
+        # from extra round trips. Kept at timing level: this fires on every
+        # relay operation, which is noise in an ordinary event trace.
+        storage = SftpRelayStorage("host", "user", "/relay")
+        storage._sftp = object()
+        events = []
+        storage.on_event = lambda kind, **fields: events.append((kind, fields))
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            storage._with_retry(lambda _sftp: "fine", name="read_head")
+
+        self.assertEqual([kind for kind, _ in events], ["relay.sftp_operation"])
+        self.assertEqual(events[0][1]["operation"], "read_head")
+        self.assertEqual(events[0][1]["trace_level"], "timing")
+        self.assertGreaterEqual(events[0][1]["duration_ms"], 0)
+
+    def test_an_unnamed_operation_is_labelled_by_its_caller(self):
+        # Every caller names its inner closure `operation`, so the label has
+        # to come from the method that built it or it says nothing.
+        storage = SftpRelayStorage("host", "user", "/relay")
+        storage._sftp = object()
+        events = []
+        storage.on_event = lambda kind, **fields: events.append(fields)
+
+        def read_presence_with_mtime():
+            return storage._with_retry(lambda _sftp: "fine")
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            read_presence_with_mtime()
+
+        self.assertEqual(events[0]["operation"], "read_presence_with_mtime")
+
+    def test_reporting_a_fault_cannot_cause_one(self):
+        storage = SftpRelayStorage("host", "user", "/relay")
+        storage._sftp = object()
+
+        def exploding(_kind, **_fields):
+            raise RuntimeError("tracing is down")
+
+        storage.on_event = exploding
+        attempts = []
+
+        def operation(_sftp):
+            attempts.append(1)
+            if len(attempts) == 1:
+                raise OSError("dropped")
+            return "second attempt"
+
+        with patch.dict(sys.modules, {"paramiko": _Paramiko()}):
+            with patch.object(storage, "_connect") as connect:
+                connect.side_effect = lambda: setattr(
+                    storage, "_sftp", object(),
+                )
+                self.assertEqual(storage._with_retry(operation), "second attempt")
+
 
 class LivenessIsNotBlockedByTheRelayTests(unittest.TestCase):
     """peer_liveness answers from cache, so a stuck poller cannot reach it.

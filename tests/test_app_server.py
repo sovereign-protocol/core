@@ -955,7 +955,9 @@ class AppServerTests(unittest.TestCase):
         self.assertGreaterEqual(scheduled, started + 2.9)
         self.assertLessEqual(scheduled, started + 3.1)
 
-    def test_poll_deadline_advances_from_cadence_and_skips_missed_slots(self):
+    def test_poll_deadline_advances_from_the_cadence_not_from_completion(self):
+        # A cycle that finishes inside its slot keeps the fixed cadence, so
+        # polling does not drift later and later by however long the work took.
         self.assertEqual(
             app_server._advance_poll_deadline(None, 10.0, 3.0, 11.0),
             13.0,
@@ -966,11 +968,31 @@ class AppServerTests(unittest.TestCase):
             ),
             13.0,
         )
+
+    def test_a_cycle_that_overruns_its_slot_does_not_halve_the_poll_rate(self):
+        # Rounding a missed deadline up to the next whole slot meant a cycle
+        # overrunning its interval by a fraction polled at half the rate: a
+        # measured 3.33s cycle against a 3s interval ran every 6.00s, and
+        # every propagation through that client paid it. Overrunning work is
+        # followed by the next cycle, not by the rest of an empty slot.
+        self.assertEqual(
+            app_server._advance_poll_deadline(
+                10.0, 10.0, 3.0, 13.33,
+            ),
+            13.33,
+        )
+        # Still never faster than the interval when there is time to spare.
         self.assertEqual(
             app_server._advance_poll_deadline(
                 10.0, 10.2, 3.0, 13.5,
             ),
-            16.0,
+            13.5,
+        )
+        self.assertEqual(
+            app_server._advance_poll_deadline(
+                10.0, 10.2, 3.0, 11.0,
+            ),
+            13.0,
         )
 
     def test_early_local_wake_keeps_existing_response_deadline(self):
@@ -1662,3 +1684,102 @@ class AppServerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ChannelPublishTickTests(unittest.TestCase):
+    """A local edit only needs the way out, not a full cycle.
+
+    A cycle publishes last, so an edit that woke the loop queued behind a
+    heartbeat write and an inbound poll before it could leave - measured at a
+    floor of roughly 1.5s per change, of which about 1.3s was inbound work the
+    edit did not depend on.
+    """
+
+    def runtime(self, connections):
+        return types.SimpleNamespace(
+            config={}, session=Session("local"),
+            channel_manager=_FakeRelayManager(connections),
+            host=None,
+            persist_confirmed_change=lambda kind=None: None,
+        )
+
+    def test_a_local_edit_publishes_without_polling_first(self):
+        class Relay:
+            poll_interval_seconds = 3
+
+            def __init__(self):
+                self.polled = 0
+                self.published = 0
+
+            def has_active_relationship(self):
+                return True
+
+            def poll_once(self, after_apply=None):
+                self.polled += 1
+                return PollCycleResult(ok=True, changed=False)
+
+            def publish_once(self):
+                self.published += 1
+                return PollCycleResult(
+                    ok=True, changed=True, published_before=("topic-1",),
+                )
+
+            def polling_diagnostics(self):
+                return {"identity": "fake"}
+
+        relay = Relay()
+
+        self.assertTrue(
+            asyncio.run(app_server.channel_publish_tick(self.runtime([relay]))),
+        )
+        self.assertEqual(relay.published, 1)
+        self.assertEqual(
+            relay.polled, 0,
+            "the inbound poll is not what a local edit is waiting for",
+        )
+
+    def test_an_endpoint_without_a_publish_path_still_gets_a_full_cycle(self):
+        # A channel predating publish_once must keep working exactly as
+        # before rather than silently never publishing again.
+        class OldRelay:
+            poll_interval_seconds = 3
+
+            def __init__(self):
+                self.polled = 0
+
+            def has_active_relationship(self):
+                return True
+
+            def poll_once(self, after_apply=None):
+                self.polled += 1
+                return PollCycleResult(ok=True, changed=False)
+
+            def polling_diagnostics(self):
+                return {"identity": "old"}
+
+        relay = OldRelay()
+        runtime = self.runtime([relay])
+
+        asyncio.run(app_server.channel_publish_tick(runtime))
+
+        self.assertEqual(relay.polled, 1)
+
+    def test_nothing_to_publish_reports_no_change(self):
+        class Quiet:
+            poll_interval_seconds = 3
+
+            def has_active_relationship(self):
+                return True
+
+            def poll_once(self, after_apply=None):
+                raise AssertionError("must not poll")
+
+            def publish_once(self):
+                return PollCycleResult(ok=True, changed=False)
+
+            def polling_diagnostics(self):
+                return {"identity": "quiet"}
+
+        self.assertFalse(
+            asyncio.run(app_server.channel_publish_tick(self.runtime([Quiet()]))),
+        )

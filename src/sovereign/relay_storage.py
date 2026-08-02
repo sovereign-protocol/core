@@ -11,7 +11,7 @@ Offered API:
   LocalFolderRelayStorage(root)
   SftpRelayStorage(host, username, remote_root, port=22, password=None,
                    private_key_path=None, private_key_passphrase=None,
-                   connect_timeout=10.0, operation_timeout=30.0,
+                   connect_timeout=10.0, operation_timeout=10.0,
                    keepalive_seconds=15.0)
     Every wait is bounded: connect_timeout covers the TCP handshake, the
     SSH banner and authentication; operation_timeout bounds each read on
@@ -19,6 +19,13 @@ Offered API:
     rather than be waited on. A connection that dies after it is
     established is the case that matters - paramiko's own timeout does
     not cover it, and an unbounded read stalls the whole poll cycle.
+
+    operation_timeout bounds *silence*, not slowness: a large blob keeps
+    transferring for as long as data keeps arriving. Ten seconds is
+    therefore already generous against a relay whose normal round trip is
+    a few hundred milliseconds, and it caps one dropped operation at
+    roughly two timeouts rather than the minute the old default allowed.
+    Raise it with relay_sftp_operation_timeout for a genuinely slow link.
     Both satisfy RelayStorage, including:
     write_snapshot(topic_uuid, peer_id, state_hash, payload)
     read_head(topic_uuid, peer_id) -> dict | None
@@ -75,6 +82,7 @@ import json
 import os
 import posixpath
 import stat
+import sys
 import threading
 import time
 import uuid as uuid_mod
@@ -342,7 +350,7 @@ class SftpRelayStorage:
                 private_key_path: str | None = None,
                 private_key_passphrase: str | None = None,
                 connect_timeout: float = 10.0,
-                operation_timeout: float = 30.0,
+                operation_timeout: float = 10.0,
                 keepalive_seconds: float = 15.0):
         self.host = host
         self.port = port
@@ -368,6 +376,10 @@ class SftpRelayStorage:
         self.root = remote_root.rstrip("/") or "/"
         self._client = None
         self._sftp = None
+        # Optional callback(kind, **fields) for transport events worth
+        # reporting - set by whoever builds this, left None in tests and for
+        # any caller that does not care.
+        self.on_event = None
         # Paramiko's SFTP client/channel is not safe for concurrent use.
         # Relay polling and diagnostic/API reads can run in different worker
         # threads, so every operation on this shared connection is serialized.
@@ -601,9 +613,29 @@ class SftpRelayStorage:
         sftp.rmdir(path)
 
     def write_presence(self, peer_id: str, payload: dict) -> float | None:
+        # One round trip fewer than write-then-stat, and it runs every poll
+        # cycle on every client, so the saving is per cycle rather than per
+        # change. The mtime must come from the same visit as the write in
+        # any case: it is this client's reference point for "what does the
+        # server think now", and a separate call could read a newer one
+        # written by a sibling in between.
         path = self._presence_path(peer_id)
-        self._write_json(path, payload)
-        return self._stat_mtime(path)
+        payload_bytes = (
+            json.dumps(payload, sort_keys=True, indent=2) + "\n"
+        ).encode("utf-8")
+        tmp_path = f"{path}.{uuid_mod.uuid4().hex}.tmp"
+
+        def operation(sftp):
+            self._mkdir_p(sftp, posixpath.dirname(path))
+            with sftp.open(tmp_path, "wb") as handle:
+                handle.write(payload_bytes)
+            self._atomic_rename(sftp, tmp_path, path)
+            try:
+                return sftp.stat(path).st_mtime
+            except FileNotFoundError:
+                return None
+
+        return self._with_retry(operation)
 
     def read_presence_with_mtime(self, peer_id: str) -> tuple[dict | None, float | None]:
         path = self._presence_path(peer_id)
@@ -720,18 +752,63 @@ class SftpRelayStorage:
         self._client = None
         self._sftp = None
 
-    def _with_retry(self, operation):
+    def _with_retry(self, operation, name: str | None = None):
         import paramiko
 
         with self._operation_lock:
+            started = time.monotonic()
             try:
-                return operation(self._sftp_client())
+                result = operation(self._sftp_client())
+                # Reported per operation because the phase timings above
+                # aggregate several of these, and two clients talking to the
+                # same relay were observed 4x apart in one phase with no way
+                # to tell a slow link from extra round trips.
+                self._emit(
+                    "relay.sftp_operation",
+                    trace_level="timing",
+                    # Every caller names its inner closure `operation`, so the
+                    # useful label is the method that built it.
+                    operation=name or sys._getframe(1).f_code.co_name,
+                    duration_ms=round((time.monotonic() - started) * 1000, 1),
+                )
+                return result
             except paramiko.AuthenticationException:
                 self._reset_connection()
                 raise
-            except (OSError, paramiko.SSHException):
+            except (OSError, paramiko.SSHException) as exc:
+                # A dropped connection is absorbed here and the phase above
+                # still reports ok=True, so without this event a reconnect is
+                # visible only as an unexplained spike in a phase duration -
+                # which is how the cost had to be found the first time.
+                started = time.monotonic()
                 self._reset_connection()
-                return operation(self._sftp_client())
+                try:
+                    return operation(self._sftp_client())
+                finally:
+                    self._emit(
+                        "relay.sftp_reconnect",
+                        error_type=type(exc).__name__,
+                        error=str(exc),
+                        reconnect_ms=round(
+                            (time.monotonic() - started) * 1000, 1,
+                        ),
+                    )
+
+    def _emit(self, kind: str, **fields) -> None:
+        """Report a transport event, if anyone is listening.
+
+        A callback rather than a Session reference: storage is deliberately
+        ignorant of what is being synchronised, and a reconnect is a fact
+        about the link, not about any topic on it.
+        """
+        callback = self.on_event
+        if callback is None:
+            return
+        try:
+            callback(kind, **fields)
+        except Exception:
+            # Never let reporting a transport fault cause one.
+            pass
 
     def _write_json(self, path: str, data: dict) -> None:
         payload = (json.dumps(data, sort_keys=True, indent=2) + "\n").encode("utf-8")
