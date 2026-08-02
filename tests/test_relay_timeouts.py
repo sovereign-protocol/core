@@ -21,6 +21,7 @@ that only exist after a connection is established".
 """
 
 import sys
+import types
 import threading
 import unittest
 from unittest.mock import patch
@@ -374,3 +375,59 @@ class LivenessIsNotBlockedByTheRelayTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PublishOnceCostTests(unittest.TestCase):
+    """A local edit must not pay a relay round trip per idle topic.
+
+    publish_once skips the inbound poll so a change can leave quickly, and
+    checks for a sibling's unseen publication itself instead. Checking every
+    topic put one head read in front of every edit: measured at 2.5-3.4s of
+    reads before a 0.9s publish, which is worse than the ordering it avoids.
+    """
+
+    def logic(self, due, published):
+        logic = RelayLogic.__new__(RelayLogic)
+        logic.identity = "me"
+        logic._state = {
+            "published": published,
+            "published_observations": {},
+            "observed": {},
+            "observed_publications": {},
+        }
+        logic._session_lock = threading.RLock()
+        logic.session = types.SimpleNamespace(
+            node_state_hash=lambda uuid: due.get(uuid),
+        )
+        logic.relay_topic_uuids = lambda: sorted(due)
+        return logic
+
+    def test_only_topics_with_something_to_send_are_checked(self):
+        logic = self.logic(
+            due={"quiet": "hash-a", "changed": "hash-new"},
+            published={"quiet": "hash-a", "changed": "hash-old"},
+        )
+        logic._state["published_observations"] = {
+            "quiet": logic._observed_digest("quiet"),
+            "changed": logic._observed_digest("changed"),
+        }
+
+        self.assertEqual(logic._topics_with_unpublished_work(), ["changed"])
+
+    def test_a_topic_never_published_counts_as_work(self):
+        logic = self.logic(due={"fresh": "hash-a"}, published={})
+
+        self.assertEqual(logic._topics_with_unpublished_work(), ["fresh"])
+
+    def test_an_acknowledgement_alone_counts_as_work(self):
+        # Observations change without content changing, and that still has
+        # to reach the peer or it never learns its revision was seen.
+        logic = self.logic(due={"topic": "hash-a"}, published={"topic": "hash-a"})
+        logic._state["published_observations"] = {"topic": "stale-digest"}
+
+        self.assertEqual(logic._topics_with_unpublished_work(), ["topic"])
+
+    def test_a_topic_with_no_local_state_is_not_published(self):
+        logic = self.logic(due={"gone": None}, published={})
+
+        self.assertEqual(logic._topics_with_unpublished_work(), [])

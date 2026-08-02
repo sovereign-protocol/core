@@ -845,6 +845,46 @@ class RelayLogic:
         )
         return result
 
+    def _topics_with_unpublished_work(self) -> list[str]:
+        """Topics whose local state differs from what we last published.
+
+        Local comparison only - no relay round trip. It is deliberately the
+        cheap half of publish_due_topics' test: that method additionally
+        confirms the relay still holds our publication, which costs a read
+        per topic and exists to catch a wiped relay. Rechecking that before
+        every local edit would pay for a rare recovery case on the hot path,
+        and the next ordinary poll catches it anyway.
+        """
+        due = []
+        for topic_uuid in self.relay_topic_uuids():
+            with self._session_lock:
+                current_hash = self.session.node_state_hash(topic_uuid)
+            if current_hash is None:
+                continue
+            observed_digest = self._observed_digest(topic_uuid)
+            if (self._state["published"].get(topic_uuid) == current_hash
+                    and self._state["published_observations"].get(topic_uuid)
+                    == observed_digest):
+                continue
+            due.append(topic_uuid)
+        return due
+
+    def _observed_digest(self, topic_uuid: str) -> str:
+        observed = self._state.get("observed", {}).get(topic_uuid, {})
+        observed_publications = self._state.get(
+            "observed_publications", {},
+        ).get(topic_uuid, {})
+        return hashlib.sha256(
+            json.dumps(
+                {
+                    "node_revisions": observed,
+                    "publications": observed_publications,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        ).hexdigest()[:20]
+
     def publish_once(self) -> PollCycleResult:
         """Send local work without first draining the inbound side.
 
@@ -863,7 +903,11 @@ class RelayLogic:
         started = time.monotonic()
         published: list[str] = []
         try:
-            for topic_uuid in self.relay_topic_uuids():
+            # Only topics that actually have something to send. Checking
+            # every topic cost one head read each before a single byte went
+            # out - measured at 2.5-3.4s of reads in front of a 0.9s publish,
+            # which is worse than the ordering this exists to avoid.
+            for topic_uuid in self._topics_with_unpublished_work():
                 self._reconcile_sibling_publication(topic_uuid)
             published = self.publish_due_topics()
         except Exception as exc:
@@ -1229,16 +1273,7 @@ class RelayLogic:
             observed_publications = self._state.get(
                 "observed_publications", {},
             ).get(topic_uuid, {})
-            observed_digest = hashlib.sha256(
-                json.dumps(
-                    {
-                        "node_revisions": observed,
-                        "publications": observed_publications,
-                    },
-                    sort_keys=True,
-                    separators=(",", ":"),
-                ).encode("utf-8")
-            ).hexdigest()[:20]
+            observed_digest = self._observed_digest(topic_uuid)
             if (self._state["published"].get(topic_uuid) == current_hash
                     and self._state["published_observations"].get(topic_uuid)
                     == observed_digest
