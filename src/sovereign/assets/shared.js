@@ -365,9 +365,33 @@ function transitionStanding(info) {
   }[info?.stage] || "";
 }
 
+// A conflict is the one case with two authors, so it is the one case the
+// act clause cannot describe on its own: naming a single side then adding
+// "also changed by them" repeats that side and never mentions mine.
+function conflictPhrase(info) {
+  const changes = info?.changes || [];
+  const acts = dedupe(changes.map((c) => c.authored_act).filter(Boolean));
+  if (!acts.length) return "";
+  const node = changes.find((c) => c.node_label)?.node_label || "Item";
+  const join = (key) => {
+    const parts = dedupe(changes.map((c) => c[key]).filter(Boolean));
+    return parts.length ? ` ${parts.join(" ")}` : "";
+  };
+  // authored_suffix describes the peer's side here, because a divergence is
+  // not locally authored; counter_suffix is mine.
+  return (
+    `${node} ${acts.join(" and ")} by me${join("counter_suffix")}`
+    + `, and by ${transitionActorLabel(info)}${join("authored_suffix")}`
+  );
+}
+
 // One difference as one sentence: what happened, who did it, where it stands.
 function transitionSentence(info) {
   const standing = transitionStanding(info);
+  if (info?.stage === "conflict") {
+    const both = conflictPhrase(info);
+    if (both) return both;
+  }
   const authored = authoredPhrase(info, transitionAuthorLabel(info));
   if (authored) return standing ? `${authored}, ${standing}` : authored;
   const peer = transitionActorLabel(info);
