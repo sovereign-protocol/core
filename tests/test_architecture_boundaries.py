@@ -144,10 +144,28 @@ class ArchitectureBoundaryTests(unittest.TestCase):
         # Applications must read this ranking rather than copy it; each
         # application repository asserts that about its own source.
         priority = Session.TRANSITION_PRIORITY
+        stage = Session.STAGE_PRIORITY
 
         self.assertGreater(priority["divergence"], priority["peer_made_changes"])
-        self.assertGreater(priority["peer_made_changes"], priority["in_transition"])
+        self.assertGreater(
+            priority["peer_made_changes"], priority["local_made_changes"],
+        )
         self.assertEqual(priority["in_agreement"], 0)
+
+        # Relation first, then how far it has travelled: two peers holding
+        # the same relation are ordered by which of them is actually waiting.
+        self.assertGreater(stage["conflict"], stage["awaiting_me"])
+        self.assertGreater(stage["awaiting_me"], stage["awaiting_peer"])
+        self.assertGreater(stage["awaiting_peer"], stage["in_flight"])
+        self.assertEqual(stage["settled"], 0)
+        self.assertGreater(
+            Session.transition_rank(
+                {"type": "divergence", "stage": "conflict"},
+            ),
+            Session.transition_rank(
+                {"type": "peer_made_changes", "stage": "awaiting_me"},
+            ),
+        )
 
 
 class ShippedExampleTests(unittest.TestCase):

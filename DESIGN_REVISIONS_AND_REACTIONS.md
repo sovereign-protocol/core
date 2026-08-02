@@ -29,18 +29,36 @@ the next poll.
 
 ## Transition staging
 
-Session owns generic comparison and staging:
+Session owns generic comparison and staging, and reports them as two
+independent fields. `type` is the *relation* between the two versions -
+`in_agreement`, `peer_made_changes`, `local_made_changes`,
+`local_missing_node`, `peer_missing_node`, `divergence`. `stage` is *whose
+turn it is*:
 
-- equal actual hashes are in agreement;
-- a locally initiated difference remains `in_transition` until the other
-  client has had an opportunity to observe that local revision;
-- an incoming peer revision is actionable immediately;
-- competing revisions are a confirmed `divergence` immediately;
-- a client that observed a revision but continues publishing its previous
-  version is also confirmed as not aligned.
+- `settled` - equal actual hashes;
+- `in_flight` - a locally initiated difference the other client has not yet
+  had an opportunity to observe;
+- `awaiting_peer` - a client observed my revision and continues publishing
+  its previous version, so it is answering rather than lagging;
+- `awaiting_me` - an incoming peer revision, actionable immediately;
+- `conflict` - competing revisions, confirmed immediately.
+
+These were one field until the two meanings started contradicting each
+other in the interface. Collapsed together, an uncontested local edit
+became a "divergence" on its author's screen the moment the peer merely
+observed it, while the peer - the side actually holding a decision - saw
+the milder "in transition" for the same fact. Under a topic set to never
+auto-adopt, that is the normal steady state rather than an exception, so
+every one-sided edit turned red for its author within one round trip.
+Only `conflict` is something to resolve; the rest describe progress.
 
 Applications do not implement these transport semantics. They decide only
 whether an incoming revision is eligible for automatic adoption.
+
+`Session.transition_rank(event)` ranks one transition against another,
+relation first and stage second, so a node carrying several transitions
+leads with the peer that is actually waiting. Applications read it rather
+than copying the tables.
 
 ## Reactions
 

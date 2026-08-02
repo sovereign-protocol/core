@@ -277,21 +277,6 @@ if (sharedConfirmCancelBtn) {
     document.getElementById("confirmModal").close();
 }
 
-// Plain "+"/"-" read as barely-visible specks at badge size - wider, bolder
-// Unicode variants keep the same at-a-glance meaning but are legible.
-function transitionSymbol(type) {
-  return (
-    {
-      peer_made_changes: "＋", // fullwidth plus sign
-      local_missing_node: "＋",
-      local_made_changes: "≈", // almost-equal sign
-      peer_missing_node: "−", // minus sign
-      divergence: "!",
-      in_transition: ".",
-    }[type] || "*"
-  );
-}
-
 function dedupe(items) {
   return [...new Set(items)];
 }
@@ -304,8 +289,38 @@ function safePeerLabel(addr) {
   return String(addr || "a peer");
 }
 
+// Who authored the change being described - "me" when this client did.
+// Distinct from transitionActorLabel, which names the peer on the other end
+// of the comparison: a rollback target is "my previous version held by
+// <peer>", so that wording needs the counterpart even when I am the author.
+const LOCALLY_AUTHORED_TYPES = ["local_made_changes", "peer_missing_node"];
+
+function transitionAuthorLabel(info) {
+  if (LOCALLY_AUTHORED_TYPES.includes(info?.type)) return "me";
+  return transitionActorLabel(info);
+}
+
+// The one sentence both sides compose from the same change record, each from
+// their own end: "Card deleted by me" and "Card deleted by Ana" are the same
+// fact, and neither reads as an accusation of divergence. The author sits
+// between the act and its detail, so a modification reads "Card modified by
+// me: Ana added" rather than leaving "by me" dangling off the detail.
+function authoredPhrase(info, author) {
+  const changes = (info?.events || [info]).flatMap(
+    (event) => event?.changes || [],
+  );
+  const acts = dedupe(changes.map((c) => c.authored_act).filter(Boolean));
+  if (!acts.length) return "";
+  const node = changes.find((c) => c.node_label)?.node_label || "Item";
+  const details = dedupe(
+    changes.map((c) => c.authored_detail).filter(Boolean),
+  );
+  const head = `${node} ${acts.join(" and ")} by ${author}`;
+  return details.length ? `${head}: ${details.join("; ")}` : head;
+}
+
 function transitionActorLabel(info) {
-  const sourceType = info.original_type || info.type;
+  const sourceType = info.type;
   const originDescribesIncomingRevision = [
     "peer_made_changes",
     "local_missing_node",
@@ -353,6 +368,22 @@ function transitionChangeDetails(info) {
     .join("\n");
 }
 
+// A difference still in flight reads the same whatever its relation is: the
+// peer has not had the chance to answer yet, so there is nothing to say about
+// the two versions beyond that. Everything else is named by what they are.
+function transitionKey(event) {
+  return event?.stage === "in_flight" ? "in_flight" : event?.type;
+}
+
+const TRANSITION_LABELS = {
+  divergence: "Diverged from",
+  peer_made_changes: "Changes from",
+  local_missing_node: "Only in",
+  local_made_changes: "My changes not in",
+  peer_missing_node: "Missing in",
+  in_flight: "Waiting for",
+};
+
 function groupedTransitionLabel(events) {
   const order = [
     "divergence",
@@ -360,23 +391,15 @@ function groupedTransitionLabel(events) {
     "local_missing_node",
     "local_made_changes",
     "peer_missing_node",
-    "in_transition",
+    "in_flight",
   ];
-  const labels = {
-    divergence: "Diverged from",
-    peer_made_changes: "Changes from",
-    local_missing_node: "Only in",
-    local_made_changes: "My changes not in",
-    peer_missing_node: "Missing in",
-    in_transition: "Waiting for",
-  };
   return order
-    .filter((type) => events.some((event) => event.type === type))
-    .map((type) => {
+    .filter((key) => events.some((event) => transitionKey(event) === key))
+    .map((key) => {
       const peers = events
-        .filter((event) => event.type === type)
+        .filter((event) => transitionKey(event) === key)
         .map((event) => transitionActorLabel(event));
-      return `${labels[type]} ${dedupe(peers).join(", ")}`;
+      return `${TRANSITION_LABELS[key]} ${dedupe(peers).join(", ")}`;
     })
     .join("; ");
 }
@@ -389,6 +412,16 @@ function transitionLabel(info) {
     return details ? `${grouped}\n${details}` : grouped;
   }
   const peer = transitionActorLabel(info);
+  // Say what happened and who did it. Only a genuinely two-sided conflict
+  // is described as a divergence; anything else is one person's change,
+  // and naming its author is more use than naming the relation.
+  const authored = authoredPhrase(info, transitionAuthorLabel(info));
+  if (authored && info.stage !== "conflict") {
+    const label = info.stage === "in_flight"
+      ? `${authored} - not seen by ${peer} yet`
+      : authored;
+    return details ? `${label}\n${details}` : label;
+  }
   const labels = {
     in_agreement: "In agreement",
     peer_made_changes: `Changes from ${peer}`,
@@ -396,9 +429,9 @@ function transitionLabel(info) {
     local_missing_node: `Only in ${peer}`,
     peer_missing_node: `Missing in ${peer}`,
     divergence: `Diverged from ${peer}`,
-    in_transition: `Waiting for ${peer} to process this change`,
+    in_flight: `Waiting for ${peer} to process this change`,
   };
-  const label = labels[info.type] || "Difference";
+  const label = labels[transitionKey(info)] || "Difference";
   return details ? `${label}\n${details}` : label;
 }
 
@@ -1117,19 +1150,34 @@ Object.assign(SovereignShell, {
     button.disabled = false;
     button.hidden = false;
     const items = this._disagreements();
-    const diverged = items.filter((item) => item.type === "divergence").length;
-    button.classList.toggle("has-divergence", diverged > 0);
+    // Only a two-sided conflict is something to resolve. A change of my own
+    // that the peer has merely observed is not - counting it as one is what
+    // put the author in the red bucket with nothing to act on.
+    const conflicts = items.filter((item) => item.stage === "conflict").length;
+    const mine = items.filter((item) => item.stage === "awaiting_me").length;
+    button.classList.toggle("has-divergence", conflicts > 0);
     button.classList.toggle("has-items", items.length > 0);
     button.title = items.length
       ? "Open current divergences"
       : "Everything on this topic is in agreement";
     if (!status) return;
     status.hidden = false;
-    status.textContent = items.length
-      ? items.length + (diverged ? " to resolve" : " in transition")
-      : "In agreement";
-    status.dataset.state = diverged
-      ? "divergence" : (items.length ? "in_transition" : "in_agreement");
+    // Each side is told about its own obligation, so the two screens never
+    // contradict each other: only a conflict is mine to resolve, an incoming
+    // change is mine to review, and my own change in flight is neither.
+    if (conflicts) {
+      status.textContent = `${conflicts} to resolve`;
+      status.dataset.state = "conflict";
+    } else if (mine) {
+      status.textContent = `${mine} to review`;
+      status.dataset.state = "review";
+    } else if (items.length) {
+      status.textContent = `${items.length} in transition`;
+      status.dataset.state = "pending";
+    } else {
+      status.textContent = "In agreement";
+      status.dataset.state = "in_agreement";
+    }
     status.title = button.title;
   },
 
@@ -1149,7 +1197,7 @@ Object.assign(SovereignShell, {
     for (const item of items) {
       const row = document.createElement("div");
       row.className = "shell-disagreement-row";
-      row.dataset.status = item.type;
+      row.dataset.status = item.stage;
       const label = document.createElement("span");
       label.className = "shell-disagreement-label";
       label.textContent = transitionLabel(item);

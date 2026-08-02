@@ -2116,13 +2116,13 @@ class Session:
         local_identity = self._local_revision_origin()
         local_origin = event.get("local_revision_origin")
         peer_origin = event.get("peer_revision_origin")
-        original_type = event.get("original_type") or event.get("type")
         same_local_wave = (
             peer_origin == local_identity
             and event.get("local_base_hash") == event.get("peer_base_hash")
         )
         if (local_identity and local_origin == local_identity
-                and (same_local_wave or original_type == "peer_missing_node")):
+                and (same_local_wave
+                     or event.get("type") == "peer_missing_node")):
             return "rollback"
         return "adopt"
 
@@ -2136,9 +2136,28 @@ class Session:
         "local_missing_node": 4,
         "local_made_changes": 3,
         "peer_missing_node": 3,
-        "in_transition": 1,
         "in_agreement": 0,
     }
+
+    # Two events can share a relation and differ only in how far each has
+    # travelled - one peer has observed my revision, another has not yet.
+    # Ranking the stage as well keeps the peer who is actually holding a
+    # decision as the node's headline instead of whichever arrived first.
+    STAGE_PRIORITY = {
+        "conflict": 4,
+        "awaiting_me": 3,
+        "awaiting_peer": 2,
+        "in_flight": 1,
+        "settled": 0,
+    }
+
+    @classmethod
+    def transition_rank(cls, event: dict) -> tuple[int, int]:
+        """How loudly one transition speaks, relation first, then stage."""
+        return (
+            cls.TRANSITION_PRIORITY.get(event.get("type"), 0),
+            cls.STAGE_PRIORITY.get(event.get("stage"), 0),
+        )
 
     @staticmethod
     def _same_origin_sequence_order(local_node: ProtocolNode,
@@ -2311,6 +2330,14 @@ class Session:
 
     @staticmethod
     def _stage_transition_event(event: dict) -> dict:
+        """Say how far a difference has travelled without changing what it is.
+
+        `type` is the relation between the two versions; `stage` is whose
+        turn it is. These used to share one field, which is why the author
+        of an uncontested edit saw "divergence" as soon as the peer merely
+        observed it, while the peer - the side that actually had a decision
+        to make - saw the milder "in transition" for the same fact.
+        """
         event_type = event["type"]
         observed = event.get("peer_observed_local_revision") is True
         local_origin = event.get("local_revision_origin")
@@ -2318,15 +2345,21 @@ class Session:
         competing_origins = bool(
             local_origin and peer_origin and local_origin != peer_origin
         )
-        if event_type == "divergence" and not competing_origins and not observed:
-            return {**event, "type": "in_transition", "original_type": event_type}
-        if event_type in ("local_made_changes", "peer_missing_node"):
-            return {
-                **event,
-                "type": "divergence" if observed else "in_transition",
-                "original_type": event_type,
-            }
-        return event
+        if event_type == "in_agreement":
+            stage = "settled"
+        elif event_type in ("peer_made_changes", "local_missing_node"):
+            stage = "awaiting_me"
+        elif event_type in ("local_made_changes", "peer_missing_node"):
+            # A peer that has observed this revision and still publishes its
+            # own is answering rather than lagging - but it is answering me,
+            # so this is my change awaiting a decision, not a conflict.
+            stage = "awaiting_peer" if observed else "in_flight"
+        elif competing_origins or observed:
+            stage = "conflict"
+        else:
+            # Hashes disagree, but nothing yet says the peer has seen my side.
+            stage = "in_flight"
+        return {**event, "stage": stage}
 
     @staticmethod
     def _remove_uuid_from_tree(root: ProtocolNode, uuid: str) -> bool:

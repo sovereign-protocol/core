@@ -255,8 +255,8 @@ class SessionTests(unittest.TestCase):
 
         events = local.analyze_peer_transitions("si-b", child.uuid)
 
-        self.assertEqual(events[0]["type"], "in_transition")
-        self.assertEqual(events[0]["original_type"], "peer_missing_node")
+        self.assertEqual(events[0]["type"], "peer_missing_node")
+        self.assertEqual(events[0]["stage"], "in_flight")
 
     def test_analyze_peer_transition_compounds_multiple_unsynced_edits(self):
         local = Session("si-a")
@@ -448,8 +448,12 @@ class SessionTests(unittest.TestCase):
             **event, "peer_observed_local_revision": True,
         })
 
-        self.assertEqual(waiting["type"], "in_transition")
-        self.assertEqual(confirmed["type"], "divergence")
+        # The relation is the same either way - it is my change in both. Only
+        # how far it has travelled differs, and neither is a conflict.
+        self.assertEqual(waiting["type"], "local_made_changes")
+        self.assertEqual(waiting["stage"], "in_flight")
+        self.assertEqual(confirmed["type"], "local_made_changes")
+        self.assertEqual(confirmed["stage"], "awaiting_peer")
 
     def test_competing_origins_confirm_divergence_immediately(self):
         event = {

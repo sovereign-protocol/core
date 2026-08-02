@@ -610,10 +610,13 @@ dialog menu .danger:not(:last-child) {
   background: rgba(127, 127, 127, 0.18);
   color: var(--shell-muted, #9aa4b2);
 }
-.shell-topic-status[data-state="in_transition"] {
+.shell-topic-status[data-state="pending"] {
+  color: #8c9bab;
+}
+.shell-topic-status[data-state="review"] {
   color: #f59e0b;
 }
-.shell-topic-status[data-state="divergence"] {
+.shell-topic-status[data-state="conflict"] {
   color: #f87171;
   font-weight: 600;
 }
@@ -687,11 +690,15 @@ dialog menu .danger:not(:last-child) {
   border-left: 3px solid transparent;
   background: rgba(127, 127, 127, 0.1);
 }
-.shell-disagreement-row[data-status="divergence"] {
+.shell-disagreement-row[data-status="conflict"] {
   border-left-color: #dc2626;
 }
-.shell-disagreement-row[data-status="in_transition"] {
+.shell-disagreement-row[data-status="awaiting_me"] {
   border-left-color: #f59e0b;
+}
+.shell-disagreement-row[data-status="awaiting_peer"],
+.shell-disagreement-row[data-status="in_flight"] {
+  border-left-color: #8c9bab;
 }
 .shell-disagreement-label {
   white-space: pre-line;
