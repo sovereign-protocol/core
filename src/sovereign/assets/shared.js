@@ -948,6 +948,10 @@ Object.assign(SovereignShell, {
       menu.append(choice);
     }
     picker.querySelector(".shell-topic-switch-btn").hidden = topics.length < 2;
+    // Re-attached here rather than only once at mount: this method builds
+    // the picker on first use, so anything appended before that would be
+    // lost with it.
+    this._attachTopicActions();
   },
 
   _sizeTopicTitle(input) {
@@ -964,6 +968,24 @@ Object.assign(SovereignShell, {
     if (!region) return;
     region.replaceChildren();
     for (const node of nodes) if (node) region.append(node);
+  },
+
+  // A decision about the topic itself belongs beside the topic's name, not
+  // in the far corner with the application-level actions. Adopting a
+  // renamed board is about the thing the title shows, and a control that
+  // far from it reads as belonging to something else entirely.
+  setTopicActions(node) {
+    this._topicActions = node || null;
+    this._attachTopicActions();
+  },
+
+  _attachTopicActions() {
+    const node = this._topicActions;
+    if (!node) return;
+    const region = document.getElementById("shellTopicRegion");
+    if (!region) return;
+    const host = region.querySelector(".shell-topic-picker") || region;
+    if (node.parentElement !== host) host.append(node);
   },
 
   // ---- profile -----------------------------------------------------------
